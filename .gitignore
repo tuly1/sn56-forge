@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+checkpoints/
+wandb/
+.DS_Store
+*.egg-info/
