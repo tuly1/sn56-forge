@@ -1,0 +1,247 @@
+"""Unit tests for the ML-free logic: dataset-type parsing, prompt assembly,
+dataset loading, CLI arg handling, and GRPO reward materialisation. These run
+with no torch/transformers so they stay fast and cover the parsing layer where a
+silent mistake would quietly tank eval scores.
+"""
+
+import json
+import os
+
+from forge import cli
+from forge.data import loader, prompts
+from forge.data.schema import TaskSpec
+from forge.tasks.rewards import materialise_rewards
+
+
+# --- schema ----------------------------------------------------------------
+
+def test_instruct_render_with_and_without_input():
+    spec = TaskSpec.build(
+        task_id="t", task_type="InstructTextTask", model="m", dataset=None,
+        dataset_type_json=json.dumps(
+            {"field_instruction": "instr", "field_input": "inp", "field_output": "out",
+             "system_prompt": "SYS"}
+        ),
+        expected_repo_name="r", baseline_stats_path=None,
+    )
+    cols = spec.instruct
+    with_input = cols.render_prompt({"instr": "Add", "inp": "2+2", "out": "4"})
+    assert "Add 2+2" in with_input and with_input.startswith("SYS")
+    without_input = cols.render_prompt({"instr": "Hi", "inp": "", "out": "x"})
+    assert "Hi" in without_input and "None" not in without_input
+    assert cols.render_completion({"out": "4"}) == "4"
+
+
+def test_chat_defaults_do_not_crash_on_partial_payload():
+    # A payload missing the chat_* keys must fall back to the validator defaults,
+    # not raise (the old code treated the alias as a key and crashed).
+    spec = TaskSpec.build(
+        task_id="t", task_type="ChatTask", model="m", dataset=None,
+        dataset_type_json="{}", expected_repo_name="r", baseline_stats_path=None,
+    )
+    assert spec.chat.conversation == "conversations"
+    assert spec.chat.role_field == "from"
+    assert spec.chat.content_field == "value"
+    assert spec.chat.user_value == "user"
+    assert spec.chat.assistant_value == "assistant"
+
+
+def test_grpo_accepts_rewardfunction_dicts():
+    dt = json.dumps({
+        "field_prompt": "p",
+        "reward_functions": [
+            {"reward_func": "def a(completions, **k): return [0.0]", "reward_weight": 0.7},
+            {"reward_func": "def b(completions, **k): return [1.0]", "reward_weight": 0.3},
+        ],
+    })
+    spec = TaskSpec.build(
+        task_id="t", task_type="GrpoTask", model="m", dataset=None,
+        dataset_type_json=dt, expected_repo_name="r", baseline_stats_path=None,
+    )
+    assert spec.grpo.reward_weights == [0.7, 0.3]
+    assert len(spec.grpo.reward_functions) == 2
+
+
+def test_kl_fields_and_file_format_carry_through():
+    spec = TaskSpec.build(
+        task_id="t", task_type="InstructTextTask", model="m", dataset=None,
+        dataset_type_json=json.dumps({"field_instruction": "i", "field_output": "o"}),
+        expected_repo_name="r", baseline_stats_path=None,
+        file_format="s3", use_kl=True, kl_coef=0.5,
+    )
+    assert spec.use_kl is True and spec.kl_coef == 0.5
+    assert spec.file_format == "s3"
+    assert spec.cached_dataset_path == "/cache/datasets/t_train_data.json"
+    assert spec.cached_model_dir == "/cache/models/m"
+
+
+def test_cached_model_dir_sanitises_slashes():
+    spec = TaskSpec.build(
+        task_id="t", task_type="InstructTextTask", model="org/Name", dataset=None,
+        dataset_type_json=json.dumps({"field_instruction": "i", "field_output": "o"}),
+        expected_repo_name="r", baseline_stats_path=None,
+    )
+    assert spec.cached_model_dir == "/cache/models/org--Name"
+
+
+# --- prompts ---------------------------------------------------------------
+
+def test_build_instruct_examples_drops_empty_completion():
+    cols = TaskSpec.build(
+        task_id="t", task_type="InstructTextTask", model="m", dataset=None,
+        dataset_type_json=json.dumps({"field_instruction": "q", "field_output": "a"}),
+        expected_repo_name="r", baseline_stats_path=None,
+    ).instruct
+    rows = [{"q": "hi", "a": "yo"}, {"q": "x", "a": ""}, {"q": "", "a": "z"}]
+    out = prompts.build_instruct_examples(rows, cols)
+    assert len(out) == 1
+    assert out[0]["completion_text"] == "yo"
+
+
+def test_build_chat_conversations_normalises_roles_and_requires_assistant():
+    cols = TaskSpec.build(
+        task_id="t", task_type="ChatTask", model="m", dataset=None,
+        dataset_type_json="{}", expected_repo_name="r", baseline_stats_path=None,
+    ).chat
+    rows = [
+        {"conversations": [
+            {"from": "human", "value": "hello"},
+            {"from": "gpt", "value": "hi there"},
+        ]},
+        {"conversations": [{"from": "human", "value": "no answer"}]},  # dropped
+    ]
+    out = prompts.build_chat_conversations(rows, cols)
+    assert len(out) == 1
+    assert out[0][0]["role"] == "user"
+    assert out[0][1]["role"] == "assistant"
+
+
+def test_build_dpo_applies_format_templates():
+    cols = TaskSpec.build(
+        task_id="t", task_type="DpoTask", model="m", dataset=None,
+        dataset_type_json=json.dumps({
+            "field_prompt": "p", "field_chosen": "c", "field_rejected": "r",
+            "prompt_format": "Q: {prompt}",
+        }),
+        expected_repo_name="r", baseline_stats_path=None,
+    ).dpo
+    out = prompts.build_dpo_examples([{"p": "why", "c": "good", "r": "bad"}], cols)
+    assert out == [{"prompt": "Q: why", "chosen": "good", "rejected": "bad"}]
+
+
+def test_build_grpo_keeps_prompt_and_extra_column():
+    spec = TaskSpec.build(
+        task_id="t", task_type="GrpoTask", model="m", dataset=None,
+        dataset_type_json=json.dumps({
+            "field_prompt": "p", "extra_column": "meta",
+            "reward_functions": ["def r(completions, **k): return [0.0]"],
+        }),
+        expected_repo_name="r", baseline_stats_path=None,
+    ).grpo
+    out = prompts.build_grpo_examples([{"p": "solve", "meta": 42}, {"p": ""}], spec)
+    assert out == [{"prompt": "solve", "meta": 42}]
+
+
+# --- loader ----------------------------------------------------------------
+
+def test_loader_reads_json_array(tmp_path):
+    p = tmp_path / "d.json"
+    p.write_text(json.dumps([{"a": 1}, {"a": 2}]))
+    rows = loader.load_rows(str(p), dataset_arg=None, file_format="s3")
+    assert rows == [{"a": 1}, {"a": 2}]
+
+
+def test_loader_reads_jsonlines(tmp_path):
+    p = tmp_path / "d.json"
+    p.write_text('{"a": 1}\n{"a": 2}\n')
+    rows = loader.load_rows(str(p), dataset_arg=None, file_format="s3")
+    assert rows == [{"a": 1}, {"a": 2}]
+
+
+def test_loader_reads_wrapped_object(tmp_path):
+    p = tmp_path / "d.json"
+    p.write_text(json.dumps({"rows": [{"a": 1}]}))
+    rows = loader.load_rows(str(p), dataset_arg=None, file_format="s3")
+    assert rows == [{"a": 1}]
+
+
+def test_loader_missing_raises(tmp_path):
+    try:
+        loader.load_rows(str(tmp_path / "nope.json"), dataset_arg=None, file_format="s3")
+        assert False, "expected FileNotFoundError"
+    except FileNotFoundError:
+        pass
+
+
+# --- cli -------------------------------------------------------------------
+
+def test_cli_parse_tolerates_unknown_flags_and_task_types():
+    args = cli._parse([
+        "--task-id", "t", "--model", "m", "--dataset", "s3://x",
+        "--task-type", "SomeFutureTask", "--expected-repo-name", "r",
+        "--hours-to-complete", "1.5", "--brand-new-flag", "v",
+    ])
+    assert args.task_type == "SomeFutureTask"  # no argparse choices rejection
+    assert args.hours_to_complete == 1.5
+    assert args.file_format == "s3"
+
+
+def test_kl_from_env(monkeypatch):
+    monkeypatch.delenv("USE_KL", raising=False)
+    assert cli._kl_from_env() == (False, 0.0)
+    monkeypatch.setenv("USE_KL", "1")
+    monkeypatch.setenv("KL_COEF", "0.35")
+    assert cli._kl_from_env() == (True, 0.35)
+    monkeypatch.setenv("KL_COEF", "not-a-number")
+    assert cli._kl_from_env() == (True, 0.0)
+
+
+# --- rewards ---------------------------------------------------------------
+
+def test_completion_style_instruct_supervises_whole_instruction():
+    # A valid instruct task can omit field_output (completion-style); the whole
+    # instruction text is then the training signal.
+    spec = TaskSpec.build(
+        task_id="t", task_type="InstructTextTask", model="m", dataset=None,
+        dataset_type_json=json.dumps({"field_instruction": "text"}),
+        expected_repo_name="r", baseline_stats_path=None,
+    )
+    assert spec.instruct.output is None
+    out = prompts.build_instruct_examples([{"text": "a story"}], spec.instruct)
+    assert out == [{"prompt_text": "", "completion_text": "a story"}]
+
+
+def test_instruct_system_format_applied():
+    cols = TaskSpec.build(
+        task_id="t", task_type="InstructTextTask", model="m", dataset=None,
+        dataset_type_json=json.dumps({
+            "field_instruction": "q", "field_output": "a",
+            "system_prompt": "BeHelpful", "system_format": "SYSTEM: {system}",
+        }),
+        expected_repo_name="r", baseline_stats_path=None,
+    ).instruct
+    p = cols.render_prompt({"q": "hi", "a": "x"})
+    assert p.startswith("SYSTEM: BeHelpful")
+    assert "hi" in p
+
+
+def test_main_never_raises_on_malformed_dataset_type():
+    # The never-exit-nonzero guarantee: a broken --dataset-type must not raise
+    # out of main(); it degrades (here the fallback no-ops because no /cache).
+    rc = cli.main([
+        "--task-id", "t", "--model", "no/such-model", "--dataset", "s3://x",
+        "--dataset-type", "{not valid json",
+        "--task-type", "InstructTextTask", "--expected-repo-name", "r",
+        "--hours-to-complete", "0.01",
+    ])
+    assert rc == 0
+
+
+def test_materialise_rewards_compiles_and_skips_bad():
+    good = "def scorer(completions, **kwargs):\n    return [len(c) for c in completions]"
+    bad = "def broken(:"  # syntax error
+    notdef = "x = 5"
+    funcs, weights = materialise_rewards([good, bad, notdef], [0.5, 0.3, 0.2])
+    assert len(funcs) == 1 and weights == [0.5]
+    assert funcs[0](["ab", "cde"]) == [2, 3]
+    assert funcs[0].__name__ == "scorer"

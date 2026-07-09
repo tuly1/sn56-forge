@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sn56-forge"
+version = "0.1.0"
+description = "Original training pipeline for Gradients (Bittensor SN56) text tournaments."
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+
+# Runtime ML deps are installed in the Docker image (see ops/docker/), pinned
+# there against the CUDA base so the versions that land on the validator GPU are
+# exactly the ones we intend. They are declared here too for local installs, but
+# torch is intentionally omitted: it comes from the base image / platform wheel.
+dependencies = [
+    "transformers==4.57.1",
+    "peft==0.17.1",
+    "trl==0.24.0",
+    "datasets>=3.0,<5.0",
+    "accelerate>=1.0,<2.0",
+    "safetensors>=0.4",
+]
+
+[project.optional-dependencies]
+# 8-bit optimizer state (CUDA-only). Not required on CPU smoke tests.
+cuda = ["bitsandbytes>=0.44"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+sn56-forge = "forge.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["forge*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

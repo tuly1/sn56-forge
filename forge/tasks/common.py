@@ -1,0 +1,148 @@
+"""Shared trainer setup: argument construction, periodic saving, finalisation.
+
+Kill-safety strategy: we disable the HF Trainer's own checkpointing and instead
+mirror the current adapter into the mandated output path every few steps. That
+keeps exactly one clean adapter at `spec.output_dir` at all times — so if the
+wall-clock kill lands, the uploader finds the latest model and no stale
+`checkpoint-*` subdirectory can shadow it.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from forge.clock import Deadline
+from forge.data.schema import TaskSpec
+from forge.tuning.plan import TrainPlan
+
+
+def workdir(spec: TaskSpec) -> str:
+    d = f"/app/checkpoints/{spec.task_id}/_work"
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def build_training_kwargs(spec: TaskSpec, plan: TrainPlan) -> dict[str, Any]:
+    """Common TrainingArguments fields shared by SFT/DPO/GRPO configs."""
+    return dict(
+        output_dir=workdir(spec),
+        overwrite_output_dir=True,
+        num_train_epochs=plan.num_epochs,
+        per_device_train_batch_size=plan.per_device_batch_size,
+        gradient_accumulation_steps=plan.grad_accum_steps,
+        learning_rate=plan.learning_rate,
+        lr_scheduler_type=plan.lr_scheduler,
+        warmup_ratio=plan.warmup_ratio,
+        weight_decay=plan.weight_decay,
+        optim=plan.optimizer,
+        max_grad_norm=1.0,
+        bf16=plan.bf16,
+        fp16=plan.fp16,
+        gradient_checkpointing=plan.gradient_checkpointing,
+        # PEFT + gradient checkpointing needs non-reentrant to keep adapter grads.
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        logging_steps=10,
+        save_strategy="no",  # we mirror to output_dir ourselves (see below)
+        report_to=[],  # wandb is offline via env; don't import integrations
+        remove_unused_columns=False,
+        dataloader_num_workers=2,
+        disable_tqdm=True,
+        seed=7,
+    )
+
+
+def safe_train(trainer: Any) -> None:
+    """Run trainer.train(), retrying once at a smaller batch on CUDA OOM.
+
+    Pairs with the eager floor save the handlers do before training: if even the
+    retry fails, the exception propagates to the CLI, but a valid (untrained)
+    adapter already exists at the output path, so we get the floor rather than a
+    forfeit.
+    """
+    try:
+        trainer.train()
+        return
+    except Exception as exc:  # noqa: BLE001
+        if not _is_oom(exc):
+            raise
+    _free_cuda()
+    args = trainer.args
+    if getattr(args, "per_device_train_batch_size", 1) > 1:
+        args.gradient_accumulation_steps = (
+            getattr(args, "gradient_accumulation_steps", 1)
+            * args.per_device_train_batch_size
+        )
+        args.per_device_train_batch_size = 1
+    trainer.train()
+
+
+def _is_oom(exc: Exception) -> bool:
+    import torch
+
+    if isinstance(exc, getattr(torch.cuda, "OutOfMemoryError", ())):
+        return True
+    return "out of memory" in str(exc).lower()
+
+
+def _free_cuda() -> None:
+    try:
+        import gc
+
+        import torch
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def save_adapter(model: Any, tokenizer: Any, output_dir: str) -> None:
+    # Write to a sibling temp dir, then swap directories with atomic renames so
+    # the path the uploader reads is always a complete adapter — never a
+    # half-written one, even if a kill lands mid-save.
+    final = output_dir.rstrip("/")
+    tmp = final + ".tmp"
+    old = final + ".old"
+    _rmtree(tmp)
+    os.makedirs(tmp, exist_ok=True)
+    model.save_pretrained(tmp, safe_serialization=True)
+    tokenizer.save_pretrained(tmp)
+
+    _rmtree(old)
+    if os.path.isdir(final):
+        os.rename(final, old)  # atomic: move the complete old dir aside
+    os.rename(tmp, final)  # atomic: the new complete dir becomes live
+    _rmtree(old)
+
+
+def _rmtree(path: str) -> None:
+    import shutil
+
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def _make_periodic_save_callback(spec: TaskSpec, tokenizer: Any, *, every: int = 25):
+    """Mirror the adapter into the output path every `every` optimizer steps.
+
+    Built as a TrainerCallback subclass at call time to keep this module usable
+    (for arg/save helpers) even where transformers isn't importable.
+    """
+    from transformers import TrainerCallback
+
+    step = max(1, every)
+
+    class PeriodicSaveCallback(TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):  # noqa: ANN001
+            if state.global_step > 0 and state.global_step % step == 0:
+                model = kwargs.get("model")
+                if model is not None:
+                    try:
+                        save_adapter(model, tokenizer, spec.output_dir)
+                    except Exception:
+                        pass  # a failed mirror must never stop training
+            return control
+
+    return PeriodicSaveCallback()
