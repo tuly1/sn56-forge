@@ -21,10 +21,10 @@ RUN pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1 \
         peft==0.17.1 \
         trl==0.24.0 \
         accelerate==1.10.1 \
-        "datasets>=3.0,<5.0" \
-        "safetensors>=0.4" \
-        sentencepiece \
-        protobuf
+        "datasets==4.8.5" \
+        "safetensors==0.8.0" \
+        "sentencepiece==0.2.1" \
+        "protobuf==7.35.1"
 
 WORKDIR /app
 COPY forge /app/forge

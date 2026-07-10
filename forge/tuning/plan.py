@@ -68,7 +68,12 @@ def make_sft_plan(*, use_kl: bool) -> TrainPlan:
     # so a higher cap is nearly free on short data and OOM-retry guards big models.
     if use_kl:
         # KL tasks penalise divergence from base: a smaller adapter and gentler
-        # LR keep us close while still improving eval loss.
+        # LR keep us close while still improving eval loss. They also run a second
+        # (base) forward, so halve the micro-batch and hold the effective batch
+        # constant via accumulation.
+        if cuda:
+            b["per_device_batch_size"] = 2
+            b["grad_accum_steps"] = 8
         return TrainPlan(
             lora_r=16, lora_alpha=32, lora_dropout=0.05,
             learning_rate=1.0e-4, max_seq_len=4096, num_epochs=2, **b,
@@ -82,10 +87,12 @@ def make_sft_plan(*, use_kl: bool) -> TrainPlan:
 def make_dpo_plan() -> TrainPlan:
     cuda, bf16 = _hardware()
     b = _base(cuda, bf16)
-    # DPO is sensitive; a lower LR and modest adapter train stably.
+    # DPO is sensitive; a lower LR and modest adapter train stably. The evaluator
+    # scores DPO pairs at the model's own max length, so we don't truncate tighter
+    # than 4096 (clamped to the model's positional range at load time).
     return TrainPlan(
         lora_r=16, lora_alpha=32, lora_dropout=0.05,
-        learning_rate=5.0e-5, max_seq_len=2048, num_epochs=2, **b,
+        learning_rate=5.0e-5, max_seq_len=4096, num_epochs=2, **b,
     )
 
 

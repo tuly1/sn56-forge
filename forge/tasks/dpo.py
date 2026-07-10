@@ -11,7 +11,7 @@ from __future__ import annotations
 from forge.clock import Deadline
 from forge.data import loader, prompts
 from forge.data.schema import TaskSpec
-from forge.model import attach_lora, load_base
+from forge.model import attach_lora, effective_seq_len, load_base
 from forge.tasks.common import (
     _make_periodic_save_callback,
     build_training_kwargs,
@@ -47,11 +47,12 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     save_adapter(model, tokenizer, spec.output_dir)  # floor before training
 
     dataset = Dataset.from_list(examples)
+    seq_len = effective_seq_len(loaded.model, plan.max_seq_len)
     config = DPOConfig(
         **build_training_kwargs(spec, plan),
         beta=_EVAL_BETA,
-        max_length=plan.max_seq_len,
-        max_prompt_length=plan.max_seq_len // 2,
+        max_length=seq_len,
+        max_prompt_length=seq_len // 2,
     )
 
     trainer = DPOTrainer(

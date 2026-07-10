@@ -26,16 +26,18 @@ def build_instruct_examples(
     out: list[dict[str, str]] = []
     completion_style = cols.output is None
     for row in rows:
+        # Emptiness is checked on a stripped copy, but the text itself is kept
+        # verbatim: trimming would move the boundary the evaluator scores.
         if completion_style:
-            text = str(row.get(cols.instruction, "") or "").strip()
-            if text:
+            text = str(row.get(cols.instruction, "") or "")
+            if text.strip():
                 out.append({"prompt_text": "", "completion_text": text})
             continue
-        completion = cols.render_completion(row).strip()
-        if not completion:
+        completion = cols.render_completion(row)
+        if not completion.strip():
             continue
         prompt = cols.render_prompt(row)
-        if not prompt:
+        if not prompt.strip():
             continue
         out.append({"prompt_text": prompt, "completion_text": completion})
     return out

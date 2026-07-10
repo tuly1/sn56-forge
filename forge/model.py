@@ -83,6 +83,13 @@ def load_base(cached_model_dir: str, *, for_generation: bool = False) -> LoadedM
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
     )
+    # The validator allocates 2-8 GPUs for larger models (and multiplies the
+    # effective size for DPO/GRPO/KL). Shard across them when there is more than
+    # one, since a boss-round model will not fit on a single card.
+    sharded = torch.cuda.is_available() and torch.cuda.device_count() > 1
+    if sharded:
+        common["device_map"] = "auto"
+
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_dir, attn_implementation="sdpa", **common
@@ -94,7 +101,7 @@ def load_base(cached_model_dir: str, *, for_generation: bool = False) -> LoadedM
     model.config.use_cache = False
     if getattr(model.config, "pad_token_id", None) is None:
         model.config.pad_token_id = tokenizer.pad_token_id
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not sharded:
         model = model.to("cuda")
     return LoadedModel(model=model, tokenizer=tokenizer, model_dir=model_dir, dtype=dtype)
 
@@ -111,6 +118,19 @@ def _fix_special_tokens(tokenizer: Any) -> None:
     # never leave pad unset (the collator would otherwise pad with a bare 0).
     if tokenizer.pad_token_id is None and tokenizer.unk_token is not None:
         tokenizer.pad_token = tokenizer.unk_token
+
+
+def effective_seq_len(model: Any, requested: int) -> int:
+    """Clamp the planned sequence length to what the model can actually attend to.
+
+    The evaluator does the same (it halves its 4096 when the model's positional
+    range is smaller), so exceeding `max_position_embeddings` would train on
+    positions that are never scored — and can throw on some architectures.
+    """
+    limit = getattr(getattr(model, "config", None), "max_position_embeddings", None)
+    if isinstance(limit, int) and limit > 0:
+        return max(256, min(requested, limit))
+    return requested
 
 
 def attach_lora(model: Any, *, r: int, alpha: int, dropout: float) -> Any:

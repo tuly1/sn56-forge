@@ -68,10 +68,11 @@ class InstructColumns:
             sys_text = str(row.get(self.system))
         if sys_text:
             # Render the system segment through the validator's system_format
-            # (default "{system}"), then place it before the body on its own line.
-            sys_rendered = self.system_format.format(system=sys_text)
-            return f"{sys_rendered}\n{body}".strip()
-        return body.strip()
+            # (default "{system}") and concatenate directly. Any separator is the
+            # template's business — injecting our own would shift the boundary
+            # tokens away from what the evaluator scores.
+            return self.system_format.format(system=sys_text) + body
+        return body
 
     def render_completion(self, row: dict[str, Any]) -> str:
         return str(row.get(self.output, "") or "")

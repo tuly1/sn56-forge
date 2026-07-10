@@ -11,7 +11,7 @@ from __future__ import annotations
 from forge.clock import Deadline
 from forge.data import loader, prompts, tokenize
 from forge.data.schema import TaskSpec
-from forge.model import attach_lora, load_base
+from forge.model import attach_lora, effective_seq_len, load_base
 from forge.tasks.common import (
     _make_periodic_save_callback,
     build_training_kwargs,
@@ -35,28 +35,27 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     loaded = load_base(spec.cached_model_dir, for_generation=False)
     tokenizer = loaded.tokenizer
 
-    if spec.chat is not None:
-        conversations = prompts.build_chat_conversations(rows, spec.chat)
-        tokenized = tokenize.tokenize_chat(
-            conversations, tokenizer, _plan_seq_len(spec)
-        )
-    else:
-        assert spec.instruct is not None, "instruct task missing instruct columns"
-        examples = prompts.build_instruct_examples(rows, spec.instruct)
-        tokenized = tokenize.tokenize_instruct(examples, tokenizer, _plan_seq_len(spec))
-
-    if not tokenized:
-        raise RuntimeError("no trainable examples after tokenization")
-
     plan = make_sft_plan(use_kl=spec.use_kl and spec.kl_coef > 0)
     model = attach_lora(
         loaded.model, r=plan.lora_r, alpha=plan.lora_alpha, dropout=plan.lora_dropout
     )
 
-    # Floor first: write a valid (untrained) adapter before training so a kill
-    # during setup or before the first periodic save still leaves a scoreable
-    # model at the output path. Training overwrites it.
+    # Floor first, before the minutes-long tokenization of a large dataset: write
+    # a valid (untrained) adapter so a kill anywhere in setup still leaves a
+    # scoreable model at the output path. Training overwrites it.
     save_adapter(model, tokenizer, spec.output_dir)
+
+    seq_len = effective_seq_len(loaded.model, plan.max_seq_len)
+    if spec.chat is not None:
+        conversations = prompts.build_chat_conversations(rows, spec.chat)
+        tokenized = tokenize.tokenize_chat(conversations, tokenizer, seq_len)
+    else:
+        assert spec.instruct is not None, "instruct task missing instruct columns"
+        examples = prompts.build_instruct_examples(rows, spec.instruct)
+        tokenized = tokenize.tokenize_instruct(examples, tokenizer, seq_len)
+
+    if not tokenized:
+        raise RuntimeError("no trainable examples after tokenization")
 
     dataset = Dataset.from_list(tokenized)
     args = TrainingArguments(**build_training_kwargs(spec, plan))
@@ -88,7 +87,3 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
 
     safe_train(trainer)
     save_adapter(model, tokenizer, spec.output_dir)
-
-
-def _plan_seq_len(spec: TaskSpec) -> int:
-    return make_sft_plan(use_kl=spec.use_kl and spec.kl_coef > 0).max_seq_len

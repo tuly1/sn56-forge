@@ -1,9 +1,16 @@
 """Tokenize examples into input_ids/labels with correct completion masking.
 
 Only completion tokens carry loss (prompt tokens are masked to -100), which is
-what the evaluator scores. For instruct we mask by character offset so a token
-straddling the prompt/completion boundary is handled precisely; for chat we
-supervise every assistant turn.
+what the evaluator scores.
+
+For instruct we tokenize the prompt and the completion *separately* and
+concatenate, injecting no separator of our own. That mirrors how the evaluator
+assembles the same row (its prompter tokenizes the rendered prompt, then the
+output with an EOS appended), so the boundary token we train on is the boundary
+token we are scored on. Any separator belongs to the validator's own `format` /
+`system_format` templates, not to us.
+
+For chat we supervise every assistant turn.
 """
 
 from __future__ import annotations
@@ -15,56 +22,57 @@ def tokenize_instruct(
     examples: list[dict[str, str]], tokenizer: Any, max_len: int
 ) -> list[dict[str, list[int]]]:
     eos = tokenizer.eos_token_id
-    fast = bool(getattr(tokenizer, "is_fast", False))
     out: list[dict[str, list[int]]] = []
     for ex in examples:
-        # Completion-style examples carry an empty prompt: supervise everything
-        # (only the BOS token, which has offset (0,0), gets masked).
-        prefix = (ex["prompt_text"] + "\n") if ex["prompt_text"] else ""
-        full = prefix + ex["completion_text"]
-        if fast:
-            input_ids, labels = _mask_by_offsets(tokenizer, prefix, full, max_len)
-        else:
-            input_ids, labels = _mask_by_length(tokenizer, prefix, full, max_len)
+        # Prompt keeps the leading BOS; the completion must not add one. A
+        # completion-style example has an empty prompt, so only BOS is masked and
+        # every real token is supervised.
+        prompt_ids = list(
+            tokenizer(ex["prompt_text"], add_special_tokens=True)["input_ids"]
+        )
+        completion_ids = list(
+            tokenizer(ex["completion_text"], add_special_tokens=False)["input_ids"]
+        )
         if eos is not None:
-            input_ids.append(eos)
-            labels.append(eos)
-        if all(l == -100 for l in labels):
-            continue  # completion was truncated away — no signal
-        out.append({"input_ids": input_ids, "labels": labels})
+            completion_ids.append(eos)
+
+        prompt_ids, completion_ids = _fit(prompt_ids, completion_ids, max_len, tokenizer)
+        if not completion_ids:
+            continue  # nothing left to supervise
+
+        out.append(
+            {
+                "input_ids": prompt_ids + completion_ids,
+                "labels": [-100] * len(prompt_ids) + completion_ids,
+            }
+        )
     return out
 
 
-def _mask_by_offsets(
-    tokenizer: Any, prefix: str, full: str, max_len: int
+def _fit(
+    prompt_ids: list[int], completion_ids: list[int], max_len: int, tokenizer: Any
 ) -> tuple[list[int], list[int]]:
-    completion_start = len(prefix)
-    enc = tokenizer(
-        full,
-        add_special_tokens=True,
-        return_offsets_mapping=True,
-        truncation=True,
-        max_length=max_len - 1,  # leave room for a trailing EOS
-    )
-    input_ids = list(enc["input_ids"])
-    labels = [
-        tid if (end > completion_start) else -100
-        for tid, (_start, end) in zip(input_ids, enc["offset_mapping"])
-    ]
-    return input_ids, labels
+    """Trim to max_len, sacrificing prompt context before completion signal.
 
-
-def _mask_by_length(
-    tokenizer: Any, prefix: str, full: str, max_len: int
-) -> tuple[list[int], list[int]]:
-    """Slow-tokenizer path: mask by the token count of the prefix. Less precise
-    at the boundary than offsets, but correct for the common case.
+    Truncating from the right (the naive default) would silently delete the very
+    tokens the loss is computed on, so we drop from the left of the prompt first
+    and keep its BOS.
     """
-    prefix_ids = tokenizer(prefix, add_special_tokens=True)["input_ids"]
-    full_ids = tokenizer(full, add_special_tokens=True)["input_ids"][: max_len - 1]
-    boundary = min(len(prefix_ids), len(full_ids))
-    labels = [-100] * boundary + list(full_ids[boundary:])
-    return list(full_ids), labels
+    overflow = len(prompt_ids) + len(completion_ids) - max_len
+    if overflow <= 0:
+        return prompt_ids, completion_ids
+
+    if len(prompt_ids) - overflow >= 1:
+        bos = tokenizer.bos_token_id
+        if bos is not None and prompt_ids and prompt_ids[0] == bos:
+            # Drop from just after BOS so the sequence still opens correctly.
+            return [bos] + prompt_ids[1 + overflow :], completion_ids
+        return prompt_ids[overflow:], completion_ids
+
+    # Prompt alone can't absorb it: keep a minimal prompt and clip the completion.
+    prompt_ids = prompt_ids[:1] if prompt_ids else []
+    room = max_len - len(prompt_ids)
+    return prompt_ids, completion_ids[: max(0, room)]
 
 
 # A standard ChatML template, used when the base tokenizer ships none — matching

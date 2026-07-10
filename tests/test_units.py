@@ -8,9 +8,23 @@ import json
 import os
 
 from forge import cli
-from forge.data import loader, prompts
+from forge.data import loader, prompts, tokenize
 from forge.data.schema import TaskSpec
 from forge.tasks.rewards import materialise_rewards
+
+
+class _FakeTokenizer:
+    """Char-level stand-in: one token per character, plus BOS/EOS."""
+
+    bos_token_id = 1
+    eos_token_id = 2
+    is_fast = True
+
+    def __call__(self, text, add_special_tokens=True, **_kw):
+        ids = [ord(c) for c in text]
+        if add_special_tokens:
+            ids = [self.bos_token_id] + ids
+        return {"input_ids": ids}
 
 
 # --- schema ----------------------------------------------------------------
@@ -235,6 +249,52 @@ def test_main_never_raises_on_malformed_dataset_type():
         "--hours-to-complete", "0.01",
     ])
     assert rc == 0
+
+
+# --- tokenization ----------------------------------------------------------
+
+def test_tokenize_instruct_injects_no_separator_and_masks_prompt():
+    tok = _FakeTokenizer()
+    out = tokenize.tokenize_instruct(
+        [{"prompt_text": "ab", "completion_text": "cd"}], tok, max_len=64
+    )
+    ids, labels = out[0]["input_ids"], out[0]["labels"]
+    # BOS + 'a','b' + 'c','d' + EOS — nothing inserted at the boundary.
+    assert ids == [1, ord("a"), ord("b"), ord("c"), ord("d"), 2]
+    # Only the completion (and its EOS) carries loss.
+    assert labels == [-100, -100, -100, ord("c"), ord("d"), 2]
+
+
+def test_tokenize_instruct_completion_style_supervises_all_but_bos():
+    tok = _FakeTokenizer()
+    out = tokenize.tokenize_instruct(
+        [{"prompt_text": "", "completion_text": "xy"}], tok, max_len=64
+    )
+    assert out[0]["input_ids"] == [1, ord("x"), ord("y"), 2]
+    assert out[0]["labels"] == [-100, ord("x"), ord("y"), 2]
+
+
+def test_tokenize_instruct_truncation_sacrifices_prompt_not_completion():
+    tok = _FakeTokenizer()
+    out = tokenize.tokenize_instruct(
+        [{"prompt_text": "abcdefgh", "completion_text": "xy"}], tok, max_len=6
+    )
+    ids, labels = out[0]["input_ids"], out[0]["labels"]
+    assert len(ids) == 6
+    assert ids[0] == 1  # BOS preserved
+    # The completion and its EOS survive intact; the prompt lost its left side.
+    assert ids[-3:] == [ord("x"), ord("y"), 2]
+    assert labels[-3:] == [ord("x"), ord("y"), 2]
+    assert labels[:3] == [-100, -100, -100]
+
+
+def test_tokenize_instruct_drops_example_with_no_completion_signal():
+    tok = _FakeTokenizer()
+    # max_len leaves no room for any completion token after a 1-token prompt.
+    out = tokenize.tokenize_instruct(
+        [{"prompt_text": "abcd", "completion_text": "xyz"}], tok, max_len=1
+    )
+    assert out == []
 
 
 def test_materialise_rewards_compiles_and_skips_bad():
