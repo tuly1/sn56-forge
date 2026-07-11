@@ -59,23 +59,29 @@ class KLSFTTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
     def _completion_kl_sum(self, model, inputs, ft_logits, labels):
-        """Sum of per-token KL(ft || base) over completion tokens, and their count."""
+        """Sum of per-token KL(ft || base) over completion tokens, and their count.
+
+        The validator scores KL **unshifted**: at position ``i`` it uses
+        ``logits[i]`` masked by ``labels[i] != -100`` (its CE term is shifted, but
+        its KL deliberately is not — see the grader's
+        ``_calculate_instruct_kl_divergence``). We compute the KL the same way so
+        we optimise exactly the quantity we are ranked on. (CE stays shifted via
+        the base ``Trainer`` above.)
+        """
         base_module = model.module if hasattr(model, "module") else model
         model_inputs = {k: v for k, v in inputs.items() if k != "labels"}
         with torch.no_grad():
             with base_module.disable_adapter():
                 base_logits = base_module(**model_inputs).logits
 
-        # Align to the causal shift and the completion mask (labels != -100).
-        shift_ft = ft_logits[:, :-1, :]
-        shift_base = base_logits[:, :-1, :]
-        mask = labels[:, 1:] != -100
+        # Unshifted completion mask: logits[i] gated by labels[i] != -100.
+        mask = labels != -100
         n_tokens = int(mask.sum())
         if n_tokens == 0:
             return ft_logits.new_zeros(()), 0
 
-        ft = shift_ft[mask]
-        base = shift_base[mask]
+        ft = ft_logits[mask]
+        base = base_logits[mask]
 
         total = ft.new_zeros((), dtype=torch.float32)
         for start in range(0, n_tokens, _KL_CHUNK_TOKENS):

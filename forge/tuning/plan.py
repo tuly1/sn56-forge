@@ -53,7 +53,9 @@ def _base(cuda: bool, bf16: bool) -> dict:
         # Fused AdamW is fast and, unlike the 8-bit optimizer, carries no
         # bitsandbytes version risk on the validator GPU.
         optimizer="adamw_torch_fused" if cuda else "adamw_torch",
-        lr_scheduler="cosine",
+        # Floored cosine (min-LR 0.25 of peak): keeps a useful LR if the deadline
+        # cuts the schedule short, instead of annealing toward zero mid-run.
+        lr_scheduler="cosine_with_min_lr",
         gradient_checkpointing=cuda,
         bf16=bf16,
         fp16=cuda and not bf16,
@@ -87,12 +89,14 @@ def make_sft_plan(*, use_kl: bool) -> TrainPlan:
 def make_dpo_plan() -> TrainPlan:
     cuda, bf16 = _hardware()
     b = _base(cuda, bf16)
-    # DPO is sensitive; a lower LR and modest adapter train stably. The evaluator
+    # DPO is sensitive; a too-hot LR silently collapses the policy log-probs
+    # (loss falls while the model degrades). Champion DPO LRs sit in 5e-6..1.35e-5
+    # with a 3e-5 hard ceiling, so 1e-5 is a safe, well-inside value. The evaluator
     # scores DPO pairs at the model's own max length, so we don't truncate tighter
     # than 4096 (clamped to the model's positional range at load time).
     return TrainPlan(
         lora_r=16, lora_alpha=32, lora_dropout=0.05,
-        learning_rate=5.0e-5, max_seq_len=4096, num_epochs=2, **b,
+        learning_rate=1.0e-5, max_seq_len=4096, num_epochs=2, **b,
     )
 
 
@@ -100,7 +104,9 @@ def make_grpo_plan() -> TrainPlan:
     cuda, bf16 = _hardware()
     b = _base(cuda, bf16)
     b["per_device_batch_size"] = 2 if cuda else 1
+    # GRPO is also LR-sensitive; champion GRPO LRs are ~3e-6..8e-6 with a 1.5e-5
+    # ceiling, so 8e-6 keeps us inside the safe band.
     return TrainPlan(
         lora_r=16, lora_alpha=32, lora_dropout=0.05,
-        learning_rate=1.0e-5, max_seq_len=1024, num_epochs=1, **b,
+        learning_rate=8.0e-6, max_seq_len=1024, num_epochs=1, **b,
     )

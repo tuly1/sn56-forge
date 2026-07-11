@@ -23,9 +23,16 @@ def workdir(spec: TaskSpec) -> str:
     return d
 
 
-def build_training_kwargs(spec: TaskSpec, plan: TrainPlan) -> dict[str, Any]:
-    """Common TrainingArguments fields shared by SFT/DPO/GRPO configs."""
-    return dict(
+def build_training_kwargs(
+    spec: TaskSpec, plan: TrainPlan, *, neftune_alpha: float | None = None
+) -> dict[str, Any]:
+    """Common TrainingArguments fields shared by SFT/DPO/GRPO configs.
+
+    `neftune_alpha` enables NEFTune input-embedding noise (instruction-tuning
+    regulariser). Left None on the KL path, where the noise would otherwise
+    contaminate the disable_adapter base reference.
+    """
+    kwargs = dict(
         output_dir=workdir(spec),
         overwrite_output_dir=True,
         num_train_epochs=plan.num_epochs,
@@ -33,6 +40,13 @@ def build_training_kwargs(spec: TaskSpec, plan: TrainPlan) -> dict[str, Any]:
         gradient_accumulation_steps=plan.grad_accum_steps,
         learning_rate=plan.learning_rate,
         lr_scheduler_type=plan.lr_scheduler,
+        # Floor the cosine at 25% of peak when using the floored scheduler.
+        lr_scheduler_kwargs=(
+            {"min_lr_rate": 0.25}
+            if plan.lr_scheduler == "cosine_with_min_lr"
+            else {}
+        ),
+        neftune_noise_alpha=neftune_alpha,
         warmup_ratio=plan.warmup_ratio,
         weight_decay=plan.weight_decay,
         optim=plan.optimizer,
@@ -50,6 +64,7 @@ def build_training_kwargs(spec: TaskSpec, plan: TrainPlan) -> dict[str, Any]:
         disable_tqdm=True,
         seed=7,
     )
+    return kwargs
 
 
 def safe_train(trainer: Any) -> None:

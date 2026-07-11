@@ -13,6 +13,17 @@ from typing import Any
 
 from forge.data.schema import ChatColumns, DpoColumns, GrpoSpec, InstructColumns
 
+# Literal junk that leaks into dataset text and would otherwise be tokenised as
+# real content (special-token strings written verbatim into fields).
+_JUNK = ("[PAD]", "<pad>", "<PAD>")
+
+
+def _clean(text: str) -> str:
+    for j in _JUNK:
+        if j in text:
+            text = text.replace(j, "")
+    return text
+
 
 def build_instruct_examples(
     rows: list[dict[str, Any]], cols: InstructColumns
@@ -27,16 +38,17 @@ def build_instruct_examples(
     completion_style = cols.output is None
     for row in rows:
         # Emptiness is checked on a stripped copy, but the text itself is kept
-        # verbatim: trimming would move the boundary the evaluator scores.
+        # verbatim (only junk-token literals removed): trimming would move the
+        # boundary the evaluator scores.
         if completion_style:
-            text = str(row.get(cols.instruction, "") or "")
+            text = _clean(str(row.get(cols.instruction, "") or ""))
             if text.strip():
                 out.append({"prompt_text": "", "completion_text": text})
             continue
-        completion = cols.render_completion(row)
+        completion = _clean(cols.render_completion(row))
         if not completion.strip():
             continue
-        prompt = cols.render_prompt(row)
+        prompt = _clean(cols.render_prompt(row))
         if not prompt.strip():
             continue
         out.append({"prompt_text": prompt, "completion_text": completion})
@@ -94,11 +106,15 @@ def build_dpo_examples(
         rejected_raw = row.get(cols.rejected)
         if prompt_raw is None or chosen_raw is None or rejected_raw is None:
             continue
+        # Drop degenerate pairs (identical chosen/rejected carry zero preference
+        # signal) and strip junk-token literals.
+        if str(chosen_raw) == str(rejected_raw):
+            continue
         system = str(row.get(cols.system, "") or "") if cols.system else ""
-        prompt = cols.prompt_format.format(prompt=str(prompt_raw), system=system)
-        chosen = cols.chosen_format.format(chosen=str(chosen_raw))
-        rejected = cols.rejected_format.format(rejected=str(rejected_raw))
-        if not str(chosen).strip() or not str(rejected).strip():
+        prompt = _clean(cols.prompt_format.format(prompt=str(prompt_raw), system=system))
+        chosen = _clean(cols.chosen_format.format(chosen=str(chosen_raw)))
+        rejected = _clean(cols.rejected_format.format(rejected=str(rejected_raw)))
+        if not chosen.strip() or not rejected.strip():
             continue
         out.append({"prompt": prompt, "chosen": chosen, "rejected": rejected})
     return out

@@ -57,15 +57,21 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     if not tokenized:
         raise RuntimeError("no trainable examples after tokenization")
 
+    is_kl = spec.use_kl and spec.kl_coef > 0
     dataset = Dataset.from_list(tokenized)
-    args = TrainingArguments(**build_training_kwargs(spec, plan))
+    # NEFTune (embedding noise) regularises SFT, but only on the plain path: on a
+    # KL task the noise would leak into the disable_adapter base forward and
+    # corrupt the reference the KL is measured against.
+    args = TrainingArguments(
+        **build_training_kwargs(spec, plan, neftune_alpha=None if is_kl else 5.0)
+    )
     collator = tokenize.PadCollator(tokenizer.pad_token_id)
     callbacks = [
         DeadlineCallback(deadline),
         _make_periodic_save_callback(spec, tokenizer, every=25),
     ]
 
-    if spec.use_kl and spec.kl_coef > 0:
+    if is_kl:
         from forge.tuning.kl import KLSFTTrainer
 
         trainer = KLSFTTrainer(
