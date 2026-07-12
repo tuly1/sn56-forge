@@ -88,5 +88,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         ],
     )
 
-    safe_train(trainer)
+    # Floor the OOM-retry batch at num_generations so a retry can't break TRL's
+    # global-batch-divisible-by-num_generations requirement.
+    safe_train(trainer, min_batch=_NUM_GENERATIONS)
     save_adapter(model, tokenizer, spec.output_dir)

@@ -67,13 +67,14 @@ def build_training_kwargs(
     return kwargs
 
 
-def safe_train(trainer: Any) -> None:
+def safe_train(trainer: Any, *, min_batch: int = 1) -> None:
     """Run trainer.train(), retrying once at a smaller batch on CUDA OOM.
 
-    Pairs with the eager floor save the handlers do before training: if even the
-    retry fails, the exception propagates to the CLI, but a valid (untrained)
-    adapter already exists at the output path, so we get the floor rather than a
-    forfeit.
+    `min_batch` floors the retry micro-batch: GRPO requires the batch to stay a
+    multiple of num_generations, so it passes min_batch=num_generations. Pairs
+    with the eager floor save the handlers do before training: if even the retry
+    fails, the exception propagates to the CLI, but a valid (untrained) adapter
+    already exists at the output path, so we get the floor rather than a forfeit.
     """
     try:
         trainer.train()
@@ -81,15 +82,34 @@ def safe_train(trainer: Any) -> None:
     except Exception as exc:  # noqa: BLE001
         if not _is_oom(exc):
             raise
+    from forge import telemetry
+
+    telemetry.event("oom_retry")
     _free_cuda()
+    _clear_neftune_hook(trainer)  # a NEFTune hook from the aborted run persists
     args = trainer.args
-    if getattr(args, "per_device_train_batch_size", 1) > 1:
-        args.gradient_accumulation_steps = (
-            getattr(args, "gradient_accumulation_steps", 1)
-            * args.per_device_train_batch_size
+    cur = getattr(args, "per_device_train_batch_size", 1)
+    if cur > min_batch:
+        # Preserve the effective batch and, for GRPO, num_generations divisibility.
+        args.gradient_accumulation_steps = max(
+            1, getattr(args, "gradient_accumulation_steps", 1) * (cur // min_batch)
         )
-        args.per_device_train_batch_size = 1
+        args.per_device_train_batch_size = min_batch
     trainer.train()
+
+
+def _clear_neftune_hook(trainer: Any) -> None:
+    """Remove a NEFTune forward hook left attached when a run aborts mid-training
+    (HF only detaches it on the normal return path, not on exception), so the
+    retry doesn't stack a second noise hook on the embeddings.
+    """
+    try:
+        handle = getattr(trainer, "neftune_hook_handle", None)
+        if handle is not None:
+            handle.remove()
+            trainer.neftune_hook_handle = None
+    except Exception:
+        pass
 
 
 def _is_oom(exc: Exception) -> bool:
@@ -148,18 +168,13 @@ def _rmtree(path: str) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def _make_periodic_save_callback(
-    spec: TaskSpec, tokenizer: Any, *, every: int = 25, tracker: Any = None
-):
+def _make_periodic_save_callback(spec: TaskSpec, tokenizer: Any, *, every: int = 25):
     """Mirror the adapter into the output path every `every` optimizer steps.
 
     Built as a TrainerCallback subclass at call time to keep this module usable
-    (for arg/save helpers) even where transformers isn't importable.
-
-    Once best-checkpoint selection has mirrored a best-eval adapter (see
-    `tracker.saved_best`), the unconditional mirror stands down: overwriting the
-    best-known model with a merely-latest one would trade score for nothing —
-    kill-safety is already covered by the best mirror.
+    (for arg/save helpers) even where transformers isn't importable. Keeps the
+    latest model at the mandated output path so a wall-clock kill always uploads
+    the most recent trained adapter.
     """
     from transformers import TrainerCallback
 
@@ -167,8 +182,6 @@ def _make_periodic_save_callback(
 
     class PeriodicSaveCallback(TrainerCallback):
         def on_step_end(self, args, state, control, **kwargs):  # noqa: ANN001
-            if tracker is not None and getattr(tracker, "saved_best", False):
-                return control
             if state.global_step > 0 and state.global_step % step == 0:
                 model = kwargs.get("model")
                 if model is not None:

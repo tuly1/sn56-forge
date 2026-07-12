@@ -89,6 +89,13 @@ def make_sft_plan(*, use_kl: bool) -> TrainPlan:
 def make_dpo_plan() -> TrainPlan:
     cuda, bf16 = _hardware()
     b = _base(cuda, bf16)
+    # DPO packs chosen+rejected into one batch (2x sequences) at 4096 and holds a
+    # reference forward, so it is materially heavier than SFT. Halve the micro-
+    # batch and double accumulation to keep the effective batch while staying
+    # inside the memory the OOM-retry would otherwise have to rescue.
+    if cuda:
+        b["per_device_batch_size"] = 2
+        b["grad_accum_steps"] = 8
     # DPO is sensitive; a too-hot LR silently collapses the policy log-probs
     # (loss falls while the model degrades). Champion DPO LRs sit in 5e-6..1.35e-5
     # with a 3e-5 hard ceiling, so 1e-5 is a safe, well-inside value. The evaluator
