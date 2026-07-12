@@ -236,6 +236,36 @@ def test_split_val_capped_at_500():
     assert len(val) == 500
 
 
+# --- telemetry ---------------------------------------------------------------
+
+def test_telemetry_roundtrip_and_never_raises(tmp_path):
+    from forge import telemetry
+
+    telemetry.init(task_id="t1", task_type="InstructTextTask", use_kl=True)
+    telemetry.event("model_loaded", rows=123)
+    telemetry.train_point(10, 1.5, 2e-4)
+    telemetry.eval_point(50, 1.23)
+    telemetry.sample("kl_per_token", 0.004)
+
+    telemetry.write_into(str(tmp_path))
+    data = json.loads((tmp_path / "forge_run.json").read_text())
+    assert data["meta"]["task_id"] == "t1"
+    assert any(e["name"] == "model_loaded" for e in data["events"])
+    assert data["eval_curve"][0][2] == 1.23
+    assert "kl_per_token" in data["samples"]
+
+    # Writing into a nonexistent dir must be a silent no-op, never a crash.
+    telemetry.write_into(str(tmp_path / "does" / "not" / "exist"))
+
+
+def test_telemetry_curve_thinning():
+    from forge import telemetry
+
+    for i in range(1000):
+        telemetry.train_point(i, 1.0, 1e-4)
+    assert len(telemetry._data["train_curve"]) <= 600  # bounded, never unbounded
+
+
 # --- rewards ---------------------------------------------------------------
 
 def test_completion_style_instruct_supervises_whole_instruction():

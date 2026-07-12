@@ -55,6 +55,12 @@ class KLSFTTrainer(Trainer):
         denom = float(num_items) if num_items is not None else float(kl_tokens)
         kl = kl_sum / denom
 
+        self._kl_calls = getattr(self, "_kl_calls", 0) + 1
+        if self._kl_calls % 20 == 1:  # sparse sample of the per-token KL magnitude
+            from forge import telemetry
+
+            telemetry.sample("kl_per_token", float(kl_sum) / max(1, kl_tokens))
+
         loss = ce_loss + self._kl_coef * kl
         return (loss, outputs) if return_outputs else loss
 

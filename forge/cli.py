@@ -15,6 +15,7 @@ import os
 import sys
 import time
 
+from forge import telemetry
 from forge.clock import Deadline
 from forge.data.schema import TaskSpec
 
@@ -72,6 +73,15 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     use_kl, kl_coef = _kl_from_env()
+    telemetry.init(
+        task_id=args.task_id,
+        task_type=args.task_type,
+        model_arg=args.model,
+        hours_to_complete=args.hours_to_complete,
+        file_format=args.file_format,
+        use_kl=use_kl,
+        kl_coef=kl_coef,
+    )
     # Building the spec parses --dataset-type, which can raise on a payload whose
     # required column is absent (e.g. a valid completion-style instruct task with
     # field_output=null) or on malformed JSON. That must degrade to the fallback,
@@ -91,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except BaseException as exc:  # noqa: BLE001
         _log(f"spec build failed ({type(exc).__name__}: {exc}); using bare spec + fallback")
+        telemetry.event("spec_build_failed", error=f"{type(exc).__name__}: {exc}")
         spec = TaskSpec(
             task_id=args.task_id,
             task_type=args.task_type,
@@ -119,13 +130,17 @@ def _run(spec: TaskSpec, deadline: Deadline) -> None:
         handler = dispatch.for_task(spec.task_type)
     except Exception as exc:  # dispatch import problems must not forfeit
         _log(f"dispatch failed for {spec.task_type!r}: {exc!r}")
+        telemetry.event("dispatch_failed", error=repr(exc))
 
     if handler is not None:
         try:
             handler(spec, deadline)
+            telemetry.event("run_complete")
+            telemetry.write_into(spec.output_dir)
             return
         except BaseException as exc:  # noqa: BLE001 — includes SystemExit/KeyboardInterrupt
             _log(f"handler raised ({type(exc).__name__}: {exc}); using fallback")
+            telemetry.event("handler_failed", error=f"{type(exc).__name__}: {exc}")
 
     try:
         from forge.tasks.fallback import emit_untrained_copy
@@ -133,6 +148,8 @@ def _run(spec: TaskSpec, deadline: Deadline) -> None:
         emit_untrained_copy(spec)
     except Exception as exc:  # the floor itself failing is all we can log
         _log(f"fallback failed: {exc!r}")
+        telemetry.event("fallback_failed", error=repr(exc))
+    telemetry.write_into(spec.output_dir)
 
 
 def _log(msg: str) -> None:

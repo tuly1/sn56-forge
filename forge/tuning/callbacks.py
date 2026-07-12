@@ -44,6 +44,15 @@ class DeadlineCallback(TrainerCallback):
         # the soft stop, so the final export lands inside the export reserve.
         per_step = self._deadline.per_step() or 0.0
         if self._deadline.remaining() <= per_step * 1.5:
+            if not control.should_training_stop:
+                from forge import telemetry
+
+                telemetry.event(
+                    "deadline_stop",
+                    step=int(state.global_step),
+                    remaining_s=round(self._deadline.remaining(), 1),
+                    per_step_s=round(per_step, 2),
+                )
             control.should_training_stop = True
 
     def on_substep_end(

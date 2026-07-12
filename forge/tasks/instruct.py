@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 
+from forge import telemetry
 from forge.clock import Deadline
 from forge.data import loader, prompts, tokenize
 from forge.data.schema import TaskSpec
@@ -47,6 +48,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
 
     loaded = load_base(spec.cached_model_dir, for_generation=False)
     tokenizer = loaded.tokenizer
+    telemetry.collect_env()
+    telemetry.event("model_loaded", rows=len(rows))
 
     plan = make_sft_plan(use_kl=spec.use_kl and spec.kl_coef > 0)
     model = attach_lora(
@@ -72,6 +75,19 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
 
     is_kl = spec.use_kl and spec.kl_coef > 0
     train_examples, val_examples = split_train_val(tokenized)
+    telemetry.set_meta(
+        handler="chat" if spec.chat is not None else "instruct",
+        seq_len=seq_len,
+        tokenized=len(tokenized),
+        train_n=len(train_examples),
+        val_n=len(val_examples),
+        lora_r=plan.lora_r,
+        lr=plan.learning_rate,
+        batch=plan.per_device_batch_size,
+        grad_accum=plan.grad_accum_steps,
+        epochs=plan.num_epochs,
+        neftune=not is_kl,
+    )
 
     # NEFTune (embedding noise) regularises SFT, but only on the plain path: on a
     # KL task the noise would leak into the disable_adapter base forward and
@@ -98,6 +114,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     callbacks = [
         DeadlineCallback(deadline),
         _make_periodic_save_callback(spec, tokenizer, every=25, tracker=tracker),
+        telemetry.make_trainer_callback(spec.output_dir),
     ]
     if val_examples:
         callbacks.append(BestCheckpointCallback(spec, tokenizer, tracker))
@@ -130,15 +147,22 @@ def _finalize(trainer, tracker, spec: TaskSpec, tokenizer, model, deadline: Dead
     actually better.
     """
     if not tracker.saved_best:
+        telemetry.event("final_saved", reason="no_best_recorded")
         save_adapter(model, tokenizer, spec.output_dir)
         return
 
     if deadline.remaining() <= _FINAL_EVAL_MIN_REMAINING_S:
+        telemetry.event("best_kept", reason="no_time_for_final_eval",
+                        best_loss=tracker.best_loss)
+        telemetry.write_into(spec.output_dir)
         return  # keep the mirrored best; no time to fairly judge the final
 
     try:
         final_loss = trainer.evaluate().get("eval_loss")
     except Exception:
+        telemetry.event("best_kept", reason="final_eval_failed",
+                        best_loss=tracker.best_loss)
+        telemetry.write_into(spec.output_dir)
         return  # keep the mirrored best
     if (
         final_loss is not None
@@ -146,4 +170,10 @@ def _finalize(trainer, tracker, spec: TaskSpec, tokenizer, model, deadline: Dead
         and tracker.best_loss is not None
         and final_loss < tracker.best_loss
     ):
+        telemetry.event("final_saved", reason="final_beats_best",
+                        final_loss=float(final_loss), best_loss=tracker.best_loss)
         save_adapter(model, tokenizer, spec.output_dir)
+    else:
+        telemetry.event("best_kept", reason="best_beats_final",
+                        final_loss=final_loss, best_loss=tracker.best_loss)
+        telemetry.write_into(spec.output_dir)

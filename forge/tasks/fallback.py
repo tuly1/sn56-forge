@@ -26,27 +26,34 @@ from forge.model import resolve_model_dir
 
 
 def emit_untrained_copy(spec: TaskSpec) -> None:
+    from forge import telemetry
+
     dst = spec.output_dir
     # If training already mirrored a real adapter here (periodic save), keep it —
     # a late handler failure must not downgrade a trained model to the floor.
     if _has_weights(dst):
+        telemetry.event("fallback_kept_existing_weights")
         return
 
     os.makedirs(dst, exist_ok=True)
     try:
         src = resolve_model_dir(spec.cached_model_dir)
     except Exception:
+        telemetry.event("fallback_no_base_model")
         return  # no base staged; nothing we can honestly emit
 
     # Each rung starts from a clean dst so a partial write from a failed rung
     # (e.g. adapter_config.json without weights) can't shadow the next rung.
     if _emit_lora_adapter(src, dst):
+        telemetry.event("fallback_emitted", rung="lora_adapter")
         return
     _clear_dir(dst)
     if _emit_perturbed_copy(src, dst):
+        telemetry.event("fallback_emitted", rung="perturbed_copy")
         return
     _clear_dir(dst)
     _emit_plain_copy(src, dst)
+    telemetry.event("fallback_emitted", rung="plain_copy")
 
 
 def _clear_dir(path: str) -> None:

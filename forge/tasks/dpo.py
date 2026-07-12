@@ -39,6 +39,10 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
 
     loaded = load_base(spec.cached_model_dir, for_generation=False)
     tokenizer = loaded.tokenizer
+    from forge import telemetry
+
+    telemetry.collect_env()
+    telemetry.set_meta(handler="dpo", rows=len(rows), pairs=len(examples))
     plan = make_dpo_plan()
     model = attach_lora(
         loaded.model, r=plan.lora_r, alpha=plan.lora_alpha, dropout=plan.lora_dropout
@@ -64,6 +68,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         callbacks=[
             DeadlineCallback(deadline),
             _make_periodic_save_callback(spec, tokenizer, every=25),
+            telemetry.make_trainer_callback(spec.output_dir),
         ],
     )
 

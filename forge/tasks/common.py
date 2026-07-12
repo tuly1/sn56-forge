@@ -131,6 +131,12 @@ def save_adapter(model: Any, tokenizer: Any, output_dir: str) -> None:
     os.rename(tmp, final)  # atomic: the new complete dir becomes live
     _rmtree(old)
 
+    # The swap replaced the directory wholesale, taking any previous run log with
+    # it — re-drop the flight recorder so the uploaded folder always carries it.
+    from forge import telemetry
+
+    telemetry.write_into(final)
+
 
 def _rmtree(path: str) -> None:
     import shutil
