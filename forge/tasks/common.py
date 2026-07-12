@@ -125,17 +125,20 @@ def save_adapter(model: Any, tokenizer: Any, output_dir: str) -> None:
     model.save_pretrained(tmp, safe_serialization=True)
     tokenizer.save_pretrained(tmp)
 
+    # Carry the flight recorder INTO the staging dir *before* it goes live, so the
+    # swapped-in directory already contains forge_run.json the instant it becomes
+    # the adapter the uploader reads. This makes the log exactly as kill-safe as
+    # the weights: there is no window where `final` has an adapter but no log,
+    # even if a SIGKILL lands mid-swap.
+    from forge import telemetry
+
+    telemetry.write_into(tmp)
+
     _rmtree(old)
     if os.path.isdir(final):
         os.rename(final, old)  # atomic: move the complete old dir aside
-    os.rename(tmp, final)  # atomic: the new complete dir becomes live
+    os.rename(tmp, final)  # atomic: the new complete dir (adapter + log) becomes live
     _rmtree(old)
-
-    # The swap replaced the directory wholesale, taking any previous run log with
-    # it — re-drop the flight recorder so the uploaded folder always carries it.
-    from forge import telemetry
-
-    telemetry.write_into(final)
 
 
 def _rmtree(path: str) -> None:

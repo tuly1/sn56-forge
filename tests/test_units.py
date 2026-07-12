@@ -258,6 +258,47 @@ def test_telemetry_roundtrip_and_never_raises(tmp_path):
     telemetry.write_into(str(tmp_path / "does" / "not" / "exist"))
 
 
+def test_save_adapter_carries_flight_recorder_atomically(tmp_path):
+    # The flight recorder must ride into the swapped output dir together with the
+    # adapter — present the instant the dir goes live, so a mid-swap kill can't
+    # leave weights without the log.
+    import os as _os
+
+    from forge import telemetry
+    from forge.tasks.common import save_adapter
+
+    telemetry.init(task_id="carry-test")
+    telemetry.event("model_loaded")
+
+    class _FakeModel:
+        def save_pretrained(self, d, **_k):
+            with open(_os.path.join(d, "adapter_model.safetensors"), "w") as f:
+                f.write("weights")
+            with open(_os.path.join(d, "adapter_config.json"), "w") as f:
+                f.write("{}")
+
+    class _FakeTok:
+        def save_pretrained(self, d, **_k):
+            with open(_os.path.join(d, "tokenizer.json"), "w") as f:
+                f.write("{}")
+
+    out = str(tmp_path / "checkpoints" / "task" / "model")
+    _os.makedirs(out)
+    # Pre-existing dir (simulates a prior mirror-save) so the rename-aside path runs.
+    with open(_os.path.join(out, "stale"), "w") as f:
+        f.write("x")
+
+    save_adapter(_FakeModel(), _FakeTok(), out)
+
+    # Adapter and log co-present; stale contents gone; no .tmp/.old leaked.
+    assert _os.path.isfile(_os.path.join(out, "adapter_model.safetensors"))
+    assert _os.path.isfile(_os.path.join(out, "forge_run.json"))
+    assert not _os.path.exists(_os.path.join(out, "stale"))
+    assert not _os.path.exists(out + ".tmp") and not _os.path.exists(out + ".old")
+    data = json.loads(open(_os.path.join(out, "forge_run.json")).read())
+    assert data["meta"]["task_id"] == "carry-test"
+
+
 def test_telemetry_curve_thinning():
     from forge import telemetry
 
