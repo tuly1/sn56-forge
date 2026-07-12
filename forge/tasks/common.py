@@ -139,11 +139,18 @@ def _rmtree(path: str) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def _make_periodic_save_callback(spec: TaskSpec, tokenizer: Any, *, every: int = 25):
+def _make_periodic_save_callback(
+    spec: TaskSpec, tokenizer: Any, *, every: int = 25, tracker: Any = None
+):
     """Mirror the adapter into the output path every `every` optimizer steps.
 
     Built as a TrainerCallback subclass at call time to keep this module usable
     (for arg/save helpers) even where transformers isn't importable.
+
+    Once best-checkpoint selection has mirrored a best-eval adapter (see
+    `tracker.saved_best`), the unconditional mirror stands down: overwriting the
+    best-known model with a merely-latest one would trade score for nothing —
+    kill-safety is already covered by the best mirror.
     """
     from transformers import TrainerCallback
 
@@ -151,6 +158,8 @@ def _make_periodic_save_callback(spec: TaskSpec, tokenizer: Any, *, every: int =
 
     class PeriodicSaveCallback(TrainerCallback):
         def on_step_end(self, args, state, control, **kwargs):  # noqa: ANN001
+            if tracker is not None and getattr(tracker, "saved_best", False):
+                return control
             if state.global_step > 0 and state.global_step % step == 0:
                 model = kwargs.get("model")
                 if model is not None:

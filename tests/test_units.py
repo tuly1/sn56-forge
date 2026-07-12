@@ -10,6 +10,7 @@ import os
 from forge import cli
 from forge.data import loader, prompts, tokenize
 from forge.data.schema import TaskSpec
+from forge.data.split import split_train_val
 from forge.tasks.rewards import materialise_rewards
 
 
@@ -208,6 +209,31 @@ def test_kl_from_env(monkeypatch):
     assert cli._kl_from_env() == (True, 0.35)
     monkeypatch.setenv("KL_COEF", "not-a-number")
     assert cli._kl_from_env() == (True, 0.0)
+
+
+# --- split -------------------------------------------------------------------
+
+def test_split_skipped_for_small_datasets():
+    ex = [{"i": i} for i in range(255)]
+    train, val = split_train_val(ex)
+    assert train == ex and val == []
+
+
+def test_split_sizes_and_determinism():
+    ex = [{"i": i} for i in range(10_000)]
+    t1, v1 = split_train_val(ex)
+    t2, v2 = split_train_val(ex)
+    assert v1 == v2 and t1 == t2  # deterministic
+    assert len(v1) == 10_000 // 33  # ~3%
+    assert len(t1) + len(v1) == 10_000
+    ids = {e["i"] for e in t1} | {e["i"] for e in v1}
+    assert len(ids) == 10_000  # disjoint, complete
+
+
+def test_split_val_capped_at_500():
+    ex = [{"i": i} for i in range(50_000)]
+    _, val = split_train_val(ex)
+    assert len(val) == 500
 
 
 # --- rewards ---------------------------------------------------------------
