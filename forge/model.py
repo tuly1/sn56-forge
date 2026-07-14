@@ -162,15 +162,33 @@ def decide_full_finetune(
     """
     if use_kl or n_gpus != 1 or per_gpu_gb <= 0 or params_b <= 0:
         return False
-    budget_gb = 0.80 * per_gpu_gb
-    needed_gb = params_b * 12.0 + 12.0  # optimizer/grads/weights + activation slack
+    # 16 B/param = fp32 master weights (4) + fp32 grads (4) + fused-AdamW fp32
+    # states (8); +20 GB for activations (the LM-head logits + fp32 CE dominate at
+    # seq 4096 / large vocab). Held to 78% of the card so fragmentation + the
+    # 20 GB activation reserve leave real headroom. This admits ~<=2.6B on 80 GB —
+    # covering the small group/knockout models where full-FT wins — and defers
+    # bigger models to LoRA. The OOM-retry is a backstop, not the plan.
+    budget_gb = 0.78 * per_gpu_gb
+    needed_gb = params_b * 16.0 + 20.0
     return needed_gb <= budget_gb
 
 
 def prepare_full_finetune(model: Any, *, gradient_checkpointing: bool) -> Any:
     """Ready a raw (non-PEFT) model for full fine-tuning: every parameter trains,
     cache off, and (for gradient checkpointing) inputs require grad.
+
+    Crucially, upcast the trainable weights to fp32 so the optimizer keeps fp32
+    *master* weights while bf16 autocast (TrainingArguments bf16=True) does the
+    compute. Pure-bf16 full fine-tuning silently stalls — at a 1e-4 LR the
+    per-step update is at or below bf16's representable spacing and rounds to
+    zero — which would defeat the whole point of full-FT and never show on a CPU
+    (fp32) smoke test. This raises memory to ~16 bytes/param; the fit gate budgets
+    for it.
     """
+    try:
+        model = model.float()
+    except Exception:
+        pass
     for p in model.parameters():
         p.requires_grad_(True)
     if hasattr(model, "config"):

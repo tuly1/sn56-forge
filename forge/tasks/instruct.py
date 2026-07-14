@@ -85,9 +85,25 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     telemetry.event("model_loaded", rows=len(rows))
 
     # Floor first, before the minutes-long tokenization of a large dataset: write
-    # a valid (untrained) model/adapter so a kill anywhere in setup still leaves a
-    # scoreable artifact at the output path. Training overwrites it.
-    save_adapter(model, tokenizer, spec.output_dir)
+    # a valid (untrained) artifact so a kill anywhere in setup still leaves a
+    # scoreable model at the output path. Training overwrites it (the atomic swap
+    # replaces the whole dir).
+    #
+    # For LoRA the untrained adapter is a valid finetune (adapter_config.json is
+    # always detected as a finetune). For FULL-FT, saving the untrained full model
+    # would be byte-identical to the base — which the evaluator scores as
+    # non-finetuned AND which would trap the fallback (its _has_weights guard
+    # keeps it). So use the LoRA-adapter floor (loaded from the cached base on CPU,
+    # zero GPU cost): a valid, non-identical finetune until real training lands.
+    if strategy == "full":
+        from forge.tasks.fallback import emit_untrained_copy
+
+        # A `fallback_emitted` event here is the intentional floor, not a failure —
+        # a real fallback would have no later `train_end`.
+        telemetry.event("full_ft_floor")
+        emit_untrained_copy(spec)
+    else:
+        save_adapter(model, tokenizer, spec.output_dir)
 
     seq_len = effective_seq_len(loaded.model, plan.max_seq_len)
     if spec.chat is not None:
@@ -101,7 +117,9 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     if not tokenized:
         raise RuntimeError("no trainable examples after tokenization")
 
-    train_ex, val_ex = _split_for_eval(tokenized)
+    # Eval-loss logging holds out a small slice — but NOT on KL tasks, where each
+    # eval reruns the full KL double-forward and would eat the time budget.
+    train_ex, val_ex = (tokenized, []) if is_kl else _split_for_eval(tokenized)
     eff_batch = plan.per_device_batch_size * plan.grad_accum_steps
     telemetry.set_meta(
         handler="chat" if spec.chat is not None else "instruct",
