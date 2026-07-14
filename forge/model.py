@@ -120,6 +120,66 @@ def _fix_special_tokens(tokenizer: Any) -> None:
         tokenizer.pad_token = tokenizer.unk_token
 
 
+def model_param_billions(model: Any) -> float:
+    """Trainable-model size in billions of parameters (for strategy + LR sizing)."""
+    try:
+        return sum(p.numel() for p in model.parameters()) / 1e9
+    except Exception:
+        return 0.0
+
+
+def gpu_topology() -> tuple[int, float]:
+    """(gpu_count, per_gpu_total_GB). (0, 0.0) on CPU."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            n = torch.cuda.device_count()
+            gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+            return n, round(gb, 1)
+    except Exception:
+        pass
+    return 0, 0.0
+
+
+def decide_full_finetune(
+    *, use_kl: bool, params_b: float, n_gpus: int, per_gpu_gb: float
+) -> bool:
+    """Full fine-tune when it clearly beats LoRA and fits comfortably.
+
+    Full-FT is the empirically-winning choice on the small models that dominate
+    the group/knockout rounds (week-1 postmortem: every advancer full-FT'd, no
+    LoRA miner advanced). We gate it conservatively for reliability:
+
+    - Never on KL tasks: our KL trainer reads the base logits via the LoRA
+      adapter's disable_adapter(); there is no adapter under full-FT. LoRA also
+      naturally stays near base, which is what KL rewards.
+    - Only single-GPU: multi-GPU full-FT training needs FSDP; our validated
+      multi-GPU path is device_map + LoRA. When the validator hands us >1 GPU the
+      model is large, so LoRA there is both safer and appropriate.
+    - Only when full-FT (bf16 weights+grads + fp32 AdamW states ≈ 12 B/param,
+      plus an activation budget) fits inside ~80% of one card's memory.
+    """
+    if use_kl or n_gpus != 1 or per_gpu_gb <= 0 or params_b <= 0:
+        return False
+    budget_gb = 0.80 * per_gpu_gb
+    needed_gb = params_b * 12.0 + 12.0  # optimizer/grads/weights + activation slack
+    return needed_gb <= budget_gb
+
+
+def prepare_full_finetune(model: Any, *, gradient_checkpointing: bool) -> Any:
+    """Ready a raw (non-PEFT) model for full fine-tuning: every parameter trains,
+    cache off, and (for gradient checkpointing) inputs require grad.
+    """
+    for p in model.parameters():
+        p.requires_grad_(True)
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+    if gradient_checkpointing and hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    return model
+
+
 def effective_seq_len(model: Any, requested: int) -> int:
     """Clamp the planned sequence length to what the model can actually attend to.
 

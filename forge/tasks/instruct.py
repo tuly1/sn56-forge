@@ -1,25 +1,33 @@
 """Supervised fine-tuning for InstructTextTask and ChatTask.
 
-Loss is computed only on completion tokens, matching the evaluator. On
-KL-regularised tasks we swap in a trainer that adds the scored KL(model || base)
-term. This one handler serves both task types: it branches on whether the spec
-carries instruct columns or chat columns.
+Strategy: on small non-KL models we FULL fine-tune (the week-1 postmortem showed
+every advancer full-fine-tuned and no LoRA miner advanced); on KL tasks and
+large/multi-GPU models we keep the validated LoRA path (the KL trainer needs the
+adapter, and LoRA is the safe multi-GPU route). The choice is made after the
+model loads, from its real parameter count and the GPU it landed on.
 
-Checkpoint policy: mirror the adapter to the output path every 25 steps and save
-once more at the end. Under the floored cosine the final model is at worst a hair
-past its best; earlier eval-based best-checkpoint selection was removed after
-review showed it regressed the common large-deadline-cut case and no-op'd on
-small datasets under the real batch geometry. The flight recorder now measures
-whether overfitting actually occurs, to inform a proper early-stopping design.
+Loss is completion-only, matching the evaluator. We also hold out a small slice
+and log an eval loss purely for post-tournament learning — it drives no decision,
+so it can't repeat the eval-cadence regression that got best-checkpoint reverted.
 """
 
 from __future__ import annotations
+
+import random
 
 from forge import telemetry
 from forge.clock import Deadline
 from forge.data import loader, prompts, tokenize
 from forge.data.schema import TaskSpec
-from forge.model import attach_lora, effective_seq_len, load_base
+from forge.model import (
+    attach_lora,
+    decide_full_finetune,
+    effective_seq_len,
+    gpu_topology,
+    load_base,
+    model_param_billions,
+    prepare_full_finetune,
+)
 from forge.tasks.common import (
     _make_periodic_save_callback,
     build_training_kwargs,
@@ -28,6 +36,11 @@ from forge.tasks.common import (
 )
 from forge.tuning.callbacks import DeadlineCallback
 from forge.tuning.plan import make_sft_plan
+
+# Hold out a small fixed val slice for eval-loss LOGGING only (never gates a
+# checkpoint). Skip it on datasets too small to spare rows.
+_EVAL_VAL_ROWS = 256
+_EVAL_MIN_DATASET = 1000
 
 
 def run(spec: TaskSpec, deadline: Deadline) -> None:
@@ -43,16 +56,37 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     loaded = load_base(spec.cached_model_dir, for_generation=False)
     tokenizer = loaded.tokenizer
     telemetry.collect_env()
-    telemetry.event("model_loaded", rows=len(rows))
 
-    plan = make_sft_plan(use_kl=spec.use_kl and spec.kl_coef > 0)
-    model = attach_lora(
-        loaded.model, r=plan.lora_r, alpha=plan.lora_alpha, dropout=plan.lora_dropout
+    is_kl = spec.use_kl and spec.kl_coef > 0
+    params_b = model_param_billions(loaded.model)
+    n_gpus, per_gpu_gb = gpu_topology()
+    use_full = decide_full_finetune(
+        use_kl=is_kl, params_b=params_b, n_gpus=n_gpus, per_gpu_gb=per_gpu_gb
+    )
+    strategy = "full" if use_full else "lora"
+    plan = make_sft_plan(use_kl=is_kl, strategy=strategy, params_b=params_b)
+    telemetry.event(
+        "strategy_chosen",
+        strategy=strategy,
+        params_b=round(params_b, 3),
+        n_gpus=n_gpus,
+        per_gpu_gb=per_gpu_gb,
     )
 
+    if use_full:
+        model = prepare_full_finetune(
+            loaded.model, gradient_checkpointing=plan.gradient_checkpointing
+        )
+    else:
+        model = attach_lora(
+            loaded.model, r=plan.lora_r, alpha=plan.lora_alpha, dropout=plan.lora_dropout
+        )
+
+    telemetry.event("model_loaded", rows=len(rows))
+
     # Floor first, before the minutes-long tokenization of a large dataset: write
-    # a valid (untrained) adapter so a kill anywhere in setup still leaves a
-    # scoreable model at the output path. Training overwrites it.
+    # a valid (untrained) model/adapter so a kill anywhere in setup still leaves a
+    # scoreable artifact at the output path. Training overwrites it.
     save_adapter(model, tokenizer, spec.output_dir)
 
     seq_len = effective_seq_len(loaded.model, plan.max_seq_len)
@@ -67,36 +101,56 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     if not tokenized:
         raise RuntimeError("no trainable examples after tokenization")
 
-    is_kl = spec.use_kl and spec.kl_coef > 0
+    train_ex, val_ex = _split_for_eval(tokenized)
+    eff_batch = plan.per_device_batch_size * plan.grad_accum_steps
     telemetry.set_meta(
         handler="chat" if spec.chat is not None else "instruct",
+        strategy=strategy,
+        params_b=round(params_b, 3),
+        n_gpus=n_gpus,
+        gpu_gb=per_gpu_gb,
         seq_len=seq_len,
         tokenized=len(tokenized),
+        train_n=len(train_ex),
+        val_n=len(val_ex),
         lora_r=plan.lora_r,
         lr=plan.learning_rate,
         batch=plan.per_device_batch_size,
         grad_accum=plan.grad_accum_steps,
+        eff_batch=eff_batch,
         epochs=plan.num_epochs,
         neftune=not is_kl,
+        tokens_per_step_cap=eff_batch * seq_len,
     )
 
-    # NEFTune (embedding noise) regularises SFT, but only on the plain path: on a
-    # KL task the noise would leak into the disable_adapter base forward and
-    # corrupt the reference the KL is measured against.
-    args = TrainingArguments(
-        **build_training_kwargs(spec, plan, neftune_alpha=None if is_kl else 5.0)
-    )
+    # NEFTune (embedding noise) regularises SFT, but only on non-KL: on a KL task
+    # the noise would leak into the disable_adapter base forward and corrupt the
+    # reference. (It applies in training mode only, so eval stays clean.)
+    kwargs = build_training_kwargs(spec, plan, neftune_alpha=None if is_kl else 5.0)
+    if val_ex:
+        steps_per_epoch = max(1, len(train_ex) // eff_batch)
+        kwargs.update(
+            eval_strategy="steps",
+            eval_steps=max(1, steps_per_epoch // 2),  # ~2 evals/epoch, no floor bug
+            per_device_eval_batch_size=max(1, plan.per_device_batch_size),
+        )
+    args = TrainingArguments(**kwargs)
+
     collator = tokenize.PadCollator(tokenizer.pad_token_id)
+    # Mirror less often when full weights are large to write (kill-safety is still
+    # covered by the eager floor + final save + the DeadlineCallback margin).
+    mirror_every = 100 if strategy == "full" else 25
     callbacks = [
         DeadlineCallback(deadline),
-        _make_periodic_save_callback(spec, tokenizer, every=25),
+        _make_periodic_save_callback(spec, tokenizer, every=mirror_every),
         telemetry.make_trainer_callback(spec.output_dir),
     ]
 
     trainer_kwargs = dict(
         model=model,
         args=args,
-        train_dataset=Dataset.from_list(tokenized),
+        train_dataset=Dataset.from_list(train_ex),
+        eval_dataset=Dataset.from_list(val_ex) if val_ex else None,
         data_collator=collator,
         callbacks=callbacks,
     )
@@ -109,3 +163,16 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
 
     safe_train(trainer)
     save_adapter(model, tokenizer, spec.output_dir)
+
+
+def _split_for_eval(tokenized: list) -> tuple[list, list]:
+    """Small held-out slice for eval-loss logging; empty on tiny datasets."""
+    n = len(tokenized)
+    if n < _EVAL_MIN_DATASET:
+        return tokenized, []
+    idx = list(range(n))
+    random.Random(7).shuffle(idx)
+    val_idx = set(idx[:_EVAL_VAL_ROWS])
+    train = [ex for i, ex in enumerate(tokenized) if i not in val_idx]
+    val = [tokenized[i] for i in sorted(val_idx)]
+    return train, val

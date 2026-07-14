@@ -30,6 +30,9 @@ class TrainPlan:
     gradient_checkpointing: bool
     bf16: bool
     fp16: bool
+    # "lora" (adapter) or "full" (all weights). LoRA is the default and covers
+    # KL tasks + large/multi-GPU models; "full" is chosen for small non-KL models.
+    strategy: str = "lora"
 
 
 def _hardware() -> tuple[bool, bool]:
@@ -62,12 +65,40 @@ def _base(cuda: bool, bf16: bool) -> dict:
     )
 
 
-def make_sft_plan(*, use_kl: bool) -> TrainPlan:
+def _full_ft_lr(params_b: float) -> float:
+    """Full fine-tune LR falls with model size (champion per-size table)."""
+    if params_b <= 1.0:
+        return 1.0e-4
+    if params_b <= 2.0:
+        return 1.0e-4
+    if params_b <= 4.0:
+        return 7.5e-5
+    return 6.0e-5
+
+
+def make_sft_plan(*, use_kl: bool, strategy: str = "lora", params_b: float = 1.0) -> TrainPlan:
     cuda, bf16 = _hardware()
     b = _base(cuda, bf16)
     # Match the evaluator's 4096 sequence length so long completions aren't
     # truncated in training but kept at scoring. Padding is dynamic (per batch),
     # so a higher cap is nearly free on short data and OOM-retry guards big models.
+
+    if strategy == "full":
+        # Full fine-tuning: the winning axis on small models. Bigger effective
+        # batch (32) keeps the step count low so 2-3 epochs fit the ~1h budget
+        # despite the heavier per-step cost, and spends the GPU headroom LoRA left
+        # idle. num_epochs 3 lets small datasets use more of the budget; the
+        # DeadlineCallback caps big ones. Gradient checkpointing keeps memory sane.
+        if cuda:
+            b["per_device_batch_size"] = 4
+            b["grad_accum_steps"] = 8
+            b["gradient_checkpointing"] = True
+        return TrainPlan(
+            lora_r=0, lora_alpha=0, lora_dropout=0.0,
+            learning_rate=_full_ft_lr(params_b), max_seq_len=4096, num_epochs=3,
+            strategy="full", **b,
+        )
+
     if use_kl:
         # KL tasks penalise divergence from base: a smaller adapter and gentler
         # LR keep us close while still improving eval loss. They also run a second
@@ -78,11 +109,11 @@ def make_sft_plan(*, use_kl: bool) -> TrainPlan:
             b["grad_accum_steps"] = 8
         return TrainPlan(
             lora_r=16, lora_alpha=32, lora_dropout=0.05,
-            learning_rate=1.0e-4, max_seq_len=4096, num_epochs=2, **b,
+            learning_rate=1.0e-4, max_seq_len=4096, num_epochs=2, strategy="lora", **b,
         )
     return TrainPlan(
         lora_r=32, lora_alpha=64, lora_dropout=0.05,
-        learning_rate=1.5e-4, max_seq_len=4096, num_epochs=2, **b,
+        learning_rate=1.5e-4, max_seq_len=4096, num_epochs=2, strategy="lora", **b,
     )
 
 

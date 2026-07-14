@@ -168,7 +168,14 @@ def make_trainer_callback(output_dir: str):
             return control
 
         def on_train_end(self, args, state, control, **kwargs):  # noqa: ANN001
-            event("train_end", steps=int(state.global_step))
+            # epochs completed is the single clearest "did we run out of time"
+            # signal — capture it directly instead of deriving it post-hoc.
+            event(
+                "train_end",
+                steps=int(state.global_step),
+                epochs=round(float(getattr(state, "epoch", 0.0) or 0.0), 3),
+                planned_epochs=int(getattr(args, "num_train_epochs", 0) or 0),
+            )
             note_peak_memory()
             write_into(output_dir)
             return control
