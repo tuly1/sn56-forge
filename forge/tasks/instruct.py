@@ -29,10 +29,13 @@ from forge.model import (
     prepare_full_finetune,
 )
 from forge.tasks.common import (
+    BestTracker,
+    _make_best_checkpoint_callback,
     _make_periodic_save_callback,
     build_training_kwargs,
     safe_train,
     save_adapter,
+    should_final_save,
     time_aware_epochs,
 )
 from forge.tuning.callbacks import DeadlineCallback
@@ -188,11 +191,16 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             probe_per_step_s=round(probe_per_step, 4),
         )
 
+    tracker = BestTracker()
     if val_ex:
         steps_per_epoch = max(1, len(train_ex) // eff_batch)
         kwargs.update(
             eval_strategy="steps",
-            eval_steps=max(1, steps_per_epoch // 2),  # ~2 evals/epoch, no floor bug
+            # ~4 evals/epoch — the week-3 curves put the eval minimum near
+            # 1 epoch with meaningful movement each half-epoch, so 2/epoch was
+            # too sparse to land near it. Relative cadence only: an absolute
+            # floor is the small-task bug that sank the week-1 version.
+            eval_steps=max(1, steps_per_epoch // 4),
             per_device_eval_batch_size=max(1, plan.per_device_batch_size),
         )
     args = TrainingArguments(**kwargs)
@@ -203,9 +211,14 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     mirror_every = 100 if strategy == "full" else 25
     callbacks = [
         DeadlineCallback(deadline),
-        _make_periodic_save_callback(spec, tokenizer, every=mirror_every),
+        _make_periodic_save_callback(spec, tokenizer, every=mirror_every, tracker=tracker),
         telemetry.make_trainer_callback(spec.output_dir),
     ]
+    if val_ex:
+        # Best-checkpoint selection: ship the eval-minimum artifact, not the
+        # final one. Week-3 measured final-vs-best at +0.17 (LoRA) / +0.77
+        # (full-FT) eval loss — the single largest lever we have.
+        callbacks.append(_make_best_checkpoint_callback(spec, tokenizer, tracker))
 
     trainer_kwargs = dict(
         model=model,
@@ -223,7 +236,17 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         trainer = Trainer(**trainer_kwargs)
 
     safe_train(trainer)
-    save_adapter(model, tokenizer, spec.output_dir)
+    if should_final_save(tracker):
+        save_adapter(model, tokenizer, spec.output_dir)
+    else:
+        # The exported best checkpoint is strictly better than final weights;
+        # leave it in place and record why.
+        telemetry.event(
+            "kept_best_checkpoint",
+            best=round(tracker.best, 5),
+            best_step=tracker.best_step,
+            last_eval=round(tracker.last, 5),
+        )
 
 
 def _split_for_eval(tokenized: list) -> tuple[list, list]:

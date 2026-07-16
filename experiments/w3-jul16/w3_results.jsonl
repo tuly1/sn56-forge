@@ -1,0 +1,3 @@
+{"label": "full_tuned", "artifact": "/app/checkpoints/w3full/m", "eval_ce": 2.46279, "completion_tokens": 14956, "val_rows": 256}
+{"label": "lora_tuned", "artifact": "/app/checkpoints/w3lora/m", "eval_ce": 1.45636, "completion_tokens": 14956, "val_rows": 256}
+{"label": "base_reference", "artifact": "base", "eval_ce": 1.58961, "completion_tokens": 14956, "val_rows": 256}

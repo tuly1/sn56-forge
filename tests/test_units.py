@@ -308,6 +308,22 @@ def test_time_aware_epochs_skips_safely():
         assert epochs is None and per_step is None
 
 
+def test_best_tracker_final_save_decision():
+    from forge.tasks.common import BestTracker, should_final_save
+
+    # No eval history (KL / tiny tasks): final save as before.
+    assert should_final_save(None) is True
+    assert should_final_save(BestTracker()) is True
+    # Curve still descending at the end (last eval == best): final weights are
+    # the freshest point of an improving run — ship them.
+    t = BestTracker()
+    t.best, t.best_step, t.last = 1.30, 400, 1.30
+    assert should_final_save(t) is True
+    # Overfit tail (last eval worse than best): keep the exported best.
+    t.last = 1.45
+    assert should_final_save(t) is False
+
+
 def test_median_weight_rms():
     import pytest
 

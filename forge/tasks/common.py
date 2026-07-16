@@ -259,13 +259,78 @@ def _rmtree(path: str) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def _make_periodic_save_callback(spec: TaskSpec, tokenizer: Any, *, every: int = 25):
+class BestTracker:
+    """Shared state for best-checkpoint selection.
+
+    Written by the eval callback; read by the periodic latest-mirror (which
+    stands down once a best exists) and by the final-save decision.
+    """
+
+    def __init__(self) -> None:
+        self.best: float | None = None
+        self.best_step: int | None = None
+        self.last: float | None = None
+
+
+def should_final_save(tracker: "BestTracker | None") -> bool:
+    """Ship final weights only when there is no eval history (KL/tiny tasks) or
+    the last eval WAS the minimum (curve still descending at the end, so the
+    final weights are the freshest point of an improving run). Otherwise the
+    already-exported best checkpoint stays — week-3 measured the final-vs-best
+    gap at +0.17 eval loss on LoRA and +0.77 on full-FT (both overfit by end).
+    """
+    if tracker is None or tracker.best is None:
+        return True
+    return tracker.last is not None and tracker.last <= tracker.best + 1e-9
+
+
+def _make_best_checkpoint_callback(spec: TaskSpec, tokenizer: Any, tracker: BestTracker):
+    """Export the eval-minimum checkpoint the moment it becomes the minimum.
+
+    The atomic dir-swap in save_adapter means a kill at ANY point still leaves
+    a complete artifact at the output path — the best one seen so far. This is
+    what the week-1 (reverted) version lacked: it selected at the END, so a
+    deadline cut shipped whatever was newest, not whatever was best.
+    """
+    from transformers import TrainerCallback
+
+    class BestCheckpointCallback(TrainerCallback):
+        def on_evaluate(self, args, state, control, metrics=None, **kwargs):  # noqa: ANN001
+            loss = (metrics or {}).get("eval_loss")
+            if loss is None:
+                return control
+            tracker.last = float(loss)
+            if tracker.best is None or loss < tracker.best:
+                tracker.best = float(loss)
+                tracker.best_step = int(state.global_step)
+                model = kwargs.get("model")
+                if model is not None:
+                    try:
+                        save_adapter(model, tokenizer, spec.output_dir)
+                        from forge import telemetry
+
+                        telemetry.event(
+                            "best_checkpoint",
+                            step=tracker.best_step,
+                            eval_loss=round(tracker.best, 5),
+                        )
+                    except Exception:
+                        pass  # a failed export must never stop training
+            return control
+
+    return BestCheckpointCallback()
+
+
+def _make_periodic_save_callback(
+    spec: TaskSpec, tokenizer: Any, *, every: int = 25, tracker: BestTracker | None = None
+):
     """Mirror the adapter into the output path every `every` optimizer steps.
 
     Built as a TrainerCallback subclass at call time to keep this module usable
     (for arg/save helpers) even where transformers isn't importable. Keeps the
     latest model at the mandated output path so a wall-clock kill always uploads
-    the most recent trained adapter.
+    the most recent trained adapter. Once a BEST checkpoint exists (tracker),
+    this mirror stands down — "latest" must never overwrite "best".
     """
     from transformers import TrainerCallback
 
@@ -273,6 +338,8 @@ def _make_periodic_save_callback(spec: TaskSpec, tokenizer: Any, *, every: int =
 
     class PeriodicSaveCallback(TrainerCallback):
         def on_step_end(self, args, state, control, **kwargs):  # noqa: ANN001
+            if tracker is not None and tracker.best is not None:
+                return control
             if state.global_step > 0 and state.global_step % step == 0:
                 model = kwargs.get("model")
                 if model is not None:
