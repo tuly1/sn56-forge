@@ -1,0 +1,48 @@
+preflight OK
+===== RUN 1: FULL-FT production path (forge.cli, auto lr) 34k 0.65h =====
+Wed Jul 15 02:41:16 UTC 2026
+run1 exit=0
+===== RUN 2: LoRA baseline 34k 0.65h =====
+Wed Jul 15 03:17:26 UTC 2026
+run2 exit=0
+===== REPORT (runs 1-2) =====
+== FULL-FT@1e-4 (production): strategy=full artifact=full-model
+   epochs_done=1.311/3 eff_batch=32 lr=0.0001
+   train_loss 1.5728 -> 0.9801  (138 pts)
+   EVAL steps=[526, 1052]
+   EVAL curve=[1.7823, 1.7374]  MIN=1.7374@step1052  FINAL=1.7374
+   event: {'t': 13.5, 'name': 'fallback_emitted', 'rung': 'lora_adapter'}
+   event: {'t': 2158.9, 'name': 'deadline_stop', 'step': 1382, 'remaining_s': 1.2, 'per_step_s': 1.13}
+== LoRA (baseline): strategy=lora artifact=adapter
+   epochs_done=0.831/2 eff_batch=16 lr=0.00015
+   train_loss 1.6583 -> 1.3098  (175 pts)
+   EVAL steps=[1053]
+   EVAL curve=[1.2968]  MIN=1.2968@step1053  FINAL=1.2968
+   event: {'t': 2161.0, 'name': 'deadline_stop', 'step': 1751, 'remaining_s': 1.1, 'per_step_s': 1.25}
+FULL-FT@2e-5: NO RESULT ([Errno 2] No such file or directory: '/app/checkpoints/ft34lr2/m/forge_run.json')
+===== RUN 3 (optional): FULL-FT lr=2e-5 34k 0.65h =====
+Wed Jul 15 03:53:29 UTC 2026
+run3 exit=0
+peak GPU mem: 49652 MiB
+===== FINAL REPORT =====
+== FULL-FT@1e-4 (production): strategy=full artifact=full-model
+   epochs_done=1.311/3 eff_batch=32 lr=0.0001
+   train_loss 1.5728 -> 0.9801  (138 pts)
+   EVAL steps=[526, 1052]
+   EVAL curve=[1.7823, 1.7374]  MIN=1.7374@step1052  FINAL=1.7374
+   event: {'t': 13.5, 'name': 'fallback_emitted', 'rung': 'lora_adapter'}
+   event: {'t': 2158.9, 'name': 'deadline_stop', 'step': 1382, 'remaining_s': 1.2, 'per_step_s': 1.13}
+== LoRA (baseline): strategy=lora artifact=adapter
+   epochs_done=0.831/2 eff_batch=16 lr=0.00015
+   train_loss 1.6583 -> 1.3098  (175 pts)
+   EVAL steps=[1053]
+   EVAL curve=[1.2968]  MIN=1.2968@step1053  FINAL=1.2968
+   event: {'t': 2161.0, 'name': 'deadline_stop', 'step': 1751, 'remaining_s': 1.1, 'per_step_s': 1.25}
+== FULL-FT@2e-5: strategy=full artifact=full-model
+   epochs_done=1.257/3 eff_batch=32 lr=2e-05
+   train_loss 1.6103 -> 0.8077  (132 pts)
+   EVAL steps=[526, 1052]
+   EVAL curve=[1.3657, 1.3476]  MIN=1.3476@step1052  FINAL=1.3476
+   event: {'t': 13.4, 'name': 'fallback_emitted', 'rung': 'lora_adapter'}
+   event: {'t': 2161.7, 'name': 'deadline_stop', 'step': 1325, 'remaining_s': 0.9, 'per_step_s': 1.53}
+ALLDONE34

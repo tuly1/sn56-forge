@@ -231,8 +231,10 @@ def test_full_ft_plan_shape():
     p = make_sft_plan(use_kl=False, strategy="full", params_b=1.7)
     assert p.strategy == "full"
     assert p.lora_r == 0  # no adapter
-    assert p.num_epochs == 3  # use more of the budget on small data
-    assert 5e-5 <= p.learning_rate <= 1.1e-4  # size-based full-FT LR
+    assert p.num_epochs == 3  # ceiling; the handler sizes it to the wall clock
+    # eff_batch 16: wall clock binds under deadline pacing, so parity of Adam
+    # updates with the LoRA path beats a bigger batch (week-2 rematch review).
+    assert p.per_device_batch_size * p.grad_accum_steps == 16 or p.per_device_batch_size == 1
     # LoRA path unchanged and still the default.
     lora = make_sft_plan(use_kl=False)
     assert lora.strategy == "lora" and lora.lora_r == 32
@@ -241,6 +243,90 @@ def test_full_ft_plan_shape():
 def test_full_ft_lr_falls_with_size():
     from forge.tuning.plan import _full_ft_lr
     assert _full_ft_lr(0.5) >= _full_ft_lr(3.0) >= _full_ft_lr(7.0)
+
+
+def test_full_ft_lr_champion_law():
+    from forge.tuning.plan import _full_ft_lr
+    # Qwen2.5-1.5B measured values: rms 0.0278, 1.544B -> ~6.7e-5 (in-band).
+    lr = _full_ft_lr(1.544, weight_rms=0.0278)
+    assert 6.0e-5 <= lr <= 7.5e-5
+    # Clamps: the empirically-diverging 1e-4 is the ceiling, 1e-5 the floor.
+    assert _full_ft_lr(0.16, weight_rms=0.5) == 1.0e-4
+    assert _full_ft_lr(70.0, weight_rms=1e-4) == 1.0e-5
+    # No RMS -> conservative static fallback, never the old diverging 1e-4.
+    assert _full_ft_lr(1.5) <= 5.0e-5
+
+
+def test_lora_gc_gate():
+    from forge.tuning.plan import make_sft_plan
+
+    try:
+        import torch
+
+        cuda = torch.cuda.is_available()
+    except ImportError:
+        cuda = False
+    # Big single GPU, plain SFT: checkpointing off (pure throughput tax there).
+    p = make_sft_plan(use_kl=False, n_gpus=1, per_gpu_gb=85.0)
+    assert p.gradient_checkpointing is (False if cuda else False)
+    # KL, multi-GPU, or small GPU keep it on (when cuda).
+    kl = make_sft_plan(use_kl=True, n_gpus=1, per_gpu_gb=85.0)
+    multi = make_sft_plan(use_kl=False, n_gpus=4, per_gpu_gb=85.0)
+    small = make_sft_plan(use_kl=False, n_gpus=1, per_gpu_gb=24.0)
+    assert kl.gradient_checkpointing is cuda
+    assert multi.gradient_checkpointing is cuda
+    assert small.gradient_checkpointing is cuda
+
+
+def test_time_aware_epochs_skips_safely():
+    import time
+
+    from forge.clock import Deadline
+    from forge.tasks.common import time_aware_epochs
+
+    # On CPU (CI/dev) the probe must decline instantly and keep plan defaults.
+    dl = Deadline.from_hours(
+        1.0, started_monotonic=time.monotonic(), export_reserve_s=180
+    )
+    epochs, per_step = time_aware_epochs(
+        trainer_cls=None,
+        model=None,
+        kwargs={},
+        train_ex=[{}] * 10_000,
+        collator=None,
+        deadline=dl,
+        eff_batch=16,
+        strategy="full",
+    )
+    try:
+        import torch
+
+        cuda = torch.cuda.is_available()
+    except ImportError:
+        cuda = False
+    if not cuda:
+        assert epochs is None and per_step is None
+
+
+def test_median_weight_rms():
+    import pytest
+
+    torch = pytest.importorskip("torch")
+
+    from forge.model import median_weight_rms
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = torch.nn.Linear(4, 4, bias=True)  # 2-D weight + 1-D bias
+            self.b = torch.nn.Linear(4, 4, bias=False)
+
+    m = M()
+    torch.nn.init.constant_(m.a.weight, 0.02)
+    torch.nn.init.constant_(m.b.weight, 0.04)
+    rms = median_weight_rms(m)
+    assert rms is not None and 0.02 <= rms <= 0.04  # median of the 2-D RMSes
+    assert median_weight_rms(object()) is None  # never raises
 
 
 # --- telemetry ---------------------------------------------------------------

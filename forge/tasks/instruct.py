@@ -33,6 +33,7 @@ from forge.tasks.common import (
     build_training_kwargs,
     safe_train,
     save_adapter,
+    time_aware_epochs,
 )
 from forge.tuning.callbacks import DeadlineCallback
 from forge.tuning.plan import make_sft_plan
@@ -64,7 +65,16 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         use_kl=is_kl, params_b=params_b, n_gpus=n_gpus, per_gpu_gb=per_gpu_gb
     )
     strategy = "full" if use_full else "lora"
-    plan = make_sft_plan(use_kl=is_kl, strategy=strategy, params_b=params_b)
+    from forge.model import median_weight_rms
+
+    plan = make_sft_plan(
+        use_kl=is_kl,
+        strategy=strategy,
+        params_b=params_b,
+        weight_rms=median_weight_rms(loaded.model) if use_full else None,
+        n_gpus=n_gpus,
+        per_gpu_gb=per_gpu_gb,
+    )
     telemetry.event(
         "strategy_chosen",
         strategy=strategy,
@@ -145,6 +155,39 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     # the noise would leak into the disable_adapter base forward and corrupt the
     # reference. (It applies in training mode only, so eval stays clean.)
     kwargs = build_training_kwargs(spec, plan, neftune_alpha=None if is_kl else 5.0)
+
+    # Size the schedule to the wall clock (zero-LR throughput probe) so the
+    # cosine cooldown completes at the deadline. Must use the same trainer class
+    # as the real run — a plain-Trainer probe would understate KL's double
+    # forward and over-plan the schedule.
+    if is_kl:
+        from forge.tuning.kl import KLSFTTrainer as _probe_cls
+
+        _probe_extra = {"kl_coef": spec.kl_coef}
+    else:
+        from transformers import Trainer as _probe_cls
+
+        _probe_extra = None
+    ta_epochs, probe_per_step = time_aware_epochs(
+        trainer_cls=_probe_cls,
+        model=model,
+        kwargs=kwargs,
+        train_ex=train_ex,
+        collator=tokenize.PadCollator(tokenizer.pad_token_id),
+        deadline=deadline,
+        eff_batch=eff_batch,
+        strategy=strategy,
+        trainer_extra=_probe_extra,
+    )
+    if ta_epochs is not None:
+        kwargs["num_train_epochs"] = ta_epochs
+        telemetry.event(
+            "time_aware_epochs",
+            epochs=ta_epochs,
+            planned=plan.num_epochs,
+            probe_per_step_s=round(probe_per_step, 4),
+        )
+
     if val_ex:
         steps_per_epoch = max(1, len(train_ex) // eff_batch)
         kwargs.update(

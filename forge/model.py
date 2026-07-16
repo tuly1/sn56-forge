@@ -128,6 +128,24 @@ def model_param_billions(model: Any) -> float:
         return 0.0
 
 
+def median_weight_rms(model: Any) -> float | None:
+    """Median RMS of the 2-D weight matrices — the scale term in the champion
+    LR law. Cheap even on GPU (one reduction per matrix); None on failure so
+    the LR falls back to its static table."""
+    try:
+        rms = [
+            p.detach().float().pow(2).mean().sqrt().item()
+            for p in model.parameters()
+            if p.dim() == 2
+        ]
+        if not rms:
+            return None
+        rms.sort()
+        return rms[len(rms) // 2]
+    except Exception:
+        return None
+
+
 def gpu_topology() -> tuple[int, float]:
     """(gpu_count, per_gpu_total_GB). (0, 0.0) on CPU."""
     try:
