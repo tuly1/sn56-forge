@@ -214,8 +214,10 @@ def test_kl_from_env(monkeypatch):
 
 def test_decide_full_finetune_small_nonkl_single_gpu():
     from forge.model import decide_full_finetune
-    # 1.7B non-KL on one 80GB card -> full fine-tune.
-    assert decide_full_finetune(use_kl=False, params_b=1.7, n_gpus=1, per_gpu_gb=80.0) is True
+    # Gate DISABLED for Jul-20: week-3 rematch showed full-FT losing at all
+    # three tested LRs (champion-law never beat base) — LoRA everywhere until
+    # a winner-geometry replica beats LoRA on the replica evaluator.
+    assert decide_full_finetune(use_kl=False, params_b=1.7, n_gpus=1, per_gpu_gb=80.0) is False
     # KL task -> always LoRA (KL trainer needs the adapter).
     assert decide_full_finetune(use_kl=True, params_b=1.7, n_gpus=1, per_gpu_gb=80.0) is False
     # Multi-GPU (large model) -> LoRA (our validated sharding path).

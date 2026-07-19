@@ -178,6 +178,17 @@ def decide_full_finetune(
     - Only when full-FT (bf16 weights+grads + fp32 AdamW states ≈ 12 B/param,
       plus an activation budget) fits inside ~80% of one card's memory.
     """
+    # DISABLED for the Jul-20 tournament (week-3 rematch, export-time evals,
+    # 34k rows / Qwen2.5-1.5B): full-FT lost at ALL THREE tested LRs — 1e-4
+    # diverges at our batch geometry, the champion-law 6.72e-5 NEVER beat the
+    # base model (min 1.69 vs base 1.59), 2e-5 best 1.348 — while LoRA+best-
+    # checkpoint exports 1.29. Jul-16 forensics: the winners' full-FT works at
+    # per-device batch 100 with FA-varlen packing (~200k tok/step) plus
+    # checkpoint-soup selection — machinery we don't have yet. Until a replica
+    # of that geometry beats our LoRA on the replica evaluator, full-FT is a
+    # measured regression, not a strategy.
+    if True:
+        return False
     if use_kl or n_gpus != 1 or per_gpu_gb <= 0 or params_b <= 0:
         return False
     # 16 B/param = fp32 master weights (4) + fp32 grads (4) + fused-AdamW fp32
