@@ -158,13 +158,21 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     )
     if spec.chat is not None:
         conversations = prompts.build_chat_conversations(rows, spec.chat)
+        template_resolution = tokenize.resolve_chat_template(
+            spec.chat.chat_template, tokenizer
+        )
+        if template_resolution.degraded:
+            # The valid floor already exists. Persist the compatibility choice
+            # before processing rows so even a kill during tokenization explains
+            # why native/ChatML semantics replaced the requested future name.
+            telemetry.write_into(spec.output_dir)
         tokenized, seq_len = tokenize.first_nonempty_tokenization(
             seq_candidates,
-            lambda candidate: tokenize.tokenize_chat(
+            lambda candidate: tokenize.tokenize_chat_resolved(
                 conversations,
                 tokenizer,
                 candidate,
-                chat_template=spec.chat.chat_template,
+                resolution=template_resolution,
             ),
         )
     else:

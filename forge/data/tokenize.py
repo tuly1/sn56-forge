@@ -16,9 +16,12 @@ For chat we supervise every assistant turn.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from functools import lru_cache
 from importlib.resources import files
 from typing import Any, Callable
+
+from forge import telemetry
 
 
 def tokenize_instruct(
@@ -136,6 +139,24 @@ def first_nonempty_tokenization(
 _AXOLOTL_TEMPLATE_COMMIT = "0bda5a13e4d52ceec58104f44fabb7bd314f9c02"
 _NAMED_TEMPLATE_RE = re.compile(r"^[a-z0-9][a-z0-9_]*$")
 _TOKENIZER_FALLBACK_PREFIX = "tokenizer_default_fallback_"
+_MAX_TELEMETRY_TEMPLATE_NAME = 128
+
+
+class _UnbundledAxolotlTemplate(ValueError):
+    """The pinned registry does not contain a syntactically valid name."""
+
+
+@dataclass(frozen=True)
+class ChatTemplateResolution:
+    """A literal template plus any compatibility degradation that selected it."""
+
+    template: str
+    fallback: str | None = None
+    reason: str | None = None
+
+    @property
+    def degraded(self) -> bool:
+        return self.fallback is not None
 
 
 @lru_cache(maxsize=None)
@@ -147,7 +168,7 @@ def _load_axolotl_template(name: str) -> str:
     try:
         return resource.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
-        raise ValueError(
+        raise _UnbundledAxolotlTemplate(
             f"Axolotl template {name!r} is not bundled at pinned commit "
             f"{_AXOLOTL_TEMPLATE_COMMIT}"
         ) from exc
@@ -156,6 +177,40 @@ def _load_axolotl_template(name: str) -> str:
 # Compatibility name retained for tests/downstream imports; unlike the old
 # handwritten approximation, this is the evaluator image's exact template.
 _CHATML_TEMPLATE = _load_axolotl_template("chatml")
+
+
+def _degrade_unknown_chat_template(
+    requested: str, tokenizer: Any, *, reason: str
+) -> ChatTemplateResolution:
+    """Keep a newly named upstream template from flooring the whole task.
+
+    The pinned registry remains the parity path.  If G.O.D starts sending a name
+    that this build does not yet bundle, tokenizer-native rendering is a safer
+    compatibility fallback than aborting after the untrained adapter floor has
+    already been written.  A model without a native template falls back once
+    more to our pinned ChatML template so the task still trains, with telemetry
+    making the parity degradation explicit in either case.
+    """
+    native = getattr(tokenizer, "chat_template", None)
+    if isinstance(native, str) and native.strip():
+        fallback = "tokenizer_native"
+        resolved = native
+    else:
+        fallback = "bundled_chatml"
+        resolved = _CHATML_TEMPLATE
+    telemetry.event(
+        "chat_template_degraded",
+        requested=requested[:_MAX_TELEMETRY_TEMPLATE_NAME],
+        requested_length=len(requested),
+        fallback=fallback,
+        reason=reason,
+        pinned_axolotl_commit=_AXOLOTL_TEMPLATE_COMMIT,
+    )
+    return ChatTemplateResolution(
+        template=resolved,
+        fallback=fallback,
+        reason=reason,
+    )
 
 
 def tokenize_chat(
@@ -172,18 +227,36 @@ def tokenize_chat(
     training dependency-free without pretending that a model-native template is
     equivalent to an explicitly requested Axolotl template.
     """
-    resolved_template = _resolve_chat_template(chat_template, tokenizer)
+    resolution = resolve_chat_template(chat_template, tokenizer)
+    return tokenize_chat_resolved(
+        conversations,
+        tokenizer,
+        max_len,
+        resolution=resolution,
+    )
+
+
+def tokenize_chat_resolved(
+    conversations: list[list[dict[str, str]]],
+    tokenizer: Any,
+    max_len: int,
+    *,
+    resolution: ChatTemplateResolution,
+) -> list[dict[str, list[int]]]:
+    """Tokenize rows with a template resolved once outside a retry ladder."""
     out: list[dict[str, list[int]]] = []
     for messages in conversations:
         ids, labels = _mask_assistant_turns(
-            messages, tokenizer, max_len, chat_template=resolved_template
+            messages, tokenizer, max_len, chat_template=resolution.template
         )
         if ids and not all(l == -100 for l in labels):
             out.append({"input_ids": ids, "labels": labels})
     return out
 
 
-def _resolve_chat_template(requested: str | None, tokenizer: Any) -> str:
+def resolve_chat_template(
+    requested: str | None, tokenizer: Any
+) -> ChatTemplateResolution:
     """Resolve the validator's chat-template contract to literal Jinja.
 
     ``None`` means no per-dataset override and therefore resolves through
@@ -210,12 +283,23 @@ def _resolve_chat_template(requested: str | None, tokenizer: Any) -> str:
                 "chat_template='tokenizer_default' requested, but the tokenizer "
                 "does not define a native chat_template"
             )
-        return native
+        return ChatTemplateResolution(native)
     if named.startswith(_TOKENIZER_FALLBACK_PREFIX):
         native = getattr(tokenizer, "chat_template", None)
         if isinstance(native, str) and native.strip():
-            return native
+            return ChatTemplateResolution(native)
         named = named[len(_TOKENIZER_FALLBACK_PREFIX) :]
+        # This is an explicit Axolotl fallback contract, not an unknown direct
+        # name. Preserve its fail-closed behavior for empty, jinja, malformed,
+        # or unbundled suffixes.
+        if not named:
+            raise ValueError("chat_template cannot be empty")
+        if named == "jinja":
+            raise ValueError(
+                "chat_template='jinja' requires a separate Jinja value in Axolotl; "
+                "pass the literal Jinja template in the task payload instead"
+            )
+        return ChatTemplateResolution(_load_axolotl_template(named))
     if not named:
         raise ValueError("chat_template cannot be empty")
     if named == "jinja":
@@ -223,7 +307,21 @@ def _resolve_chat_template(requested: str | None, tokenizer: Any) -> str:
             "chat_template='jinja' requires a separate Jinja value in Axolotl; "
             "pass the literal Jinja template in the task payload instead"
         )
-    return _load_axolotl_template(named)
+    if not _NAMED_TEMPLATE_RE.fullmatch(named):
+        return _degrade_unknown_chat_template(
+            named, tokenizer, reason="unsupported_name"
+        )
+    try:
+        return ChatTemplateResolution(_load_axolotl_template(named))
+    except _UnbundledAxolotlTemplate:
+        return _degrade_unknown_chat_template(
+            named, tokenizer, reason="not_bundled_at_pinned_commit"
+        )
+
+
+# Compatibility name retained for tests/downstream imports.
+def _resolve_chat_template(requested: str | None, tokenizer: Any) -> str:
+    return resolve_chat_template(requested, tokenizer).template
 
 
 def _mask_assistant_turns(

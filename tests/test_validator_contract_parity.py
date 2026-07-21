@@ -154,13 +154,103 @@ def test_complete_pinned_axolotl_named_registry_is_bundled():
         assert "{%" in template or "{{" in template
 
 
-def test_unknown_named_chat_template_fails_before_processing_rows():
+def test_unknown_named_chat_template_degrades_to_tokenizer_native(monkeypatch):
+    native = "{% for message in messages %}MODEL NATIVE{% endfor %}"
+    tokenizer = _RecordingChatTokenizer(native_template=native)
+    events = []
+    monkeypatch.setattr(
+        tokenize.telemetry,
+        "event",
+        lambda name, **values: events.append((name, values)),
+    )
+
+    rows = tokenize.tokenize_chat(
+        _CHAT_ROWS, tokenizer, 512, chat_template="future_axolotl_template"
+    )
+
+    assert rows
+    assert tokenizer.templates_seen
+    assert all(rendered == native for rendered in tokenizer.templates_seen)
+    assert events == [
+        (
+            "chat_template_degraded",
+            {
+                "requested": "future_axolotl_template",
+                "requested_length": len("future_axolotl_template"),
+                "fallback": "tokenizer_native",
+                "reason": "not_bundled_at_pinned_commit",
+                "pinned_axolotl_commit": tokenize._AXOLOTL_TEMPLATE_COMMIT,
+            },
+        )
+    ]
+
+
+def test_unknown_named_chat_template_without_native_degrades_to_chatml(monkeypatch):
+    tokenizer = _RecordingChatTokenizer(native_template=None)
+    events = []
+    monkeypatch.setattr(
+        tokenize.telemetry,
+        "event",
+        lambda name, **values: events.append((name, values)),
+    )
+
+    rows = tokenize.tokenize_chat(
+        _CHAT_ROWS, tokenizer, 512, chat_template="future-template"
+    )
+
+    assert rows
+    assert tokenizer.templates_seen
+    assert all(
+        rendered == tokenize._CHATML_TEMPLATE for rendered in tokenizer.templates_seen
+    )
+    assert events[0][0] == "chat_template_degraded"
+    assert events[0][1]["fallback"] == "bundled_chatml"
+    assert events[0][1]["reason"] == "unsupported_name"
+
+
+def test_unknown_template_degradation_emits_once_across_length_retry(monkeypatch):
     tokenizer = _RecordingChatTokenizer()
+    events = []
+    monkeypatch.setattr(
+        tokenize.telemetry,
+        "event",
+        lambda name, **values: events.append((name, values)),
+    )
+    resolution = tokenize.resolve_chat_template("future_template", tokenizer)
+
+    rows, selected = tokenize.first_nonempty_tokenization(
+        [4, 512],
+        lambda max_len: tokenize.tokenize_chat_resolved(
+            _CHAT_ROWS,
+            tokenizer,
+            max_len,
+            resolution=resolution,
+        ),
+    )
+
+    assert rows
+    assert selected == 512
+    assert [name for name, _values in events] == ["chat_template_degraded"]
+
+
+def test_tokenizer_default_fallback_unknown_suffix_stays_fail_closed(monkeypatch):
+    tokenizer = _RecordingChatTokenizer(native_template=None)
+    events = []
+    monkeypatch.setattr(
+        tokenize.telemetry,
+        "event",
+        lambda name, **values: events.append((name, values)),
+    )
+
     with pytest.raises(ValueError, match="is not bundled"):
         tokenize.tokenize_chat(
-            _CHAT_ROWS, tokenizer, 512, chat_template="not_an_axolotl_template"
+            _CHAT_ROWS,
+            tokenizer,
+            512,
+            chat_template="tokenizer_default_fallback_future_template",
         )
-    assert tokenizer.templates_seen == []
+
+    assert events == []
 
 
 def test_tokenizer_default_requires_a_native_template():
