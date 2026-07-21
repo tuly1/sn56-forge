@@ -112,10 +112,13 @@ def test_build_instruct_examples_drops_empty_completion():
     assert out[0]["completion_text"] == "yo"
 
 
-def test_build_chat_conversations_normalises_roles_and_requires_assistant():
+def test_build_chat_conversations_maps_only_exact_payload_role_references():
     cols = TaskSpec.build(
         task_id="t", task_type="ChatTask", model="m", dataset=None,
-        dataset_type_json="{}", expected_repo_name="r", baseline_stats_path=None,
+        dataset_type_json=json.dumps({
+            "chat_user_reference": "human",
+            "chat_assistant_reference": "gpt",
+        }), expected_repo_name="r", baseline_stats_path=None,
     ).chat
     rows = [
         {"conversations": [
@@ -130,7 +133,7 @@ def test_build_chat_conversations_normalises_roles_and_requires_assistant():
     assert out[0][1]["role"] == "assistant"
 
 
-def test_build_dpo_applies_format_templates():
+def test_build_dpo_matches_evaluator_raw_fields_despite_dormant_formats():
     cols = TaskSpec.build(
         task_id="t", task_type="DpoTask", model="m", dataset=None,
         dataset_type_json=json.dumps({
@@ -140,7 +143,7 @@ def test_build_dpo_applies_format_templates():
         expected_repo_name="r", baseline_stats_path=None,
     ).dpo
     out = prompts.build_dpo_examples([{"p": "why", "c": "good", "r": "bad"}], cols)
-    assert out == [{"prompt": "Q: why", "chosen": "good", "rejected": "bad"}]
+    assert out == [{"prompt": "why", "chosen": "good", "rejected": "bad"}]
 
 
 def test_build_grpo_keeps_prompt_and_extra_column():
@@ -153,7 +156,7 @@ def test_build_grpo_keeps_prompt_and_extra_column():
         expected_repo_name="r", baseline_stats_path=None,
     ).grpo
     out = prompts.build_grpo_examples([{"p": "solve", "meta": 42}, {"p": ""}], spec)
-    assert out == [{"prompt": "solve", "meta": 42}]
+    assert out == [{"prompt": "solve", "extra_data": 42}]
 
 
 # --- loader ----------------------------------------------------------------
@@ -214,8 +217,10 @@ def test_kl_from_env(monkeypatch):
 
 def test_decide_full_finetune_small_nonkl_single_gpu():
     from forge.model import decide_full_finetune
-    # 1.7B non-KL on one 80GB card -> full fine-tune.
-    assert decide_full_finetune(use_kl=False, params_b=1.7, n_gpus=1, per_gpu_gb=80.0) is True
+    # Gate DISABLED for Jul-20: week-3 rematch showed full-FT losing at all
+    # three tested LRs (champion-law never beat base) — LoRA everywhere until
+    # a winner-geometry replica beats LoRA on the replica evaluator.
+    assert decide_full_finetune(use_kl=False, params_b=1.7, n_gpus=1, per_gpu_gb=80.0) is False
     # KL task -> always LoRA (KL trainer needs the adapter).
     assert decide_full_finetune(use_kl=True, params_b=1.7, n_gpus=1, per_gpu_gb=80.0) is False
     # Multi-GPU (large model) -> LoRA (our validated sharding path).
@@ -231,8 +236,10 @@ def test_full_ft_plan_shape():
     p = make_sft_plan(use_kl=False, strategy="full", params_b=1.7)
     assert p.strategy == "full"
     assert p.lora_r == 0  # no adapter
-    assert p.num_epochs == 3  # use more of the budget on small data
-    assert 5e-5 <= p.learning_rate <= 1.1e-4  # size-based full-FT LR
+    assert p.num_epochs == 3  # ceiling; the handler sizes it to the wall clock
+    # eff_batch 16: wall clock binds under deadline pacing, so parity of Adam
+    # updates with the LoRA path beats a bigger batch (week-2 rematch review).
+    assert p.per_device_batch_size * p.grad_accum_steps == 16 or p.per_device_batch_size == 1
     # LoRA path unchanged and still the default.
     lora = make_sft_plan(use_kl=False)
     assert lora.strategy == "lora" and lora.lora_r == 32
@@ -241,6 +248,106 @@ def test_full_ft_plan_shape():
 def test_full_ft_lr_falls_with_size():
     from forge.tuning.plan import _full_ft_lr
     assert _full_ft_lr(0.5) >= _full_ft_lr(3.0) >= _full_ft_lr(7.0)
+
+
+def test_full_ft_lr_champion_law():
+    from forge.tuning.plan import _full_ft_lr
+    # Qwen2.5-1.5B measured values: rms 0.0278, 1.544B -> ~6.7e-5 (in-band).
+    lr = _full_ft_lr(1.544, weight_rms=0.0278)
+    assert 6.0e-5 <= lr <= 7.5e-5
+    # Clamps: the empirically-diverging 1e-4 is the ceiling, 1e-5 the floor.
+    assert _full_ft_lr(0.16, weight_rms=0.5) == 1.0e-4
+    assert _full_ft_lr(70.0, weight_rms=1e-4) == 1.0e-5
+    # No RMS -> conservative static fallback, never the old diverging 1e-4.
+    assert _full_ft_lr(1.5) <= 5.0e-5
+
+
+def test_lora_gc_gate():
+    from forge.tuning.plan import make_sft_plan
+
+    try:
+        import torch
+
+        cuda = torch.cuda.is_available()
+    except ImportError:
+        cuda = False
+    # Big single GPU, plain SFT: checkpointing off (pure throughput tax there).
+    p = make_sft_plan(use_kl=False, n_gpus=1, per_gpu_gb=85.0)
+    assert p.gradient_checkpointing is (False if cuda else False)
+    # KL, multi-GPU, or small GPU keep it on (when cuda).
+    kl = make_sft_plan(use_kl=True, n_gpus=1, per_gpu_gb=85.0)
+    multi = make_sft_plan(use_kl=False, n_gpus=4, per_gpu_gb=85.0)
+    small = make_sft_plan(use_kl=False, n_gpus=1, per_gpu_gb=24.0)
+    assert kl.gradient_checkpointing is cuda
+    assert multi.gradient_checkpointing is cuda
+    assert small.gradient_checkpointing is cuda
+
+
+def test_time_aware_epochs_skips_safely():
+    import time
+
+    from forge.clock import Deadline
+    from forge.tasks.common import time_aware_epochs
+
+    # On CPU (CI/dev) the probe must decline instantly and keep plan defaults.
+    dl = Deadline.from_hours(
+        1.0, started_monotonic=time.monotonic(), export_reserve_s=180
+    )
+    epochs, per_step = time_aware_epochs(
+        trainer_cls=None,
+        model=None,
+        kwargs={},
+        train_ex=[{}] * 10_000,
+        collator=None,
+        deadline=dl,
+        eff_batch=16,
+        strategy="full",
+    )
+    try:
+        import torch
+
+        cuda = torch.cuda.is_available()
+    except ImportError:
+        cuda = False
+    if not cuda:
+        assert epochs is None and per_step is None
+
+
+def test_best_tracker_final_save_decision():
+    from forge.tasks.common import BestTracker, should_final_save
+
+    # No eval history (KL / tiny tasks): final save as before.
+    assert should_final_save(None) is True
+    assert should_final_save(BestTracker()) is True
+    # Curve still descending at the end (last eval == best): final weights are
+    # the freshest point of an improving run — ship them.
+    t = BestTracker()
+    t.best, t.best_step, t.last = 1.30, 400, 1.30
+    assert should_final_save(t) is True
+    # Overfit tail (last eval worse than best): keep the exported best.
+    t.last = 1.45
+    assert should_final_save(t) is False
+
+
+def test_median_weight_rms():
+    import pytest
+
+    torch = pytest.importorskip("torch")
+
+    from forge.model import median_weight_rms
+
+    class M(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = torch.nn.Linear(4, 4, bias=True)  # 2-D weight + 1-D bias
+            self.b = torch.nn.Linear(4, 4, bias=False)
+
+    m = M()
+    torch.nn.init.constant_(m.a.weight, 0.02)
+    torch.nn.init.constant_(m.b.weight, 0.04)
+    rms = median_weight_rms(m)
+    assert rms is not None and 0.02 <= rms <= 0.04  # median of the 2-D RMSes
+    assert median_weight_rms(object()) is None  # never raises
 
 
 # --- telemetry ---------------------------------------------------------------
@@ -279,8 +386,18 @@ def test_save_adapter_carries_flight_recorder_atomically(tmp_path):
 
     class _FakeModel:
         def save_pretrained(self, d, **_k):
-            with open(_os.path.join(d, "adapter_model.safetensors"), "w") as f:
-                f.write("weights")
+            header = json.dumps(
+                {
+                    "weight": {
+                        "dtype": "F32",
+                        "shape": [1],
+                        "data_offsets": [0, 4],
+                    }
+                },
+                separators=(",", ":"),
+            ).encode()
+            with open(_os.path.join(d, "adapter_model.safetensors"), "wb") as f:
+                f.write(len(header).to_bytes(8, "little") + header + b"\x00" * 4)
             with open(_os.path.join(d, "adapter_config.json"), "w") as f:
                 f.write("{}")
 
@@ -300,6 +417,7 @@ def test_save_adapter_carries_flight_recorder_atomically(tmp_path):
     # Adapter and log co-present; stale contents gone; no .tmp/.old leaked.
     assert _os.path.isfile(_os.path.join(out, "adapter_model.safetensors"))
     assert _os.path.isfile(_os.path.join(out, "forge_run.json"))
+    assert _os.path.isfile(_os.path.join(out, ".forge_artifact_ready"))
     assert not _os.path.exists(_os.path.join(out, "stale"))
     assert not _os.path.exists(out + ".tmp") and not _os.path.exists(out + ".old")
     data = json.loads(open(_os.path.join(out, "forge_run.json")).read())
@@ -378,18 +496,14 @@ def test_tokenize_instruct_completion_style_supervises_all_but_bos():
     assert out[0]["labels"] == [-100, ord("x"), ord("y"), 2]
 
 
-def test_tokenize_instruct_truncation_sacrifices_prompt_not_completion():
+def test_tokenize_instruct_drops_overcap_row_like_evaluator():
     tok = _FakeTokenizer()
     out = tokenize.tokenize_instruct(
         [{"prompt_text": "abcdefgh", "completion_text": "xy"}], tok, max_len=6
     )
-    ids, labels = out[0]["input_ids"], out[0]["labels"]
-    assert len(ids) == 6
-    assert ids[0] == 1  # BOS preserved
-    # The completion and its EOS survive intact; the prompt lost its left side.
-    assert ids[-3:] == [ord("x"), ord("y"), 2]
-    assert labels[-3:] == [ord("x"), ord("y"), 2]
-    assert labels[:3] == [-100, -100, -100]
+    # Current Axolotl excess_length_strategy defaults to drop; Forge must not
+    # train a partial row that the evaluator excludes.
+    assert out == []
 
 
 def test_tokenize_instruct_drops_example_with_no_completion_signal():

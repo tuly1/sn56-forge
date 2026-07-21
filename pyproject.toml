@@ -14,11 +14,11 @@ license = { text = "Apache-2.0" }
 # exactly the ones we intend. They are declared here too for local installs, but
 # torch is intentionally omitted: it comes from the base image / platform wheel.
 dependencies = [
-    "transformers==4.57.1",
-    "peft==0.17.1",
-    "trl==0.24.0",
-    "datasets==4.8.5",
-    "accelerate==1.10.1",
+    "transformers==5.12.1",
+    "peft==0.19.1",
+    "trl==1.5.1",
+    "datasets==4.8.4",
+    "accelerate==1.13.0",
     "safetensors==0.8.0",
 ]
 
@@ -32,6 +32,9 @@ sn56-forge = "forge.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["forge*"]
+
+[tool.setuptools.package-data]
+"forge.data" = ["chat_templates/*.jinja", "chat_templates/README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

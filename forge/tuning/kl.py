@@ -59,7 +59,12 @@ class KLSFTTrainer(Trainer):
         if self._kl_calls % 20 == 1:  # sparse sample of the per-token KL magnitude
             from forge import telemetry
 
-            telemetry.sample("kl_per_token", float(kl_sum) / max(1, kl_tokens))
+            # Telemetry is intentionally outside the objective graph. Detach
+            # explicitly before the scalar GPU sync so Torch does not warn that
+            # diagnostics may be participating in autograd.
+            telemetry.sample(
+                "kl_per_token", kl_sum.detach().item() / max(1, kl_tokens)
+            )
 
         loss = ce_loss + self._kl_coef * kl
         return (loss, outputs) if return_outputs else loss
@@ -76,9 +81,18 @@ class KLSFTTrainer(Trainer):
         """
         base_module = model.module if hasattr(model, "module") else model
         model_inputs = {k: v for k, v in inputs.items() if k != "labels"}
-        with torch.no_grad():
-            with base_module.disable_adapter():
-                base_logits = base_module(**model_inputs).logits
+        # The evaluator obtains reference logits in eval mode.  Leaving the PEFT
+        # module in training mode here would apply dropout to the adapter-disabled
+        # reference and optimize against a noisy quantity the scorer never uses.
+        # The policy logits above deliberately remain training-mode logits.
+        was_training = bool(getattr(base_module, "training", False))
+        try:
+            base_module.eval()
+            with torch.no_grad():
+                with base_module.disable_adapter():
+                    base_logits = base_module(**model_inputs).logits
+        finally:
+            base_module.train(was_training)
 
         # Unshifted completion mask: logits[i] gated by labels[i] != -100.
         mask = labels != -100

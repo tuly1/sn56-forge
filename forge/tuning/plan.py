@@ -65,18 +65,35 @@ def _base(cuda: bool, bf16: bool) -> dict:
     )
 
 
-def _full_ft_lr(params_b: float) -> float:
-    """Full fine-tune LR falls with model size (champion per-size table)."""
-    if params_b <= 1.0:
-        return 1.0e-4
+def _full_ft_lr(params_b: float, weight_rms: float | None = None) -> float:
+    """Full fine-tune LR from the champion scaling law.
+
+    seed_lr = 0.003 * median_weight_RMS * sqrt(1e9 / params). The week-2 static
+    table (1e-4 for <=2B) demonstrably DIVERGED on Qwen2.5-1.5B (train loss rose
+    all of epoch 1); the law landed at 6.7e-5 for the same model. Clamped to
+    [1e-5, 1e-4]: the ceiling is the empirically-diverging rate, the floor the
+    empirically-too-cold one.
+    """
+    if weight_rms is not None and weight_rms > 0:
+        lr = 0.003 * weight_rms * (1e9 / (params_b * 1e9)) ** 0.5
+        return max(1.0e-5, min(1.0e-4, lr))
+    # RMS unavailable (should not happen on the real path): conservative static.
     if params_b <= 2.0:
-        return 1.0e-4
+        return 5.0e-5
     if params_b <= 4.0:
-        return 7.5e-5
-    return 6.0e-5
+        return 4.0e-5
+    return 3.0e-5
 
 
-def make_sft_plan(*, use_kl: bool, strategy: str = "lora", params_b: float = 1.0) -> TrainPlan:
+def make_sft_plan(
+    *,
+    use_kl: bool,
+    strategy: str = "lora",
+    params_b: float = 1.0,
+    weight_rms: float | None = None,
+    n_gpus: int = 0,
+    per_gpu_gb: float = 0.0,
+) -> TrainPlan:
     cuda, bf16 = _hardware()
     b = _base(cuda, bf16)
     # Match the evaluator's 4096 sequence length so long completions aren't
@@ -84,19 +101,22 @@ def make_sft_plan(*, use_kl: bool, strategy: str = "lora", params_b: float = 1.0
     # so a higher cap is nearly free on short data and OOM-retry guards big models.
 
     if strategy == "full":
-        # Full fine-tuning: the winning axis on small models. Bigger effective
-        # batch (32) keeps the step count low so 2-3 epochs fit the ~1h budget
-        # despite the heavier per-step cost, and spends the GPU headroom LoRA left
-        # idle. num_epochs 3 lets small datasets use more of the budget; the
-        # DeadlineCallback caps big ones. Gradient checkpointing keeps memory sane.
+        # Full fine-tuning: the winning axis on small models — but only with a
+        # calibrated recipe. eff_batch 16 (not 32): under deadline pacing the
+        # wall clock binds, not the step count, and eff-32 gave 21% fewer Adam
+        # updates than LoRA in equal time (week-2 rematch review). Gradient
+        # checkpointing stays on: full-FT activations at batch 4 x 4096 are the
+        # real memory load. num_epochs 3 is a ceiling — the handler replaces it
+        # with a measured time-aware value so the cosine cooldown lands at the
+        # deadline instead of being cut mid-anneal.
         if cuda:
             b["per_device_batch_size"] = 4
-            b["grad_accum_steps"] = 8
+            b["grad_accum_steps"] = 4
             b["gradient_checkpointing"] = True
         return TrainPlan(
             lora_r=0, lora_alpha=0, lora_dropout=0.0,
-            learning_rate=_full_ft_lr(params_b), max_seq_len=4096, num_epochs=3,
-            strategy="full", **b,
+            learning_rate=_full_ft_lr(params_b, weight_rms), max_seq_len=4096,
+            num_epochs=3, strategy="full", **b,
         )
 
     if use_kl:
@@ -111,6 +131,13 @@ def make_sft_plan(*, use_kl: bool, strategy: str = "lora", params_b: float = 1.0
             lora_r=16, lora_alpha=32, lora_dropout=0.05,
             learning_rate=1.0e-4, max_seq_len=4096, num_epochs=2, strategy="lora", **b,
         )
+    # Plain-SFT LoRA barely touches VRAM (~12GB peak at batch 4 x 4096 on the
+    # week-2 runs), so gradient checkpointing is a pure ~30-40% throughput tax
+    # there. Disable it when a single big GPU has clear headroom; keep it on for
+    # KL (second forward doubles activations), multi-GPU, and small GPUs — the
+    # OOM-retry ladder still backstops a misjudgment.
+    if cuda and not use_kl and n_gpus == 1 and per_gpu_gb >= 60.0:
+        b["gradient_checkpointing"] = False
     return TrainPlan(
         lora_r=32, lora_alpha=64, lora_dropout=0.05,
         learning_rate=1.5e-4, max_seq_len=4096, num_epochs=2, strategy="lora", **b,

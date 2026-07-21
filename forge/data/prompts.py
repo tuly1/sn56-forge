@@ -9,9 +9,36 @@ examples is optimised for the distribution it will be graded on.
 
 from __future__ import annotations
 
+import random
 from typing import Any
 
 from forge.data.schema import ChatColumns, DpoColumns, GrpoSpec, InstructColumns
+
+
+def split_for_eval(
+    examples: list[dict[str, Any]],
+    *,
+    min_size: int,
+    max_eval_rows: int,
+    fraction: float = 0.05,
+    seed: int = 7,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Deterministically reserve a bounded validation slice.
+
+    The returned lists preserve source order, which keeps training reproducible
+    while avoiding a prefix/suffix split that could correlate with source-file
+    ordering.  Tiny datasets stay entirely in training.
+    """
+    if len(examples) < max(2, int(min_size)):
+        return examples, []
+    desired = max(1, int(round(len(examples) * fraction)))
+    n_eval = min(max(1, int(max_eval_rows)), desired, len(examples) - 1)
+    indices = list(range(len(examples)))
+    random.Random(seed).shuffle(indices)
+    eval_indices = set(indices[:n_eval])
+    train = [row for index, row in enumerate(examples) if index not in eval_indices]
+    evaluation = [row for index, row in enumerate(examples) if index in eval_indices]
+    return train, evaluation
 
 
 def build_instruct_examples(
@@ -44,6 +71,20 @@ def build_instruct_examples(
     return out
 
 
+def build_completion_documents(
+    rows: list[dict[str, Any]], cols: InstructColumns
+) -> list[str]:
+    """Extract non-empty documents for Axolotl-style completion chunking."""
+    if cols.output is not None:
+        raise ValueError("completion documents require an instruct spec without output")
+    documents: list[str] = []
+    for row in rows:
+        text = str(row.get(cols.instruction, "") or "")
+        if text.strip():
+            documents.append(text)
+    return documents
+
+
 def build_chat_conversations(
     rows: list[dict[str, Any]], cols: ChatColumns
 ) -> list[list[dict[str, str]]]:
@@ -71,22 +112,25 @@ def build_chat_conversations(
 
 
 def _norm_role(raw: str, cols: ChatColumns) -> str:
-    low = raw.lower()
-    if raw == cols.assistant_value or low in ("assistant", "gpt", "bot", "model"):
+    # Axolotl maps only the exact source references supplied in the task. Other
+    # roles (including system, tool, and custom names) remain verbatim and can
+    # materially affect the selected chat template.
+    if raw == cols.assistant_value:
         return "assistant"
-    if raw == cols.user_value or low in ("user", "human"):
+    if raw == cols.user_value:
         return "user"
-    if "system" in low:
-        return "system"
-    # Unknown speaker: treat as user so it becomes context, never a label.
-    return "user"
+    return raw
 
 
 def build_dpo_examples(
     rows: list[dict[str, Any]], cols: DpoColumns
 ) -> list[dict[str, str]]:
-    """One {prompt, chosen, rejected} per row, applying the validator's format
-    templates. Rows missing any of the three fields are dropped.
+    """One raw {prompt, chosen, rejected} per row, matching the live evaluator.
+
+    G.O.D currently renames these three columns and removes every other column;
+    its format helpers are dormant and have no call sites. Applying payload
+    format strings here would therefore train on text the evaluator never sees.
+    Rows missing any required field are dropped.
     """
     out: list[dict[str, str]] = []
     for row in rows:
@@ -99,10 +143,9 @@ def build_dpo_examples(
         # signal (and would push the DPO loss toward its ln2 floor for nothing).
         if str(chosen_raw) == str(rejected_raw):
             continue
-        system = str(row.get(cols.system, "") or "") if cols.system else ""
-        prompt = cols.prompt_format.format(prompt=str(prompt_raw), system=system)
-        chosen = cols.chosen_format.format(chosen=str(chosen_raw))
-        rejected = cols.rejected_format.format(rejected=str(rejected_raw))
+        prompt = str(prompt_raw)
+        chosen = str(chosen_raw)
+        rejected = str(rejected_raw)
         if not chosen.strip() or not rejected.strip():
             continue
         out.append({"prompt": prompt, "chosen": chosen, "rejected": rejected})
@@ -123,6 +166,10 @@ def build_grpo_examples(
             continue
         example: dict[str, Any] = {"prompt": str(prompt)}
         if spec.extra_column and spec.extra_column in row:
-            example[spec.extra_column] = row[spec.extra_column]
+            # TRL forwards non-prompt dataset columns to reward functions by
+            # their dataset key.  G.O.D's evaluator contract standardizes the
+            # configured source column to `extra_data`, so training must do the
+            # same even when the raw dataset calls it something else.
+            example["extra_data"] = row[spec.extra_column]
         out.append(example)
     return out

@@ -1,0 +1,36 @@
+stack ok 2.5.1+cu124 4.57.1
+preflight OK
+===== LR LAW (from actual weights) =====
+`torch_dtype` is deprecated! Use `dtype` instead!
+LR_LAW {"rms_median": 0.027833517640829086, "params_b": 1.543714304, "lr_law": 6.720566567097587e-05}
+champion-law LR = 6.720566567097587e-05
+===== PROBE 1: full-FT eff16 (0.3h — window must span >=200 steps / 2 mirrors) =====
+Thu Jul 16 03:07:46 UTC 2026
+probe1 exit=0
+CALIB full_eff16 0.598 s/step
+===== PROBE 2: LoRA gc-off (0.25h) =====
+Thu Jul 16 03:22:56 UTC 2026
+probe2 exit=0
+CALIB lora_gcoff 0.474 s/step
+time-aware epochs: full=2.44 lora=3.0
+===== ARM 1: full-FT lr=6.720566567097587e-05 eff16 epochs=2.44 (1h) =====
+Thu Jul 16 03:34:59 UTC 2026
+arm1 exit=0
+===== ARM 2: LoRA gc-off epochs=3.0 (1h) =====
+Thu Jul 16 04:26:14 UTC 2026
+arm2 exit=0
+===== EXPORT-TIME EVALS (the shipped artifacts) =====
+labels: full_tuned lora_tuned
+`torch_dtype` is deprecated! Use `dtype` instead!
+Loading checkpoint shards:   0%|          | 0/2 [00:00<?, ?it/s]Loading checkpoint shards:  50%|█████     | 1/2 [00:00<00:00,  5.27it/s]Loading checkpoint shards: 100%|██████████| 2/2 [00:00<00:00,  8.53it/s]
+EXPORT_EVAL {"label": "full_tuned", "artifact": "/app/checkpoints/w3full/m", "eval_ce": 2.46279, "completion_tokens": 14956, "val_rows": 256}
+`torch_dtype` is deprecated! Use `dtype` instead!
+EXPORT_EVAL {"label": "lora_tuned", "artifact": "/app/checkpoints/w3lora/m", "eval_ce": 1.45636, "completion_tokens": 14956, "val_rows": 256}
+`torch_dtype` is deprecated! Use `dtype` instead!
+EXPORT_EVAL {"label": "base_reference", "artifact": "base", "eval_ce": 1.58961, "completion_tokens": 14956, "val_rows": 256}
+peak GPU mem: 49599 MiB
+===== RESULTS =====
+{"label": "full_tuned", "artifact": "/app/checkpoints/w3full/m", "eval_ce": 2.46279, "completion_tokens": 14956, "val_rows": 256}
+{"label": "lora_tuned", "artifact": "/app/checkpoints/w3lora/m", "eval_ce": 1.45636, "completion_tokens": 14956, "val_rows": 256}
+{"label": "base_reference", "artifact": "base", "eval_ce": 1.58961, "completion_tokens": 14956, "val_rows": 256}
+W3DONE

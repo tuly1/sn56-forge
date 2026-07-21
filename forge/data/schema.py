@@ -10,6 +10,7 @@ assumed, because the validator renames them per task.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -213,7 +214,15 @@ class TaskSpec:
                     assistant_value=_first(
                         payload, "chat_assistant_reference", "assistant", default="assistant"
                     ),
-                    chat_template=_first(payload, "chat_template"),
+                    # Pydantic distinguishes omission (the model default is
+                    # ChatML) from an explicit null (no per-dataset override).
+                    # `_first` intentionally erases that distinction, so inspect
+                    # key presence directly for this field.
+                    chat_template=(
+                        payload["chat_template"]
+                        if "chat_template" in payload
+                        else "chatml"
+                    ),
                 ),
             )
         if task_type == "DpoTask":
@@ -234,13 +243,18 @@ class TaskSpec:
         if task_type == "GrpoTask":
             fns_raw = _require(payload, "reward_functions")
             fns, weights = _normalise_reward_functions(fns_raw)
-            weights = payload.get("reward_weights") or weights
+            explicit_weights = payload.get("reward_weights")
+            if explicit_weights is not None:
+                if not isinstance(explicit_weights, list):
+                    raise TypeError("reward_weights must be a list when provided")
+                weights = explicit_weights
+            weights = _validate_reward_configuration(fns, weights)
             return cls(
                 **common,
                 grpo=GrpoSpec(
                     prompt=_require(payload, "field_prompt", "prompt"),
                     reward_functions=fns,
-                    reward_weights=[float(w) for w in weights],
+                    reward_weights=weights,
                     extra_column=_first(payload, "extra_column"),
                 ),
             )
@@ -254,13 +268,41 @@ def _normalise_reward_functions(raw: list[Any]) -> tuple[list[str], list[float]]
     (`{"reward_func": "...", "reward_weight": 0.7, ...}`), which is the shape the
     live validator sends. Returns (sources, weights).
     """
+    if not isinstance(raw, list):
+        raise TypeError("reward_functions must be a list")
+    if not raw:
+        raise ValueError("reward_functions must not be empty")
+
     sources: list[str] = []
     weights: list[float] = []
     for item in raw:
         if isinstance(item, dict):
-            sources.append(_require(item, "reward_func", "func", "source"))
+            source = _require(item, "reward_func", "func", "source")
+            if not isinstance(source, str) or not source.strip():
+                raise ValueError("each reward function source must be a non-empty string")
+            sources.append(source)
             weights.append(float(_first(item, "reward_weight", "weight", default=1.0)))
         else:
-            sources.append(str(item))
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("each reward function source must be a non-empty string")
+            sources.append(item)
             weights.append(1.0)
     return sources, weights
+
+
+def _validate_reward_configuration(
+    sources: list[str], weights: list[Any]
+) -> list[float]:
+    """Reject configurations that ``zip`` would otherwise silently truncate."""
+    if len(sources) != len(weights):
+        raise ValueError(
+            "reward_functions and reward_weights must have the same length "
+            f"(got {len(sources)} and {len(weights)})"
+        )
+    parsed: list[float] = []
+    for weight in weights:
+        value = float(weight)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("reward weights must be finite and non-negative")
+        parsed.append(value)
+    return parsed
