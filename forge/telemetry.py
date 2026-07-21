@@ -17,13 +17,59 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 _FILENAME = "forge_run.json"
 _MAX_EVENTS = 200
 _MAX_CURVE_POINTS = 300
 _MAX_SAMPLES = 120
+_SENSITIVE_KEYS = {
+    "authorization",
+    "cookie",
+    "credential",
+    "credentials",
+    "password",
+    "passwd",
+    "secret",
+    "session",
+    "signature",
+    "token",
+}
+_SENSITIVE_COLLAPSED_KEYS = {
+    "apikey",
+    "accesskey",
+    "authkey",
+    "privatekey",
+    "secretkey",
+    "sessionid",
+    "sessionkey",
+    "sessiontoken",
+}
+_BEARER_RE = re.compile(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+")
+_AUTH_HEADER_RE = re.compile(
+    r"(?i)\b((?:proxy-)?authorization\s*:\s*)"
+    r"(?:(?:basic|bearer|digest)\s+)?[^\s,;]+"
+)
+_COOKIE_HEADER_RE = re.compile(r"(?im)^(\s*(?:set-)?cookie\s*:)[^\r\n]*")
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b("
+    r"api[_-]?key|access[_-]?key|auth[_-]?key|cookie|"
+    r"aws[_-]?secret[_-]?access[_-]?key|client[_-]?secret|credentials?|"
+    r"password|passwd|private[_-]?key|secret(?:[_-]?key)?|"
+    r"(?:access|refresh|id)[_-]?token|"
+    r"session(?:[_-]?(?:id|key|token))?|signature|token"
+    r")\s*([:=])\s*([^\s,;&]+)"
+)
+_KNOWN_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"github_pat_[A-Za-z0-9_]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|"
+    r"hf_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16}"
+    r")(?![A-Za-z0-9])"
+)
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"<>]+")
 
 _t0 = time.monotonic()
 _data: dict[str, Any] = {
@@ -43,7 +89,9 @@ def _rel() -> float:
 
 def init(**meta: Any) -> None:
     try:
-        _data["meta"].update({k: v for k, v in meta.items() if v is not None})
+        _data["meta"].update(
+            {k: _sanitize_value(v, key=k) for k, v in meta.items() if v is not None}
+        )
         _data["meta"].setdefault("started_unix", int(time.time()))
     except Exception:
         pass
@@ -57,7 +105,8 @@ def event(name: str, **kv: Any) -> None:
     try:
         if len(_data["events"]) >= _MAX_EVENTS:
             return
-        _data["events"].append({"t": _rel(), "name": name, **kv})
+        safe = {k: _sanitize_value(v, key=k) for k, v in kv.items()}
+        _data["events"].append({"t": _rel(), "name": name, **safe})
     except Exception:
         pass
 
@@ -146,6 +195,63 @@ def write_into(output_dir: str) -> None:
         pass
 
 
+def _sanitize_value(value: Any, *, key: str = "") -> Any:
+    """Best-effort redaction for the public flight recorder.
+
+    Tournament artifacts are public.  Diagnostics still need exception text and
+    phase information, but must not publish bearer tokens, signed URL queries, or
+    values stored under credential-like keys.  This helper deliberately keeps the
+    URL path: a missing model/file path is useful forensic evidence, while its
+    query string is where temporary credentials normally live.
+    """
+    low_key = key.lower()
+    key_parts = [part for part in re.split(r"[^a-z0-9]+", low_key) if part]
+    collapsed_key = "".join(key_parts)
+    if any(part in _SENSITIVE_KEYS for part in key_parts) or any(
+        marker in collapsed_key for marker in _SENSITIVE_COLLAPSED_KEYS
+    ):
+        return "<redacted>"
+    if isinstance(value, dict):
+        return {str(k): _sanitize_value(v, key=str(k)) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_value(v, key=key) for v in value]
+    if not isinstance(value, str):
+        return value
+
+    text = _COOKIE_HEADER_RE.sub(r"\1<redacted>", value)
+    text = _AUTH_HEADER_RE.sub(r"\1<redacted>", text)
+    text = _BEARER_RE.sub(r"\1<redacted>", text)
+
+    def _strip_url(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        # Punctuation commonly terminates a URL in an exception sentence.
+        suffix = ""
+        while raw and raw[-1] in ".,);]":
+            suffix = raw[-1] + suffix
+            raw = raw[:-1]
+        try:
+            parts = urlsplit(raw)
+            netloc = parts.netloc
+            if parts.username is not None or parts.password is not None:
+                host = parts.hostname or ""
+                if ":" in host and not host.startswith("["):
+                    host = f"[{host}]"
+                netloc = host
+                if parts.port is not None:
+                    netloc += f":{parts.port}"
+            clean = urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+            return clean + suffix
+        except Exception:
+            return "<redacted-url>" + suffix
+
+    # Strip complete URLs before redacting loose assignments.  Otherwise a
+    # credential inside a query string can introduce ``<``/``>`` delimiters
+    # that cause the URL matcher to stop midway through the same secret URL.
+    text = _URL_RE.sub(_strip_url, text)
+    text = _KNOWN_TOKEN_RE.sub("<redacted-token>", text)
+    return _SECRET_ASSIGNMENT_RE.sub(r"\1\2<redacted>", text)
+
+
 def make_trainer_callback(output_dir: str):
     """A TrainerCallback that records curves and periodically persists the log.
 
@@ -174,7 +280,9 @@ def make_trainer_callback(output_dir: str):
                 "train_end",
                 steps=int(state.global_step),
                 epochs=round(float(getattr(state, "epoch", 0.0) or 0.0), 3),
-                planned_epochs=int(getattr(args, "num_train_epochs", 0) or 0),
+                planned_epochs=round(
+                    float(getattr(args, "num_train_epochs", 0.0) or 0.0), 3
+                ),
             )
             note_peak_memory()
             write_into(output_dir)

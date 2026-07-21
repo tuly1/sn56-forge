@@ -9,3 +9,9 @@ user interfaces, or other materials that accompany the software or its
 derivatives.
 
 Gradients.io is owned by Grads LLC.
+
+This product also includes Axolotl chat-template definitions developed by the
+Axolotl maintainers and contributors (https://github.com/axolotl-ai-cloud/axolotl),
+vendored from commit 0bda5a13e4d52ceec58104f44fabb7bd314f9c02 under the Apache
+License 2.0. They are located in
+forge/data/chat_templates/.

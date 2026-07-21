@@ -1,14 +1,12 @@
 """Supervised fine-tuning for InstructTextTask and ChatTask.
 
-Strategy: on small non-KL models we FULL fine-tune (the week-1 postmortem showed
-every advancer full-fine-tuned and no LoRA miner advanced); on KL tasks and
-large/multi-GPU models we keep the validated LoRA path (the KL trainer needs the
-adapter, and LoRA is the safe multi-GPU route). The choice is made after the
-model loads, from its real parameter count and the GPU it landed on.
+Strategy defaults to the validated LoRA path.  Experimental full fine-tuning is
+fail-closed behind an explicit environment opt-in and remains subject to KL,
+topology, and memory-fit gates; it must be GPU-certified before deployment.
 
 Loss is completion-only, matching the evaluator. We also hold out a small slice
-and log an eval loss purely for post-tournament learning — it drives no decision,
-so it can't repeat the eval-cadence regression that got best-checkpoint reverted.
+and durably export the best measured checkpoint; later unevaluated weights never
+replace that measured minimum.
 """
 
 from __future__ import annotations
@@ -16,13 +14,18 @@ from __future__ import annotations
 import random
 
 from forge import telemetry
+from forge.baseline import (
+    load_baseline_summary,
+    telemetry_fields,
+)
 from forge.clock import Deadline
 from forge.data import loader, prompts, tokenize
 from forge.data.schema import TaskSpec
 from forge.model import (
     attach_lora,
+    conservative_quasar_plan,
     decide_full_finetune,
-    effective_seq_len,
+    effective_sft_seq_len,
     gpu_topology,
     load_base,
     model_param_billions,
@@ -33,6 +36,7 @@ from forge.tasks.common import (
     _make_best_checkpoint_callback,
     _make_periodic_save_callback,
     build_training_kwargs,
+    compatible_dataclass_kwargs,
     safe_train,
     save_adapter,
     should_final_save,
@@ -41,8 +45,8 @@ from forge.tasks.common import (
 from forge.tuning.callbacks import DeadlineCallback
 from forge.tuning.plan import make_sft_plan
 
-# Hold out a small fixed val slice for eval-loss LOGGING only (never gates a
-# checkpoint). Skip it on datasets too small to spare rows.
+# Hold out a small fixed validation slice for measured checkpoint selection.
+# Skip it on datasets too small to spare rows.
 _EVAL_VAL_ROWS = 256
 _EVAL_MIN_DATASET = 1000
 
@@ -61,6 +65,20 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     tokenizer = loaded.tokenizer
     telemetry.collect_env()
 
+    baseline_summary = None
+    try:
+        baseline_summary = load_baseline_summary(
+            spec.baseline_stats_path, expected_task_type=spec.task_type
+        )
+    except Exception as exc:
+        # Stats are untrusted validator input.  A rejected payload is diagnostic
+        # only; preserve the static plan and never publish the raw contents.
+        telemetry.event(
+            "baseline_stats_invalid", error=f"{type(exc).__name__}: {exc}"
+        )
+    if baseline_summary is not None:
+        telemetry.set_meta(**telemetry_fields(baseline_summary))
+
     is_kl = spec.use_kl and spec.kl_coef > 0
     params_b = model_param_billions(loaded.model)
     n_gpus, per_gpu_gb = gpu_topology()
@@ -78,6 +96,20 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         n_gpus=n_gpus,
         per_gpu_gb=per_gpu_gb,
     )
+    original_batch = plan.per_device_batch_size
+    plan, quasar_geometry_changed = conservative_quasar_plan(loaded.model, plan)
+    if quasar_geometry_changed:
+        # The mandatory Quasar remote code advertises gradient checkpointing,
+        # but its decoder never invokes Transformers' checkpoint function. Start
+        # at microbatch 1 so the 10B forced rounds do not depend on a fictitious
+        # memory saving; preserve the original effective batch via accumulation.
+        telemetry.event(
+            "quasar_conservative_geometry",
+            original_batch=original_batch,
+            batch=plan.per_device_batch_size,
+            grad_accum=plan.grad_accum_steps,
+            reason="remote_gradient_checkpointing_is_noop",
+        )
     telemetry.event(
         "strategy_chosen",
         strategy=strategy,
@@ -118,20 +150,43 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     else:
         save_adapter(model, tokenizer, spec.output_dir)
 
-    seq_len = effective_seq_len(loaded.model, plan.max_seq_len)
+    # Baseline stats are provenance-only for SFT length. Shrinking below G.O.D's
+    # evaluator ladder changes which rows retain supervised completion tokens.
+    initial_seq_len = effective_sft_seq_len(loaded.model, plan.max_seq_len)
+    seq_candidates = tokenize.sft_sequence_len_candidates(
+        loaded.model, tokenizer, initial_seq_len
+    )
     if spec.chat is not None:
         conversations = prompts.build_chat_conversations(rows, spec.chat)
-        tokenized = tokenize.tokenize_chat(conversations, tokenizer, seq_len)
+        tokenized, seq_len = tokenize.first_nonempty_tokenization(
+            seq_candidates,
+            lambda candidate: tokenize.tokenize_chat(
+                conversations,
+                tokenizer,
+                candidate,
+                chat_template=spec.chat.chat_template,
+            ),
+        )
     else:
         assert spec.instruct is not None, "instruct task missing instruct columns"
-        examples = prompts.build_instruct_examples(rows, spec.instruct)
-        tokenized = tokenize.tokenize_instruct(examples, tokenizer, seq_len)
+        if spec.instruct.output is None:
+            documents = prompts.build_completion_documents(rows, spec.instruct)
+            seq_len = seq_candidates[0]
+            tokenized = tokenize.tokenize_completion(documents, tokenizer, seq_len)
+        else:
+            examples = prompts.build_instruct_examples(rows, spec.instruct)
+            tokenized, seq_len = tokenize.first_nonempty_tokenization(
+                seq_candidates,
+                lambda candidate: tokenize.tokenize_instruct(
+                    examples, tokenizer, candidate
+                ),
+            )
 
     if not tokenized:
         raise RuntimeError("no trainable examples after tokenization")
 
-    # Eval-loss logging holds out a small slice — but NOT on KL tasks, where each
-    # eval reruns the full KL double-forward and would eat the time budget.
+    # Eval-loss selection holds out a small slice — but NOT on KL tasks, where
+    # each eval reruns the full KL double-forward and would eat the time budget.
     train_ex, val_ex = (tokenized, []) if is_kl else _split_for_eval(tokenized)
     eff_batch = plan.per_device_batch_size * plan.grad_accum_steps
     telemetry.set_meta(
@@ -141,6 +196,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         n_gpus=n_gpus,
         gpu_gb=per_gpu_gb,
         seq_len=seq_len,
+        seq_len_candidates=seq_candidates,
+        baseline_seq_policy="provenance_only",
         tokenized=len(tokenized),
         train_n=len(train_ex),
         val_n=len(val_ex),
@@ -203,7 +260,13 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             eval_steps=max(1, steps_per_epoch // 4),
             per_device_eval_batch_size=max(1, plan.per_device_batch_size),
         )
-    args = TrainingArguments(**kwargs)
+    args = TrainingArguments(
+        **compatible_dataclass_kwargs(
+            TrainingArguments,
+            kwargs,
+            allow_removed={"overwrite_output_dir"},
+        )
+    )
 
     collator = tokenize.PadCollator(tokenizer.pad_token_id)
     # Mirror less often when full weights are large to write (kill-safety is still
@@ -236,7 +299,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         trainer = Trainer(**trainer_kwargs)
 
     safe_train(trainer)
-    if should_final_save(tracker):
+    final_step = int(getattr(trainer.state, "global_step", 0) or 0)
+    if should_final_save(tracker, final_step=final_step):
         save_adapter(model, tokenizer, spec.output_dir)
     else:
         # The exported best checkpoint is strictly better than final weights;
@@ -246,6 +310,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             best=round(tracker.best, 5),
             best_step=tracker.best_step,
             last_eval=round(tracker.last, 5),
+            last_eval_step=tracker.last_step,
+            final_step=final_step,
         )
 
 

@@ -12,21 +12,50 @@ import json
 import math
 import re
 import statistics
+from functools import wraps
 from typing import Any, Callable
+
+# Fixed by G.O.D's evaluator contract (validator/evaluation/constants.py).
+EVAL_BETA_GRPO = 0.5
 
 
 def materialise_rewards(
     sources: list[str], weights: list[float]
 ) -> tuple[list[Callable[..., Any]], list[float]]:
+    if len(sources) != len(weights):
+        raise ValueError(
+            "reward function/weight length mismatch: "
+            f"{len(sources)} functions, {len(weights)} weights"
+        )
     funcs: list[Callable[..., Any]] = []
     kept_weights: list[float] = []
     for src, weight in zip(sources, weights):
         fn = _compile_one(src)
         if fn is None:
             continue
-        funcs.append(fn)
+        funcs.append(_adapt_reward_callable(fn))
         kept_weights.append(float(weight))
     return funcs, kept_weights
+
+
+def _adapt_reward_callable(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Mirror G.O.D's compatibility wrapper for TRL 0.24 reward kwargs.
+
+    TRL supplies prompts, completion ids, trainer state, and dataset columns in
+    addition to completions. Validator-approved legacy functions can still take
+    only ``completions``; retrying without kwargs keeps them usable. Functions
+    accepting ``extra_data`` plus ``**kwargs`` receive the standardized column
+    unchanged.
+    """
+
+    @wraps(fn)
+    def wrapped(completions, **kwargs):  # noqa: ANN001, ANN202
+        try:
+            return fn(completions, **kwargs)
+        except TypeError:
+            return fn(completions)
+
+    return wrapped
 
 
 def _compile_one(src: str) -> Callable[..., Any] | None:

@@ -112,10 +112,13 @@ def test_build_instruct_examples_drops_empty_completion():
     assert out[0]["completion_text"] == "yo"
 
 
-def test_build_chat_conversations_normalises_roles_and_requires_assistant():
+def test_build_chat_conversations_maps_only_exact_payload_role_references():
     cols = TaskSpec.build(
         task_id="t", task_type="ChatTask", model="m", dataset=None,
-        dataset_type_json="{}", expected_repo_name="r", baseline_stats_path=None,
+        dataset_type_json=json.dumps({
+            "chat_user_reference": "human",
+            "chat_assistant_reference": "gpt",
+        }), expected_repo_name="r", baseline_stats_path=None,
     ).chat
     rows = [
         {"conversations": [
@@ -130,7 +133,7 @@ def test_build_chat_conversations_normalises_roles_and_requires_assistant():
     assert out[0][1]["role"] == "assistant"
 
 
-def test_build_dpo_applies_format_templates():
+def test_build_dpo_matches_evaluator_raw_fields_despite_dormant_formats():
     cols = TaskSpec.build(
         task_id="t", task_type="DpoTask", model="m", dataset=None,
         dataset_type_json=json.dumps({
@@ -140,7 +143,7 @@ def test_build_dpo_applies_format_templates():
         expected_repo_name="r", baseline_stats_path=None,
     ).dpo
     out = prompts.build_dpo_examples([{"p": "why", "c": "good", "r": "bad"}], cols)
-    assert out == [{"prompt": "Q: why", "chosen": "good", "rejected": "bad"}]
+    assert out == [{"prompt": "why", "chosen": "good", "rejected": "bad"}]
 
 
 def test_build_grpo_keeps_prompt_and_extra_column():
@@ -153,7 +156,7 @@ def test_build_grpo_keeps_prompt_and_extra_column():
         expected_repo_name="r", baseline_stats_path=None,
     ).grpo
     out = prompts.build_grpo_examples([{"p": "solve", "meta": 42}, {"p": ""}], spec)
-    assert out == [{"prompt": "solve", "meta": 42}]
+    assert out == [{"prompt": "solve", "extra_data": 42}]
 
 
 # --- loader ----------------------------------------------------------------
@@ -383,8 +386,18 @@ def test_save_adapter_carries_flight_recorder_atomically(tmp_path):
 
     class _FakeModel:
         def save_pretrained(self, d, **_k):
-            with open(_os.path.join(d, "adapter_model.safetensors"), "w") as f:
-                f.write("weights")
+            header = json.dumps(
+                {
+                    "weight": {
+                        "dtype": "F32",
+                        "shape": [1],
+                        "data_offsets": [0, 4],
+                    }
+                },
+                separators=(",", ":"),
+            ).encode()
+            with open(_os.path.join(d, "adapter_model.safetensors"), "wb") as f:
+                f.write(len(header).to_bytes(8, "little") + header + b"\x00" * 4)
             with open(_os.path.join(d, "adapter_config.json"), "w") as f:
                 f.write("{}")
 
@@ -404,6 +417,7 @@ def test_save_adapter_carries_flight_recorder_atomically(tmp_path):
     # Adapter and log co-present; stale contents gone; no .tmp/.old leaked.
     assert _os.path.isfile(_os.path.join(out, "adapter_model.safetensors"))
     assert _os.path.isfile(_os.path.join(out, "forge_run.json"))
+    assert _os.path.isfile(_os.path.join(out, ".forge_artifact_ready"))
     assert not _os.path.exists(_os.path.join(out, "stale"))
     assert not _os.path.exists(out + ".tmp") and not _os.path.exists(out + ".old")
     data = json.loads(open(_os.path.join(out, "forge_run.json")).read())
@@ -482,18 +496,14 @@ def test_tokenize_instruct_completion_style_supervises_all_but_bos():
     assert out[0]["labels"] == [-100, ord("x"), ord("y"), 2]
 
 
-def test_tokenize_instruct_truncation_sacrifices_prompt_not_completion():
+def test_tokenize_instruct_drops_overcap_row_like_evaluator():
     tok = _FakeTokenizer()
     out = tokenize.tokenize_instruct(
         [{"prompt_text": "abcdefgh", "completion_text": "xy"}], tok, max_len=6
     )
-    ids, labels = out[0]["input_ids"], out[0]["labels"]
-    assert len(ids) == 6
-    assert ids[0] == 1  # BOS preserved
-    # The completion and its EOS survive intact; the prompt lost its left side.
-    assert ids[-3:] == [ord("x"), ord("y"), 2]
-    assert labels[-3:] == [ord("x"), ord("y"), 2]
-    assert labels[:3] == [-100, -100, -100]
+    # Current Axolotl excess_length_strategy defaults to drop; Forge must not
+    # train a partial row that the evaluator excludes.
+    assert out == []
 
 
 def test_tokenize_instruct_drops_example_with_no_completion_signal():
