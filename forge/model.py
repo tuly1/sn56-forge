@@ -444,6 +444,39 @@ def is_quasar_model(model: Any) -> bool:
     return "quasar" in model_type or "quasar" in class_name
 
 
+def is_qwen35_model(model: Any) -> bool:
+    """Identify native Qwen3.5 from config, independent of the public model id."""
+    config = getattr(model, "config", None)
+    candidates = (config, getattr(config, "text_config", None))
+    for candidate in candidates:
+        model_type = str(getattr(candidate, "model_type", "") or "").lower()
+        if model_type in ("qwen3_5", "qwen3_5_text"):
+            return True
+    return False
+
+
+def conservative_qwen35_plan(model: Any, plan: Any) -> tuple[Any, bool]:
+    """Apply the H100-proven Qwen3.5 LoRA geometry before Trainer creation.
+
+    The production 4x4 plan OOMed at its first optimizer step on Qwen3.5-0.8B;
+    1x16 completed while preserving effective batch 16.  Selecting that route
+    up front avoids mutating an Accelerator-owned schedule or retrying a model
+    after optimizer progress.
+    """
+    if not is_qwen35_model(model):
+        return plan, False
+    if int(plan.per_device_batch_size) == 1 and int(plan.grad_accum_steps) == 16:
+        return plan, False
+    return (
+        replace(
+            plan,
+            per_device_batch_size=1,
+            grad_accum_steps=16,
+        ),
+        True,
+    )
+
+
 def conservative_quasar_plan(model: Any, plan: Any) -> tuple[Any, bool]:
     """Use microbatch one when Quasar's advertised checkpointing is a no-op."""
     if not is_quasar_model(model) or int(plan.per_device_batch_size) <= 1:

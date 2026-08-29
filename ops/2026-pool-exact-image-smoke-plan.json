@@ -1,0 +1,157 @@
+{
+  "schema_version": 1,
+  "kind": "sn56_2026_pool_qwen35_exact_image_smoke_plan_v1",
+  "status": "PLAN_ONLY_NO_GPU_OR_PROVIDER_ACTION",
+  "scope": "focused operational admission of the static Qwen3.5 LoRA geometry; not a scientific comparison or promotion",
+  "source": {
+    "required_parent_commit": "94ef05e36f78825a92a7e8f03d74235bd0b1b233",
+    "required_parent_tree": "7505dac6bda093bf156a4b183cae7f12b568ed4c",
+    "required_clean_candidate": true,
+    "expected_changed_paths": [
+      "forge/model.py",
+      "forge/tasks/instruct.py",
+      "ops/2026-pool-exact-image-smoke-plan.json",
+      "ops/2026-pool-route-matrix.json",
+      "tests/test_2026_pool_robustness.py"
+    ],
+    "bound_file_sha256_before_this_plan": {
+      "forge/model.py": "610b800f80e6be900145e5ad89e13af6ab27721d41a7d6743bd674019d2bf566",
+      "forge/tasks/instruct.py": "235bc4881e24472a560cc43ce67f86daac7b49e598163756c8f8be94810c6f68",
+      "ops/2026-pool-route-matrix.json": "18e928e678aa4bf6246c61c018c85abc120264df7fd78d5c964ec1d9f8befffd",
+      "tests/test_2026_pool_robustness.py": "101b0b259afe3d339c43e2ef31f47d4caebd4b4dd70dde5fed4ada571383d802"
+    }
+  },
+  "pool_authority": {
+    "public_god_commit": "f11b6fca4244a9227ed1531f5fc9b189972bf9ac",
+    "public_god_tree": "d7b42dc1a941c28e613792ce60eef7c62acd295c",
+    "pool_path": "core/oversampled_later_models.json",
+    "pool_sha256": "734cfb9fac917e5e4f0b2ada383bc8f125f0929cec5462ac0afe29bf3ba5ba2e",
+    "route_matrix_path": "ops/2026-pool-route-matrix.json",
+    "route_matrix_sha256": "18e928e678aa4bf6246c61c018c85abc120264df7fd78d5c964ec1d9f8befffd"
+  },
+  "runtime": {
+    "training_image": "axolotlai/axolotl:main-20260701-py3.11-cu128-2.9.1",
+    "oci_index": "sha256:3aa6403f59f2268bb8f686f6c748d6fad2949580a0048cd25a605eb2de239ee5",
+    "oci_linux_amd64_manifest": "sha256:97fba6ae924a55059bf48c5996014f0675d569df1b9c96e0cb0a0f922f355883",
+    "oci_config": "sha256:08c3197175dedd5aa837660b898ff49f72b5b5d6429ee5b77cb95e3376a80415",
+    "network_after_staging": "none",
+    "required_physical_gpu": "exactly one NVIDIA H100 PCIe",
+    "required_environment": {
+      "FORGE_ENABLE_EXPERIMENTAL_FULL_FT": "ABSENT",
+      "HF_HUB_OFFLINE": "1",
+      "KL_COEF": "0",
+      "PYTHONDONTWRITEBYTECODE": "1",
+      "PYTHONHASHSEED": "43",
+      "TOKENIZERS_PARALLELISM": "false",
+      "TRANSFORMERS_OFFLINE": "1",
+      "USE_KL": "0",
+      "WANDB_MODE": "offline"
+    }
+  },
+  "model": {
+    "id": "Qwen/Qwen3.5-0.8B",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "config_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+    "model_type": "qwen3_5",
+    "architecture": "Qwen3_5ForConditionalGeneration",
+    "tokenizer_inventory_sha256": "99e4b2d6c0d0571877f7f7301fa32f23051a46c6ab1e19dca1b5646071cc12da"
+  },
+  "fixture": {
+    "fixture_id": "TXT-I2-CONFIRM-QWEN35",
+    "ledger_sha256": "f123db51b2e0c4d4c6340432348ae1f3189929ee93658c2ca9bb14fa05de191a",
+    "manifest_sha256": "5fc4f9551bf8d3e179cbd7457425f6ec564d9a924b108f00144a85c60ca27bc1",
+    "template_sha256": "61ec00982ab1febe1aac277a0238e46879adf4bf45061ad829e16175a96ee6e7",
+    "train": {
+      "rows": 10987,
+      "sha256": "d161efb833f55c19972a576c0211a33b2e7ce9486c15a7fe033305f7bdcd91ce"
+    },
+    "dev": {
+      "rows": 2000,
+      "sha256": "248797168dd6028ff169a7a8c6a81399620d47f7dfbc6de93f7794e9de2da52b"
+    },
+    "eval": {
+      "rows": 1996,
+      "sha256": "1f314569244a0aae0bb07f54f8b252cec5d6061f493764ab94de5ed5079146a1"
+    },
+    "active_exact_evaluator_prepared_rows": 1993,
+    "active_exact_evaluator_fingerprint": "345f0fae4404d3486206423caa6b2c48"
+  },
+  "argv_materialization": {
+    "source_path": "lanes/01-instruct-chat/evidence/cpu-scalar-selector-i2-seed43/CONTROL-ARGV.json",
+    "source_sha256": "2b10a4c0e65ef2a9a8f7ed79576a0e86b4e7659e2f106518ab876cdd3a1ff46e",
+    "required_exact_substitutions": {
+      "--task-id": [
+        "txt-i2-qwen35-0p8b-kl0-seed43-control",
+        "txt-2026-pool-qwen35-0p8b-route-smoke"
+      ],
+      "--expected-repo-name": [
+        "sn56-l1-control",
+        "sn56-2026-pool-qwen35-route-smoke"
+      ],
+      "--hours-to-complete": [
+        "12",
+        "0.75"
+      ]
+    },
+    "all_other_argv_elements": "BYTE_IDENTICAL_TO_BOUND_SOURCE",
+    "candidate_source_mount": "clean committed candidate tree from required parent",
+    "baseline_stats": "must be revalidated for the frozen fixture and bound by SHA before launch"
+  },
+  "prelaunch_cpu_gates": [
+    "candidate commit is clean, has the required sole parent, and changes exactly the five declared paths",
+    "the focused route test passes inside the exact training image",
+    "the full repository suite and legal verifier pass on the frozen source",
+    "all twelve matrix rows reopen at their immutable config revisions and hashes",
+    "the model, tokenizer, fixture, baseline, argv, image, and output-root inventories reopen byte-exact",
+    "fresh inventory, no create intent, can-create, funding, key, image, and one-H100 geometry gates pass before any single provider POST"
+  ],
+  "gpu_smoke": {
+    "classification": "OPERATIONAL_EXACT_IMAGE_SMOKE_ONLY_NO_SCORE_NO_PROMOTION",
+    "geometry": {
+      "per_device_train_batch_size": 1,
+      "gradient_accumulation_steps": 16,
+      "effective_batch": 16,
+      "gradient_checkpointing": "unchanged from the upstream production plan"
+    },
+    "required_observations_in_order": [
+      "physical one-H100 identity, container digest, source commit/tree, and immutable input hashes",
+      "qwen35_conservative_geometry telemetry before LoRA attachment and Trainer construction",
+      "untrained LoRA floor is durably readable before tokenization",
+      "trainer PID binds the expected argv and GPU; first positive optimizer progress occurs with 1x16 geometry",
+      "at least one scheduled evaluator loss and its atomically exported best adapter are durable",
+      "later/final weights do not overwrite the measured best export",
+      "all logs, telemetry, floor, best checkpoint, and terminal receipt are copied and reopened off-host before teardown"
+    ],
+    "failure_policy": {
+      "oom_at_batch1_acc16": "HOLD; do not retry after optimizer progress",
+      "sequence_length_reduction": "forbidden after Trainer construction or optimizer progress; this static-route smoke authorizes no additional reduction",
+      "generic_model_load_failure": "HOLD; do not classify it as an attention fallback experiment",
+      "attention_fallback": "unchanged production behavior; this patch adds no loader fallback",
+      "architecture_rewrite": "forbidden",
+      "checkpoint_soup": "forbidden"
+    }
+  },
+  "envelope": {
+    "trainer_deadline_hours": 0.75,
+    "staging_custody_and_teardown_reserve_hours": 0.25,
+    "maximum_h100_hours": 1.0,
+    "reference_rate_usd_per_h100_hour": 2.00672043,
+    "projected_maximum_usd_at_reference_rate": 2.00672043,
+    "funding_rule": "fresh provider rate times 1.0 H100h plus any separately preserved campaign reserve must be funded before create",
+    "provider_mutation_authorized_by_this_plan": false
+  },
+  "terminal_gpu_gates_before_any_release": [
+    "this exact-image Qwen3.5-0.8B smoke completes with all ordered observations",
+    "at least one representative exact-image load/train/export smoke passes for Gemma4, LFM2, LFM2-MoE, Granite, and MiniCPM families before treating the twelve-row declaration as generally GPU-certified",
+    "any decision-relevant candidate is externally scored on its frozen evaluator and fixture against a matched control",
+    "causal promotion and rollback gates are independently satisfied"
+  ],
+  "forbidden": [
+    "provider POST or purchase from this CPU artifact",
+    "provider or lifecycle source changes",
+    "DPO or GRPO source changes",
+    "LoRA architectures mutation",
+    "checkpoint soup",
+    "partial-smoke scientific or release claim"
+  ]
+}

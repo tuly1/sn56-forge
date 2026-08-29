@@ -23,6 +23,7 @@ from forge.data import loader, prompts, tokenize
 from forge.data.schema import TaskSpec
 from forge.model import (
     attach_lora,
+    conservative_qwen35_plan,
     conservative_quasar_plan,
     decide_full_finetune,
     effective_sft_seq_len,
@@ -97,6 +98,18 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         per_gpu_gb=per_gpu_gb,
     )
     original_batch = plan.per_device_batch_size
+    original_grad_accum = plan.grad_accum_steps
+    plan, qwen35_geometry_changed = conservative_qwen35_plan(loaded.model, plan)
+    if qwen35_geometry_changed:
+        telemetry.event(
+            "qwen35_conservative_geometry",
+            original_batch=original_batch,
+            original_grad_accum=original_grad_accum,
+            batch=plan.per_device_batch_size,
+            grad_accum=plan.grad_accum_steps,
+            effective_batch=plan.per_device_batch_size * plan.grad_accum_steps,
+            reason="h100_proven_pretrainer_geometry",
+        )
     plan, quasar_geometry_changed = conservative_quasar_plan(loaded.model, plan)
     if quasar_geometry_changed:
         # The mandatory Quasar remote code advertises gradient checkpointing,

@@ -1,0 +1,136 @@
+{
+  "schema_version": 1,
+  "kind": "sn56_2026_pool_cpu_model_route_matrix_v1",
+  "status": "CPU_DECLARATION_REQUIRES_EXACT_IMAGE_GPU_SMOKE",
+  "observed_at_utc": "2026-08-28",
+  "authority": {
+    "public_god_commit": "f11b6fca4244a9227ed1531f5fc9b189972bf9ac",
+    "public_god_tree": "d7b42dc1a941c28e613792ce60eef7c62acd295c",
+    "pool_path": "core/oversampled_later_models.json",
+    "pool_sha256": "734cfb9fac917e5e4f0b2ada383bc8f125f0929cec5462ac0afe29bf3ba5ba2e",
+    "row_count": 12,
+    "config_source": "public Hugging Face model repository at the recorded immutable revision"
+  },
+  "policy": {
+    "route_key": "config.model_type, then config.text_config.model_type",
+    "default_lora_h100_geometry": {
+      "per_device_train_batch_size": 4,
+      "gradient_accumulation_steps": 4,
+      "effective_batch": 16
+    },
+    "qwen3_5_geometry": {
+      "per_device_train_batch_size": 1,
+      "gradient_accumulation_steps": 16,
+      "effective_batch": 16,
+      "evidence": "Qwen3.5-0.8B completed 1342 optimizer steps on one H100 with this geometry after production 4x4 OOMed at optimizer step 1"
+    },
+    "qwen3_5_retry_choice": "STATIC_PROVEN_GEOMETRY_SELECTED_NO_TRAINER_FACTORY_LADDER",
+    "post_start_geometry_or_sequence_mutation": false,
+    "attention_load_order": [
+      "sdpa",
+      "existing_production_eager_fallback_unchanged"
+    ],
+    "loader_behavior_delta": false,
+    "lora_architectures_rewrite": false,
+    "checkpoint_construction_or_soup": false,
+    "untrained_floor_and_always_best_export": "UNCHANGED_PRODUCTION_BYTES_OR_CONTROL_FLOW"
+  },
+  "models": [
+    {
+      "model_id": "Qwen/Qwen3.5-0.8B",
+      "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+      "config_sha256": "b90b86f35c8e6925ef74ee04d0e758f0a845c83a42089ad82bbaa948de9b4204",
+      "model_type": "qwen3_5",
+      "architectures": ["Qwen3_5ForConditionalGeneration"],
+      "route": "QWEN35_BATCH1_ACC16"
+    },
+    {
+      "model_id": "Qwen/Qwen3.5-2B",
+      "revision": "15852e8c16360a2fea060d615a32b45270f8a8fc",
+      "config_sha256": "ed1c1723241f23f7f4e23430759cbd7dcfb4103cbdfe052bfe7626b57c2615b4",
+      "model_type": "qwen3_5",
+      "architectures": ["Qwen3_5ForConditionalGeneration"],
+      "route": "QWEN35_BATCH1_ACC16"
+    },
+    {
+      "model_id": "Qwen/Qwen3.5-4B",
+      "revision": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
+      "config_sha256": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
+      "model_type": "qwen3_5",
+      "architectures": ["Qwen3_5ForConditionalGeneration"],
+      "route": "QWEN35_BATCH1_ACC16"
+    },
+    {
+      "model_id": "Qwen/Qwen3.5-9B",
+      "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+      "config_sha256": "d0883072e01861ed0b2d47be3c16c36a8e81c224c7ffaa310c6558fb3f932b05",
+      "model_type": "qwen3_5",
+      "architectures": ["Qwen3_5ForConditionalGeneration"],
+      "route": "QWEN35_BATCH1_ACC16"
+    },
+    {
+      "model_id": "google/gemma-4-E2B-it",
+      "revision": "3e22461f65e89153144f8adb70e3b8c2cc9845a7",
+      "config_sha256": "1b28f3d2c3100f6c594754b81107428bd7b822a7f48272ca681dae9d2ec38330",
+      "model_type": "gemma4",
+      "architectures": ["Gemma4ForConditionalGeneration"],
+      "route": "PRODUCTION_LORA"
+    },
+    {
+      "model_id": "google/gemma-4-E4B-it",
+      "revision": "ee0ef6023621cff504d758262d4e04895a5af4a2",
+      "config_sha256": "33b10c02df3c2e8536cf323d29d53262aaa2f4d11dbe19bc729373fbe90295d4",
+      "model_type": "gemma4",
+      "architectures": ["Gemma4ForConditionalGeneration"],
+      "route": "PRODUCTION_LORA"
+    },
+    {
+      "model_id": "LiquidAI/LFM2.5-1.2B-Instruct",
+      "revision": "0f604ada3f766f9f257460c4c9f0b5d6f69d431b",
+      "config_sha256": "15d6157fb6df3f8272e2fe90e18f57727ccf02a125c94469198b0f3281510185",
+      "model_type": "lfm2",
+      "architectures": ["Lfm2ForCausalLM"],
+      "route": "PRODUCTION_LORA"
+    },
+    {
+      "model_id": "LiquidAI/LFM2.5-2.6B",
+      "revision": "654f9463ce32b05d0429d76fe1f580b27d4c1ac0",
+      "config_sha256": "480f63fa8e1efa534ae8b92774b3b53b8d6812d62a726e9ecfc866933662f273",
+      "model_type": "lfm2",
+      "architectures": ["Lfm2ForCausalLM"],
+      "route": "PRODUCTION_LORA"
+    },
+    {
+      "model_id": "LiquidAI/LFM2.5-8B-A1B",
+      "revision": "5dd22602c2e9f6a097b1de4c4efe0658b605015c",
+      "config_sha256": "9c0255c2d5c744c99b760a12edca2572935348dae340e79e2e6625af975d2d68",
+      "model_type": "lfm2_moe",
+      "architectures": ["Lfm2MoeForCausalLM"],
+      "route": "PRODUCTION_LORA"
+    },
+    {
+      "model_id": "ibm-granite/granite-4.1-3b",
+      "revision": "c0650403e44e78ec0262dab1c90914c65b196c4e",
+      "config_sha256": "9a0e589b69e7d3ad9fb9fb2c844aa7d7156e052cb7ea4211de7de48ab7c8525c",
+      "model_type": "granite",
+      "architectures": ["GraniteForCausalLM"],
+      "route": "PRODUCTION_LORA"
+    },
+    {
+      "model_id": "ibm-granite/granite-4.1-8b",
+      "revision": "1504002f650e656a0a3789d99574df12e3e94ed0",
+      "config_sha256": "dea9d856cb57018117fe2fe3366f37cb4aa39424890061db2c0045a6a4efbda0",
+      "model_type": "granite",
+      "architectures": ["GraniteForCausalLM"],
+      "route": "PRODUCTION_LORA"
+    },
+    {
+      "model_id": "openbmb/MiniCPM5-1B",
+      "revision": "87179e5c1f455ef22e6223592d2d61351b525bfc",
+      "config_sha256": "6a6509b646cb3169616c5ffc3196e7ccaf9d4d6bc17b266581d241a31c217714",
+      "model_type": "llama",
+      "architectures": ["LlamaForCausalLM"],
+      "route": "PRODUCTION_LORA"
+    }
+  ]
+}
