@@ -11,6 +11,7 @@ replace that measured minimum.
 
 from __future__ import annotations
 
+import os
 import random
 
 from forge import telemetry
@@ -42,9 +43,15 @@ from forge.tasks.common import (
     save_adapter,
     should_final_save,
     time_aware_epochs,
+    workdir,
 )
 from forge.tuning.callbacks import DeadlineCallback
 from forge.tuning.plan import make_sft_plan
+from forge.tuning.qwen35_soup import (
+    apply_qwen35_soup_override,
+    eligible_qwen35_soup_route,
+    make_qwen35_soup_capture_callback,
+)
 
 # Hold out a small fixed validation slice for measured checkpoint selection.
 # Skip it on datasets too small to spare rows.
@@ -270,6 +277,13 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         )
 
     tracker = BestTracker()
+    soup_route = eligible_qwen35_soup_route(
+        spec,
+        model,
+        strategy=strategy,
+        n_gpus=n_gpus,
+        capture_root=os.path.join(workdir(spec), "qwen35-r4-r2-captures"),
+    )
     if val_ex:
         steps_per_epoch = max(1, len(train_ex) // eff_batch)
         kwargs.update(
@@ -303,6 +317,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         # final one. Week-3 measured final-vs-best at +0.17 (LoRA) / +0.77
         # (full-FT) eval loss — the single largest lever we have.
         callbacks.append(_make_best_checkpoint_callback(spec, tokenizer, tracker))
+        if soup_route is not None:
+            callbacks.append(make_qwen35_soup_capture_callback(soup_route, tokenizer))
 
     trainer_kwargs = dict(
         model=model,
@@ -334,6 +350,12 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             last_eval_step=tracker.last_step,
             final_step=final_step,
         )
+    apply_qwen35_soup_override(
+        soup_route,
+        tracker=tracker,
+        model=model,
+        tokenizer=tokenizer,
+    )
 
 
 def _split_for_eval(tokenized: list) -> tuple[list, list]:
