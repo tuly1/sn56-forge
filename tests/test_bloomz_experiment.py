@@ -5,6 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 import shutil
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -42,6 +43,7 @@ def _runtime_authority() -> dict[str, object]:
             "architecture": "amd64",
             "repo_digests": [bloomz.TRAINING_IMAGE],
         },
+        "lease": bloomz.lease_authority(4_102_444_800),
     }
 
 
@@ -208,23 +210,26 @@ def test_bloom_plan_freezes_identical_safe_geometry(arm: str, strategy: str, lr:
     assert routed.learning_rate == lr
 
 
-def _write_fixture_manifest(root: Path) -> Path:
+def _write_training_fixture(root: Path) -> tuple[Path, dict[str, object]]:
+    root.mkdir()
     splits = {}
     for name in ("train", "dev"):
         path = root / f"{name}.jsonl"
-        path.write_text('{"system":"","instruct":"q","output":"a"}\n')
+        path.write_text(
+            '{"system":"","instruct":"explain confirmation bias",'
+            '"output":"confirmation can be ordinary training text"}\n'
+        )
         splits[name] = {
             "filename": path.name,
             "row_count": 1,
             "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
-    splits["confirmation"] = {
-        "filename": "must-stay-unopened.jsonl",
-        "row_count": 1,
-        "sha256": "0" * 64,
-    }
+    dataset_type = root / "dataset-type.json"
+    dataset_type.write_text("{}\n", encoding="utf-8")
+    baseline = root / "baseline-stats.json"
+    baseline.write_text("{}\n", encoding="utf-8")
     manifest = {
-        "schema_version": "sn56.bloomz-public-fixture.v1",
+        "schema_version": "sn56.bloomz-training-fixture.v1",
         "identities": {
             "dataset": {
                 "repo": bloomz.DATASET_REPO,
@@ -239,19 +244,34 @@ def _write_fixture_manifest(root: Path) -> Path:
             },
         },
         "splits": splits,
+        "schema": {
+            "fields": ["system", "instruct", "output"],
+            "dataset_type": {
+                "filename": dataset_type.name,
+                "sha256": hashlib.sha256(dataset_type.read_bytes()).hexdigest(),
+            },
+        },
+        "artifacts": {
+            "baseline_stats": {
+                "filename": baseline.name,
+                "sha256": hashlib.sha256(baseline.read_bytes()).hexdigest(),
+            }
+        },
     }
-    path = root / "manifest.json"
+    path = root / "training-manifest.json"
     path.write_text(json.dumps(manifest))
-    return path
+    return path, manifest
 
 
-def test_route_verifies_train_dev_but_never_opens_confirmation(tmp_path, monkeypatch) -> None:
-    manifest = _write_fixture_manifest(tmp_path)
+def test_training_fixture_physically_excludes_confirmation(tmp_path, monkeypatch) -> None:
+    training_root = tmp_path / "training"
+    manifest, contract = _write_training_fixture(training_root)
     monkeypatch.setattr(
         bloomz,
-        "FIXTURE_MANIFEST_SHA256",
+        "TRAINING_MANIFEST_SHA256",
         hashlib.sha256(manifest.read_bytes()).hexdigest(),
     )
+    monkeypatch.setattr(bloomz, "training_manifest_contract", lambda: contract)
     monkeypatch.setenv("FORGE_BLOOMZ_EXPERIMENT_ARM", "full")
     monkeypatch.setenv("FORGE_ENABLE_EXPERIMENTAL_FULL_FT", "1")
     monkeypatch.setenv("FORGE_BLOOMZ_LR", "1e-4")
@@ -259,7 +279,7 @@ def test_route_verifies_train_dev_but_never_opens_confirmation(tmp_path, monkeyp
     monkeypatch.setenv(
         "FORGE_BLOOMZ_MAX_STEPS", str(bloomz.MATCHED_DECISION_STEPS)
     )
-    monkeypatch.setenv("FORGE_BLOOMZ_FIXTURE_MANIFEST", str(manifest))
+    monkeypatch.setenv("FORGE_BLOOMZ_TRAINING_MANIFEST", str(manifest))
     runtime_path = tmp_path / "runtime-authority.json"
     monkeypatch.setenv("FORGE_BLOOMZ_RUNTIME_AUTHORITY", str(runtime_path))
     runtime_authority = _runtime_authority()
@@ -294,7 +314,13 @@ def test_route_verifies_train_dev_but_never_opens_confirmation(tmp_path, monkeyp
     assert request.gpu_admission_sha256 == hashlib.sha256(
         admission_path.read_bytes()
     ).hexdigest()
-    assert not (tmp_path / "must-stay-unopened.jsonl").exists()
+    assert "confirmation" in request.train_path.read_text(encoding="utf-8")
+    assert not any("confirmation" in path.name for path in training_root.iterdir())
+    forbidden = training_root / "confirmation.jsonl"
+    forbidden.write_text("forbidden\n", encoding="utf-8")
+    with pytest.raises(bloomz.BloomzExperimentError, match="physically contain only"):
+        bloomz.request_from_environment()
+    forbidden.unlink()
     monkeypatch.delenv("FORGE_BLOOMZ_GPU_ADMISSION_RECEIPT")
     with pytest.raises(bloomz.BloomzExperimentError, match="GPU_ADMISSION_RECEIPT"):
         bloomz.request_from_environment()
@@ -329,6 +355,51 @@ def test_full_arm_has_one_predeclared_matched_schedule() -> None:
         "added_tokens.json",
         "chat_template.jinja",
     ]
+
+
+def test_total_lease_cap_arithmetic_is_exact() -> None:
+    from decimal import Decimal
+
+    budget = bloomz.lease_budget()
+    stage_seconds = sum(
+        item["count"] * item["max_each_seconds"]
+        for item in bloomz.LEASE_STAGE_MAXIMA.values()
+    )
+    assert stage_seconds == budget["stage_seconds"] == 23_460
+    assert budget["science_reserve_seconds"] == 540
+    assert stage_seconds + budget["science_reserve_seconds"] == 24_000
+    assert budget["science_window_seconds"] == 24_000
+    assert budget["science_window_seconds"] + budget["closure_reserve_seconds"] == 28_800
+    assert budget["total_seconds"] == 8 * 60 * 60
+    assert Decimal(budget["hourly_rate_usd"]) * 8 == Decimal(
+        budget["maximum_cost_usd"]
+    )
+    authority = bloomz.lease_authority(10_000)
+    assert authority["science_cutoff_epoch"] == 34_000
+    assert authority["provider_deadline_epoch"] == 38_800
+
+
+def test_shell_deadline_drift_is_rejected() -> None:
+    lease = bloomz.lease_authority(10_000)
+    with pytest.raises(bloomz.BloomzExperimentError, match="shell science cutoff"):
+        bloomz.require_science_stage(
+            lease,
+            stage_max_seconds=600,
+            remaining_planned_seconds=600,
+            now_epoch=10_001,
+            claimed_science_cutoff_epoch=lease["science_cutoff_epoch"] + 1,
+        )
+
+
+def test_post_cutoff_science_stage_is_rejected() -> None:
+    lease = bloomz.lease_authority(10_000)
+    with pytest.raises(bloomz.BloomzExperimentError, match="outside"):
+        bloomz.require_science_stage(
+            lease,
+            stage_max_seconds=300,
+            remaining_planned_seconds=300,
+            now_epoch=lease["science_cutoff_epoch"],
+        )
 
 
 def test_task_contract_is_exact_standardized_schema() -> None:
@@ -546,6 +617,7 @@ def test_runtime_authority_binds_config_live_source_and_inspected_image(tmp_path
             "architecture": "amd64",
             "repo_digests": [bloomz.TRAINING_IMAGE],
         },
+        "lease": bloomz.lease_authority(4_102_444_800),
     }
     path = tmp_path / "runtime-authority.json"
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
@@ -774,7 +846,11 @@ def test_experiment_launcher_propagates_training_failure_without_fallback(
         file_format="json",
         output_dir=str(output),
     )
-    request = SimpleNamespace(arm="control", phase="control")
+    request = SimpleNamespace(
+        arm="control",
+        phase="control",
+        runtime_authority={"lease": bloomz.lease_authority(int(time.time()) - 1)},
+    )
     monkeypatch.setattr(launcher.bloomz, "request_from_environment", lambda: request)
     monkeypatch.setattr(launcher.bloomz, "validate_task_contract", lambda spec: None)
     monkeypatch.setattr(launcher.TaskSpec, "build", lambda **kwargs: fake_spec)

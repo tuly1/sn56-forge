@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Fail-closed BloomZ dev selection and one-shot confirmation verdict."""
 from __future__ import annotations
-import argparse, hashlib, json, math, os
+import argparse, hashlib, json, math, os, time
 from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
 SCORE_SCHEMA = "sn56.bloomz-external-score.v1"; DECISION_SCHEMA = "sn56.bloomz-dev-decision.v1"
 VERDICT_SCHEMA = "sn56.bloomz-confirmation-verdict.v1"
+COMPLETE_SCHEMA = "sn56.bloomz-decision-complete.v1"
 AUTHORIZED = "AUTHORIZED_FOR_ONE_CONFIRMATION"
 STOP = "STOP_NO_SCIENCE"
 LOCAL_SCOPE = "matched_public_fixture_only_no_official_calibration"
@@ -14,7 +15,7 @@ IMAGE = "gradientsio/text-evaluator:basilica@sha256:860d49c7317a82b68d93b7e0e257
 DRIVER_SHA256 = "6952bf4a9b365fa00387b87dd813eaf69d1ad8d0a555a668751990a673a1b0a3"
 DEV = {"sha256": "f5548b1864a55c208f9f8061cb0e1d2471a6e58b976bb532ffdbb7a584bbfad6", "row_count": 1024, "vector_count": 1021}
 CONFIRMATION = {"filename": "confirmation.jsonl", "sha256": "2b1a788ed12051688402d6709f75c7e1727d26711f4a52c9925d9eff5892c7ae", "row_count": 512, "expected_vector_count": 511}
-AUTHORITY_KEYS = ("runtime_authority_sha256", "source_commit", "source_tree", "forge_child_tree", "experiment_child_tree", "runtime_source_inventory_sha256", "training_image_reference", "training_image_id", "experiment_config_sha256")
+AUTHORITY_KEYS = ("runtime_authority_sha256", "source_commit", "source_tree", "forge_child_tree", "experiment_child_tree", "runtime_source_inventory_sha256", "training_image_reference", "training_image_id", "experiment_config_sha256", "provider_start_epoch", "science_cutoff_epoch", "provider_deadline_epoch", "lease_budget_sha256")
 HEX40, HEX64, HEX32 = (re.compile(rf"^[0-9a-f]{{{width}}}$") for width in (40, 64, 32)); IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 class DecisionError(RuntimeError): pass
 def need(condition: object, message: str) -> None:
@@ -49,12 +50,16 @@ def finite(value: Any, label: str) -> float:
 def authority(value: Any) -> dict[str, str]:
     need(isinstance(value, Mapping) and set(value) == set(AUTHORITY_KEYS), "runtime authority shape drift")
     result = dict(value)
-    for key in ("runtime_authority_sha256", "runtime_source_inventory_sha256", "experiment_config_sha256"):
+    for key in ("runtime_authority_sha256", "runtime_source_inventory_sha256", "experiment_config_sha256", "lease_budget_sha256"):
         hex_value(result[key], 64, key)
     for key in ("source_commit", "source_tree", "forge_child_tree", "experiment_child_tree"):
         hex_value(result[key], 40, key)
     need(isinstance(result["training_image_reference"], str) and "@sha256:" in result["training_image_reference"], "training image reference is not pinned")
     need(isinstance(result["training_image_id"], str) and IMAGE_ID.fullmatch(result["training_image_id"]), "invalid training image ID")
+    for key in ("provider_start_epoch", "science_cutoff_epoch", "provider_deadline_epoch"):
+        need(isinstance(result[key], int) and not isinstance(result[key], bool), f"invalid {key}")
+    need(result["science_cutoff_epoch"] - result["provider_start_epoch"] == 24_000, "science cutoff drift")
+    need(result["provider_deadline_epoch"] - result["provider_start_epoch"] == 28_800, "provider deadline drift")
     return result
 def gpu_admission(value: Any, strategy: str, expected_authority: Mapping[str, str]) -> dict[str, Any]:
     keys = {"receipt_path", "receipt_sha256", "status", "proof", "arm", "strategy", "learning_rate", "geometry", "model", "gpu", "authority"}
@@ -299,6 +304,7 @@ def confirm(authorization: Path, control_path: Path, candidate_path: Path) -> di
         "status": "LOCAL_PAIRED_CANDIDATE_WIN" if wins else STOP,
         "local_scope": LOCAL_SCOPE, "official_calibration_claimed": False,
         "authorization": {"path": str(auth_path), "sha256": auth_sha},
+        "authority": bound_authority,
         "dev_evidence": inventory_facts,
         "confirmation": {
             **CONFIRMATION, "eval_set_fingerprint": fingerprint,
@@ -306,6 +312,47 @@ def confirm(authorization: Path, control_path: Path, candidate_path: Path) -> di
             "paired": paired(cs["vector"], fs["vector"]), "candidate_strictly_lower": wins,
         },
         "field_targets": {"scope": "future_official_or_nonlocal_only", "observed_here": False},
+    }
+def complete(decision_path: Path, *, completed_epoch: int | None = None) -> dict[str, Any]:
+    resolved, data, digest = read_json(decision_path, "final scientific decision", 4_000_000)
+    need(isinstance(data, Mapping), "final scientific decision is not an object")
+    kind, status = data.get("kind"), data.get("status")
+    if kind == "bloomz_paired_external_dev_decision":
+        need(data.get("schema_version") == DECISION_SCHEMA and status == STOP, "dev decision still requires confirmation")
+        selection = data.get("selection")
+        need(isinstance(selection, Mapping), "dev decision selection is absent")
+        bound_authority = authority(selection.get("authority"))
+        inventory_facts = selection.get("inventories")
+    elif kind == "bloomz_paired_local_confirmation_verdict":
+        need(data.get("schema_version") == VERDICT_SCHEMA and status in {"LOCAL_PAIRED_CANDIDATE_WIN", STOP}, "invalid confirmation verdict")
+        bound_authority = authority(data.get("authority"))
+        inventory_facts = data.get("dev_evidence")
+    else:
+        raise DecisionError("unsupported final scientific decision")
+    need(isinstance(inventory_facts, Mapping), "final decision inventories are absent")
+    for role, strategy in (("control", "lora"), ("candidate", "full")):
+        expected = inventory_facts.get(role)
+        need(isinstance(expected, Mapping), f"final {role} inventory is absent")
+        current = inventory(Path(expected.get("path", "")), strategy)
+        projection = {"path": current["path"], "sha256": current["sha256"], "gpu_admission": current["gpu_admission"]}
+        need(expected == projection and current["authority"] == bound_authority, f"final {role} inventory changed")
+    completed = int(time.time()) if completed_epoch is None else completed_epoch
+    need(isinstance(completed, int) and not isinstance(completed, bool), "invalid decision-complete epoch")
+    need(bound_authority["provider_start_epoch"] <= completed <= bound_authority["science_cutoff_epoch"], "decision completed outside science cutoff")
+    return {
+        "schema_version": COMPLETE_SCHEMA,
+        "kind": "bloomz_authority_bound_decision_complete",
+        "status": "DECISION_COMPLETE",
+        "local_scope": LOCAL_SCOPE,
+        "completed_epoch": completed,
+        "authority": bound_authority,
+        "decision": {
+            "path": str(resolved),
+            "sha256": digest,
+            "schema_version": data["schema_version"],
+            "kind": kind,
+            "status": status,
+        },
     }
 def write_exclusive(path: Path, value: Mapping[str, Any]) -> str:
     output = path.expanduser().resolve(strict=False)
@@ -333,15 +380,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     held.add_argument("--control-receipt", required=True, type=Path)
     held.add_argument("--candidate-receipt", required=True, type=Path)
     held.add_argument("--output", required=True, type=Path)
+    final = modes.add_parser("complete")
+    final.add_argument("--decision", required=True, type=Path)
+    final.add_argument("--output", required=True, type=Path)
     return parser.parse_args(argv)
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    value = (select(args.control_inventory, args.candidate_inventory, args.control_receipt, args.candidate_receipt,
-                    args.control_validation, args.candidate_validation)
-             if args.mode == "select" else confirm(args.authorization, args.control_receipt, args.candidate_receipt))
+    if args.mode == "select":
+        value = select(args.control_inventory, args.candidate_inventory, args.control_receipt, args.candidate_receipt,
+                       args.control_validation, args.candidate_validation)
+    elif args.mode == "confirm":
+        value = confirm(args.authorization, args.control_receipt, args.candidate_receipt)
+    else:
+        value = complete(args.decision)
     digest = write_exclusive(args.output, value)
     print(f"BLOOMZ_DECISION={value['status']} output={args.output.resolve()} sha256={digest}")
-    return 0 if value["status"] in {AUTHORIZED, "LOCAL_PAIRED_CANDIDATE_WIN"} else 3
+    return 0 if value["status"] in {AUTHORIZED, "LOCAL_PAIRED_CANDIDATE_WIN", "DECISION_COMPLETE"} else 3
 
 if __name__ == "__main__":
     try:

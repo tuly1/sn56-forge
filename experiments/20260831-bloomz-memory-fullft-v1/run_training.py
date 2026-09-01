@@ -68,12 +68,17 @@ def _accepted_inventory(spec: TaskSpec, request: bloomz.BloomzRequest) -> dict[s
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    require(0 < args.hours_to_complete <= 3.0, "hours-to-complete must be in (0, 3]")
+    require(0 < args.hours_to_complete <= 2.0, "hours-to-complete must be in (0, 2]")
     require(args.task_type == "InstructTextTask", "only InstructTextTask is allowed")
     require(args.file_format == "json", "the frozen fixture requires JSON input")
     require(os.environ.get("USE_KL", "") != "1", "KL is forbidden in this experiment")
     request = bloomz.request_from_environment()
     require(request is not None, "explicit BloomZ arm environment is absent")
+    bloomz.require_science_stage(
+        request.runtime_authority["lease"],
+        stage_max_seconds=7_200,
+        remaining_planned_seconds=7_200,
+    )
     spec = TaskSpec.build(
         task_id=args.task_id,
         task_type=args.task_type,

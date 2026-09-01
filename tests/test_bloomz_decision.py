@@ -24,6 +24,10 @@ AUTHORITY = {
     "training_image_reference": "trainer@sha256:" + "7" * 64,
     "training_image_id": "sha256:" + "8" * 64,
     "experiment_config_sha256": "9" * 64,
+    "provider_start_epoch": 4_102_444_800,
+    "science_cutoff_epoch": 4_102_468_800,
+    "provider_deadline_epoch": 4_102_473_600,
+    "lease_budget_sha256": "b" * 64,
 }
 BASE = "a" * 64
 
@@ -259,6 +263,38 @@ def test_authorized_confirmation_is_exact_and_paired_only(tmp_path: Path) -> Non
     dump(candidate.with_name("receipt.sha256.json"), {"filename": "receipt.json", "sha256": d.sha_file(candidate)})
     with pytest.raises(d.DecisionError, match="authorization mismatch"):
         d.confirm(auth_path, control, candidate)
+
+
+def test_final_science_receipt_is_authority_bound_decision_only(tmp_path: Path) -> None:
+    ci, fi, controls, candidates, cv, fv = setup_selection(tmp_path)
+    authorization = d.select(ci, fi, controls, candidates, cv, fv)
+    auth_path = tmp_path / "dev-decision.json"
+    d.write_exclusive(auth_path, authorization)
+    auth_sha = d.sha_file(auth_path)
+    entries = authorization["confirmation"]["authorized_artifacts"]
+    common = {"path": str(auth_path.resolve()), "sha256": auth_sha}
+    selected_control = json.loads(Path(authorization["selection"]["control"]["receipt_path"]).read_text())
+    selected_candidate = json.loads(Path(authorization["selection"]["candidate"]["receipt_path"]).read_text())
+    control = receipt(tmp_path, "final-c", "control", 1.2, "confirmation", tree=entries[0]["tree_sha256"], artifact_files=selected_control["artifact"]["files"], auth={**common, "role": "control"})
+    candidate = receipt(tmp_path, "final-f", "candidate", 1.1, "confirmation", tree=entries[1]["tree_sha256"], artifact_files=selected_candidate["artifact"]["files"], auth={**common, "role": "candidate"})
+    verdict = d.confirm(auth_path, control, candidate)
+    verdict_path = tmp_path / "confirmation-verdict.json"
+    d.write_exclusive(verdict_path, verdict)
+    completed = d.complete(
+        verdict_path,
+        completed_epoch=AUTHORITY["provider_start_epoch"] + 100,
+    )
+    assert completed["status"] == "DECISION_COMPLETE"
+    assert completed["authority"] == AUTHORITY
+    assert set(completed) == {
+        "schema_version", "kind", "status", "local_scope",
+        "completed_epoch", "authority", "decision",
+    }
+    with pytest.raises(d.DecisionError, match="outside science cutoff"):
+        d.complete(
+            verdict_path,
+            completed_epoch=AUTHORITY["science_cutoff_epoch"] + 1,
+        )
 
 
 def test_output_creation_is_exclusive(tmp_path: Path) -> None:

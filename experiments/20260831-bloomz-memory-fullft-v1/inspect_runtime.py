@@ -228,6 +228,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--docker", default="/usr/bin/docker")
     parser.add_argument("--git", default="/usr/bin/git")
     parser.add_argument("--training-image", default=bloomz.TRAINING_IMAGE)
+    parser.add_argument("--provider-start-epoch", required=True, type=int)
     return parser.parse_args(argv)
 
 
@@ -240,6 +241,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     require(Path(args.git).is_absolute(), "git executable must be absolute")
     source = inspect_source(args.git, repository)
     training_image = inspect_image(args.docker, args.training_image)
+    lease = bloomz.lease_authority(args.provider_start_epoch)
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "status": "PASS",
@@ -247,6 +249,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "experiment_config_sha256": bloomz.experiment_config_sha256(),
         "source": source,
         "training_image": training_image,
+        "lease": lease,
     }
     output = args.output.expanduser().resolve(strict=False)
     require(

@@ -27,6 +27,8 @@ import unicodedata
 
 
 SCHEMA_VERSION = "sn56.bloomz-public-fixture.v1"
+TRAINING_SCHEMA_VERSION = "sn56.bloomz-training-fixture.v1"
+TRAINING_MANIFEST_SHA256 = "3efcd00e9cd8d70c15bb324c264723ea292b5ed8c64bcdbf669f4a034372c336"
 
 DATASET = {
     "repo": "AlekseyKorshuk/evol-codealpaca-v1-dpo",
@@ -713,6 +715,53 @@ def make_baseline_stats(
     }
 
 
+def make_training_manifest(
+    split_contract: dict[str, dict[str, Any]],
+    *,
+    dataset_type_sha256: str,
+    baseline_sha256: str,
+) -> dict[str, Any]:
+    """Create the exact authority allowed in the confirmation-blind mount."""
+    return {
+        "schema_version": TRAINING_SCHEMA_VERSION,
+        "identities": {
+            "dataset": {
+                key: DATASET[key]
+                for key in ("repo", "revision", "parquet_sha256")
+            },
+            "model": {
+                key: MODEL[key]
+                for key in (
+                    "repo",
+                    "revision",
+                    "config_sha256",
+                    "tokenizer_json_sha256",
+                )
+            },
+        },
+        "splits": {
+            name: {
+                key: split_contract[name][key]
+                for key in ("filename", "row_count", "sha256")
+            }
+            for name in ("train", "dev")
+        },
+        "schema": {
+            "fields": ["system", "instruct", "output"],
+            "dataset_type": {
+                "filename": "dataset-type.json",
+                "sha256": dataset_type_sha256,
+            },
+        },
+        "artifacts": {
+            "baseline_stats": {
+                "filename": "baseline-stats.json",
+                "sha256": baseline_sha256,
+            }
+        },
+    }
+
+
 def _assert_output_outside_repo(output_dir: Path) -> Path:
     output = output_dir.expanduser().resolve(strict=False)
     repo_root = Path(__file__).resolve().parents[2]
@@ -874,6 +923,18 @@ def write_fixture(
             },
         }
         manifest_sha = _write_json(temporary / "manifest.json", manifest)
+        training_manifest_sha = _write_json(
+            temporary / "training-manifest.json",
+            make_training_manifest(
+                split_contract,
+                dataset_type_sha256=dataset_type_sha,
+                baseline_sha256=baseline_sha,
+            ),
+        )
+        require(
+            training_manifest_sha == TRAINING_MANIFEST_SHA256,
+            "frozen training-manifest SHA-256 drift",
+        )
         (temporary / "manifest.sha256").write_text(
             f"{manifest_sha}  manifest.json\n", encoding="ascii"
         )

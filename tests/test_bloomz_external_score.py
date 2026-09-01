@@ -42,6 +42,10 @@ def _authority(runtime_sha: str) -> dict[str, str]:
         "training_image_reference": "image@sha256:" + "6" * 64,
         "training_image_id": "sha256:" + "7" * 64,
         "experiment_config_sha256": "8" * 64,
+        "provider_start_epoch": 4_102_444_800,
+        "science_cutoff_epoch": 4_102_468_800,
+        "provider_deadline_epoch": 4_102_473_600,
+        "lease_budget_sha256": "9" * 64,
     }
 
 

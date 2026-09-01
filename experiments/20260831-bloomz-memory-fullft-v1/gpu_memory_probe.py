@@ -110,6 +110,11 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     authority_path, authority, authority_sha = bloomz.load_runtime_authority(
         args.runtime_authority
     )
+    bloomz.require_science_stage(
+        authority["lease"],
+        stage_max_seconds=600,
+        remaining_planned_seconds=600,
+    )
     loaded = load_base(args.model_dir, for_generation=False)
     bloomz.validate_model_identity(loaded.model, loaded.model_dir)
     params_b = model_param_billions(loaded.model)

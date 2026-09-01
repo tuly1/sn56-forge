@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 import re
 import stat
+import time
 from typing import Any, Iterable, Mapping
 
 from forge.tuning.plan import TrainPlan
@@ -41,6 +42,7 @@ DATASET_REPO = "AlekseyKorshuk/evol-codealpaca-v1-dpo"
 DATASET_REVISION = "31c087a1492db443a3ace4247ef1880678b27aa4"
 DATASET_PARQUET_SHA256 = "b7d98f92731ad075bd01c1088c59816f05cf0f49605856b7e3007482a419535a"
 FIXTURE_MANIFEST_SHA256 = "f5e7ffb590a05ba3bf4ab925b442be6bcd4f743d8ddc9603f8e3fa6c93c327c7"
+TRAINING_MANIFEST_SHA256 = "3efcd00e9cd8d70c15bb324c264723ea292b5ed8c64bcdbf669f4a034372c336"
 TRAINING_IMAGE = (
     "axolotlai/axolotl@"
     "sha256:97fba6ae924a55059bf48c5996014f0675d569df1b9c96e0cb0a0f922f355883"
@@ -65,6 +67,19 @@ MODEL_PARAMS_B = 0.559214592
 EXPECTED_TRAIN_ROWS = 38_346
 EXPECTED_DEV_ROWS = 1_024
 EXPECTED_DEV_TOKENIZED_ROWS = 1_021
+
+LEASE_TOTAL_SECONDS = 8 * 60 * 60
+LEASE_SCIENCE_WINDOW_SECONDS = 24_000
+LEASE_HOURLY_RATE = "2.00672043"
+LEASE_MAX_COST = "16.05376344"
+LEASE_CLOSURE_RESERVE_SECONDS = 4_800
+LEASE_STAGE_MAXIMA = {
+    "admission": {"count": 2, "max_each_seconds": 600},
+    "training": {"count": 2, "max_each_seconds": 7_200},
+    "dev_score": {"count": 8, "max_each_seconds": 570},
+    "validation": {"count": 8, "max_each_seconds": 270},
+    "confirmation_score": {"count": 2, "max_each_seconds": 570},
+}
 
 GPU_ADMISSION_PROOF = (
     "actual_b1_s2048_forward_backward_fused_adamw_step_plus_"
@@ -175,23 +190,19 @@ class BloomEvalCounter:
 
 
 def request_from_environment() -> BloomzRequest | None:
-    """Parse the explicit route and verify only train/dev fixture bytes.
-
-    The confirmation filename/hash may be present in the manifest, but this
-    function never opens it.  Confirmation is reserved for the one dev-declared
-    winner after deterministic dev selection has finished.
-    """
+    """Parse the route from a mount that physically contains only train/dev."""
     arm = os.environ.get("FORGE_BLOOMZ_EXPERIMENT_ARM")
     if arm is None:
         return None
     if arm not in {"control", "full"}:
         raise BloomzExperimentError("FORGE_BLOOMZ_EXPERIMENT_ARM must be control or full")
-    manifest_raw = os.environ.get("FORGE_BLOOMZ_FIXTURE_MANIFEST")
+    manifest_raw = os.environ.get("FORGE_BLOOMZ_TRAINING_MANIFEST")
     if not manifest_raw:
-        raise BloomzExperimentError("FORGE_BLOOMZ_FIXTURE_MANIFEST is required")
+        raise BloomzExperimentError("FORGE_BLOOMZ_TRAINING_MANIFEST is required")
     manifest_path = Path(manifest_raw).expanduser().resolve()
-    manifest = _read_manifest(manifest_path)
+    manifest = _read_training_manifest(manifest_path)
     _verify_manifest_identities(manifest)
+    _verify_training_fixture_directory(manifest_path, manifest)
     train_path = _verified_split_path(manifest_path, manifest, "train")
     dev_path = _verified_split_path(manifest_path, manifest, "dev")
     if train_path == dev_path:
@@ -637,12 +648,96 @@ def experiment_config() -> dict[str, Any]:
             "training_image": TRAINING_IMAGE,
             "evaluator_image": EVALUATOR_IMAGE,
             "score_driver_sha256": SCORE_DRIVER_SHA256,
+            "lease_budget": lease_budget(),
         },
     }
 
 
 def experiment_config_sha256() -> str:
     return hashlib.sha256(_canonical_bytes(experiment_config())).hexdigest()
+
+
+def lease_budget() -> dict[str, Any]:
+    """Return the exact single-lease envelope shared by every GPU stage."""
+    stages = {
+        name: {
+            **facts,
+            "total_seconds": facts["count"] * facts["max_each_seconds"],
+        }
+        for name, facts in LEASE_STAGE_MAXIMA.items()
+    }
+    stage_seconds = sum(item["total_seconds"] for item in stages.values())
+    science_reserve = LEASE_SCIENCE_WINDOW_SECONDS - stage_seconds
+    if (
+        science_reserve < 0
+        or LEASE_SCIENCE_WINDOW_SECONDS + LEASE_CLOSURE_RESERVE_SECONDS
+        != LEASE_TOTAL_SECONDS
+    ):
+        raise BloomzExperimentError("lease-stage arithmetic does not equal eight hours")
+    return {
+        "schema_version": "sn56.bloomz-lease-budget.v1",
+        "total_seconds": LEASE_TOTAL_SECONDS,
+        "hourly_rate_usd": LEASE_HOURLY_RATE,
+        "maximum_cost_usd": LEASE_MAX_COST,
+        "stages": stages,
+        "stage_seconds": stage_seconds,
+        "science_window_seconds": LEASE_SCIENCE_WINDOW_SECONDS,
+        "science_reserve_seconds": science_reserve,
+        "closure_reserve_seconds": LEASE_CLOSURE_RESERVE_SECONDS,
+    }
+
+
+def lease_authority(
+    provider_start_epoch: Any,
+) -> dict[str, Any]:
+    """Derive immutable science and provider deadlines from the trusted start."""
+    if not isinstance(provider_start_epoch, int) or isinstance(provider_start_epoch, bool):
+        raise BloomzExperimentError("provider start must be an integer epoch")
+    if provider_start_epoch <= 0:
+        raise BloomzExperimentError("provider start must be positive")
+    budget = lease_budget()
+    return {
+        "schema_version": "sn56.bloomz-lease-authority.v1",
+        "provider_start_epoch": provider_start_epoch,
+        "science_cutoff_epoch": provider_start_epoch + LEASE_SCIENCE_WINDOW_SECONDS,
+        "provider_deadline_epoch": provider_start_epoch + LEASE_TOTAL_SECONDS,
+        "budget": budget,
+        "budget_sha256": hashlib.sha256(_canonical_bytes(budget)).hexdigest(),
+    }
+
+
+def require_science_stage(
+    lease: Mapping[str, Any],
+    *,
+    stage_max_seconds: int,
+    remaining_planned_seconds: int,
+    now_epoch: float | None = None,
+    claimed_science_cutoff_epoch: int | None = None,
+) -> dict[str, Any]:
+    """Fail before a stage if authority or remaining science time has drifted."""
+    expected = lease_authority(lease.get("provider_start_epoch"))
+    if dict(lease) != expected:
+        raise BloomzExperimentError("runtime lease authority drift")
+    cutoff = expected["science_cutoff_epoch"]
+    if claimed_science_cutoff_epoch is not None and claimed_science_cutoff_epoch != cutoff:
+        raise BloomzExperimentError("shell science cutoff differs from runtime authority")
+    if (
+        not isinstance(stage_max_seconds, int)
+        or isinstance(stage_max_seconds, bool)
+        or stage_max_seconds <= 0
+        or not isinstance(remaining_planned_seconds, int)
+        or isinstance(remaining_planned_seconds, bool)
+        or remaining_planned_seconds < stage_max_seconds
+    ):
+        raise BloomzExperimentError("invalid science-stage budget")
+    now = time.time() if now_epoch is None else float(now_epoch)
+    if (
+        not math.isfinite(now)
+        or now < expected["provider_start_epoch"]
+        or math.ceil(now) + remaining_planned_seconds > cutoff
+    ):
+        raise BloomzExperimentError("science stage is outside the authority cutoff")
+    return expected
 
 
 def runtime_source_inventory(
@@ -773,14 +868,19 @@ def load_runtime_authority(
         raise BloomzExperimentError("runtime authority is not an object")
     source = payload.get("source")
     image = payload.get("training_image")
+    lease = payload.get("lease")
     if (
         payload.get("schema_version") != "sn56.bloomz-runtime-authority.v1"
         or payload.get("status") != "PASS"
         or payload.get("experiment_config_sha256") != experiment_config_sha256()
         or not isinstance(source, Mapping)
         or not isinstance(image, Mapping)
+        or not isinstance(lease, Mapping)
     ):
         raise BloomzExperimentError("runtime authority contract drift")
+    expected_lease = lease_authority(lease.get("provider_start_epoch"))
+    if dict(lease) != expected_lease:
+        raise BloomzExperimentError("runtime lease authority drift")
     repository = (
         Path(source_root).expanduser().resolve()
         if source_root is not None
@@ -835,6 +935,10 @@ def authority_fields(payload: Mapping[str, Any], receipt_sha256: str) -> dict[st
         "training_image_reference": image["reference"],
         "training_image_id": image["image_id"],
         "experiment_config_sha256": experiment_config_sha256(),
+        "provider_start_epoch": payload["lease"]["provider_start_epoch"],
+        "science_cutoff_epoch": payload["lease"]["science_cutoff_epoch"],
+        "provider_deadline_epoch": payload["lease"]["provider_deadline_epoch"],
+        "lease_budget_sha256": payload["lease"]["budget_sha256"],
     }
 
 
@@ -1396,21 +1500,94 @@ def _restore_metadata(staged: Path, source: Path) -> None:
             staged_path.unlink()
 
 
-def _read_manifest(path: Path) -> dict[str, Any]:
+def training_manifest_contract() -> dict[str, Any]:
+    """Return the confirmation-blind manifest allowed in the training mount."""
+    return {
+        "schema_version": "sn56.bloomz-training-fixture.v1",
+        "identities": {
+            "dataset": {
+                "repo": DATASET_REPO,
+                "revision": DATASET_REVISION,
+                "parquet_sha256": DATASET_PARQUET_SHA256,
+            },
+            "model": {
+                "repo": MODEL_REPO,
+                "revision": MODEL_REVISION,
+                "config_sha256": MODEL_CONFIG_SHA256,
+                "tokenizer_json_sha256": MODEL_TOKENIZER_SHA256,
+            },
+        },
+        "splits": {
+            "train": {
+                "filename": "train.jsonl",
+                "row_count": EXPECTED_TRAIN_ROWS,
+                "sha256": "e4a0e2d83c9b39d0388931e868e04fdc0cc45288a29c18228ad13555ee1c52c0",
+            },
+            "dev": {
+                "filename": "dev.jsonl",
+                "row_count": EXPECTED_DEV_ROWS,
+                "sha256": "f5548b1864a55c208f9f8061cb0e1d2471a6e58b976bb532ffdbb7a584bbfad6",
+            },
+        },
+        "schema": {
+            "fields": ["system", "instruct", "output"],
+            "dataset_type": {
+                "filename": "dataset-type.json",
+                "sha256": "6a43eb4f03c0979e910e1a0f13d3510b9173d92063c091ece1d707769bf5d012",
+            },
+        },
+        "artifacts": {
+            "baseline_stats": {
+                "filename": "baseline-stats.json",
+                "sha256": "31c9c00c29fdd147a221c5c934170c4c422dba703350f3fee8952fc8de095b6f",
+            }
+        },
+    }
+
+
+def _read_training_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file() or path.stat().st_size > 2_000_000:
-        raise BloomzExperimentError("fixture manifest missing or too large")
-    if _sha256(path) != FIXTURE_MANIFEST_SHA256:
-        raise BloomzExperimentError("fixture manifest SHA-256 drift")
+        raise BloomzExperimentError("training manifest missing or too large")
+    if path.name != "training-manifest.json" or _sha256(path) != TRAINING_MANIFEST_SHA256:
+        raise BloomzExperimentError("training manifest SHA-256 drift")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise BloomzExperimentError(f"invalid fixture manifest: {exc}") from exc
     if (
         not isinstance(value, dict)
-        or value.get("schema_version") != "sn56.bloomz-public-fixture.v1"
+        or value != training_manifest_contract()
     ):
-        raise BloomzExperimentError("unsupported fixture manifest schema")
+        raise BloomzExperimentError("training manifest contract drift")
     return value
+
+
+def _verify_training_fixture_directory(
+    manifest_path: Path, manifest: Mapping[str, Any]
+) -> None:
+    """Require a flat mount that physically contains no confirmation material."""
+    root = manifest_path.parent.resolve()
+    allowed = {
+        "training-manifest.json",
+        "train.jsonl",
+        "dev.jsonl",
+        "dataset-type.json",
+        "baseline-stats.json",
+    }
+    children = list(root.iterdir())
+    if (
+        {child.name for child in children} != allowed
+        or any(not child.is_file() or child.is_symlink() for child in children)
+    ):
+        raise BloomzExperimentError(
+            "training fixture must physically contain only train/dev authority files"
+        )
+    schema = manifest["schema"]["dataset_type"]
+    baseline = manifest["artifacts"]["baseline_stats"]
+    for facts in (schema, baseline):
+        path = root / facts["filename"]
+        if _sha256(path) != facts["sha256"]:
+            raise BloomzExperimentError("training fixture support-file bytes drift")
 
 
 def _verify_manifest_identities(manifest: Mapping[str, Any]) -> None:

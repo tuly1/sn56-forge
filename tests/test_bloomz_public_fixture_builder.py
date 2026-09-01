@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
 
@@ -195,6 +196,9 @@ def test_manifest_contract_constants_are_stable_and_rights_are_unresolved() -> N
     }
     assert set(builder.MODEL) >= {"repo", "revision", "config_sha256", "tokenizer_json_sha256"}
     assert builder.RIGHTS["dataset_license_status"] == "UNRESOLVED"
+    assert builder.TRAINING_MANIFEST_SHA256 == (
+        "3efcd00e9cd8d70c15bb324c264723ea292b5ed8c64bcdbf669f4a034372c336"
+    )
     assert builder.EXPECTED_SPLITS["dev"]["index_sha256"] == (
         "4df2d1886f1b46e12fa1792c76fc6cc899f01cd34f066bb41b17b39c069b1088"
     )
@@ -212,6 +216,22 @@ def test_manifest_contract_constants_are_stable_and_rights_are_unresolved() -> N
         "top_score": 1.3348402977,
         "local_matched_ab_is_absolute_calibration": False,
     }
+    split_contract = {
+        name: {
+            "filename": f"{name}.jsonl",
+            "row_count": facts["row_count"],
+            "sha256": facts["sha256"],
+        }
+        for name, facts in builder.EXPECTED_SPLITS.items()
+    }
+    training = builder.make_training_manifest(
+        split_contract,
+        dataset_type_sha256="6a43eb4f03c0979e910e1a0f13d3510b9173d92063c091ece1d707769bf5d012",
+        baseline_sha256="31c9c00c29fdd147a221c5c934170c4c422dba703350f3fee8952fc8de095b6f",
+    )
+    assert set(training["splits"]) == {"train", "dev"}
+    assert "confirmation" not in json.dumps(training)
+    assert builder.canonical_sha(training, newline=True) == builder.TRAINING_MANIFEST_SHA256
 
 
 def test_generated_fixture_is_refused_inside_repository() -> None:

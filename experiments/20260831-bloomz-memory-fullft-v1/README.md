@@ -28,6 +28,8 @@ GPU provider or starts/stops a rented instance.
   `gradientsio/text-evaluator:basilica@sha256:860d49c7317a82b68d93b7e0e257091d810fdea12eee3013f373903092d279d0`
 - Fixture manifest SHA-256:
   `f5e7ffb590a05ba3bf4ab925b442be6bcd4f743d8ddc9603f8e3fa6c93c327c7`
+- Confirmation-blind training-manifest SHA-256:
+  `3efcd00e9cd8d70c15bb324c264723ea292b5ed8c64bcdbf669f4a034372c336`
 
 The fixture has 38,346 train rows, 1,024 dev rows, and 512 untouched
 confirmation rows. Duplicate grouping uses all six disjoint SimHash bands
@@ -41,6 +43,7 @@ workflow must be new and outside the repository.
 
 ```bash
 REPO=/absolute/path/to/clean/week12-lane-b-bloomz-v1
+set -euo pipefail
 EXP=$REPO/experiments/20260831-bloomz-memory-fullft-v1
 PARQUET=/absolute/path/train-00000-of-00001.parquet
 BASE=/absolute/path/bloomz-560m-pinned
@@ -66,22 +69,131 @@ The final command must print
 `f5e7ffb590a05ba3bf4ab925b442be6bcd4f743d8ddc9603f8e3fa6c93c327c7`.
 Keep `confirmation.jsonl` inaccessible to training and dev selection.
 
+Stage the only directory training may see. It contains exactly five flat files;
+neither confirmation bytes nor confirmation filenames/hashes are present.
+
+```bash
+TRAIN_FIXTURE=/absolute/outside/repo/bloomz-training-fixture-v1
+install -d -m 0755 "$TRAIN_FIXTURE"
+for NAME in training-manifest.json train.jsonl dev.jsonl dataset-type.json baseline-stats.json; do
+  install -m 0444 "$FIXTURE/$NAME" "$TRAIN_FIXTURE/$NAME"
+done
+chmod 0555 "$TRAIN_FIXTURE"
+test "$(find "$TRAIN_FIXTURE" -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = 5
+test -z "$(find "$TRAIN_FIXTURE" -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+EXPECTED_NAMES=$'baseline-stats.json\ndataset-type.json\ndev.jsonl\ntrain.jsonl\ntraining-manifest.json'
+ACTUAL_NAMES=$(find "$TRAIN_FIXTURE" -mindepth 1 -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)
+test "$ACTUAL_NAMES" = "$EXPECTED_NAMES"
+shasum -a 256 "$TRAIN_FIXTURE/training-manifest.json"
+```
+
+The last command must print
+`3efcd00e9cd8d70c15bb324c264723ea292b5ed8c64bcdbf669f4a034372c336`.
+
 ## 2. Bind the clean source and training image
 
 The inspector rejects a dirty checkout, records the commit and Git trees,
 captures every tracked file below `forge/` and this experiment with exact mode,
 Git blob, size, and SHA-256, and inspects the already-present image without
-pulling it.
+pulling it. Before allocating an H100, verify the static cap arithmetic:
+
+```bash
+.venv/bin/python -B - <<'PY'
+from decimal import Decimal
+from forge.tuning import bloomz
+b = bloomz.lease_budget()
+assert b["stage_seconds"] == 23_460
+assert b["science_reserve_seconds"] == 540
+assert b["stage_seconds"] + b["science_reserve_seconds"] == 24_000
+assert b["closure_reserve_seconds"] == 4_800
+assert b["science_window_seconds"] + b["closure_reserve_seconds"] == b["total_seconds"] == 28_800
+assert Decimal(b["hourly_rate_usd"]) * 8 == Decimal(b["maximum_cost_usd"])
+print(b)
+PY
+```
+
+Before the externally managed lease starts, obtain its trusted absolute start
+epoch from the CEO-owned lifecycle path. This package never creates, starts,
+stops, or closes a provider instance.
+The maxima are: admissions `2×600`, training `2×7200`, dev scoring `8×570`,
+validation `8×270`, and optional confirmation scoring `2×570` seconds. These
+total 23,460 seconds, leaving 540 seconds for scientific decisions before the
+immutable science cutoff at provider start +24,000 seconds.
+The CEO-owned trusted path exclusively owns the final 4,800 seconds for
+runtime-zero enforcement, byte-verified off-host custody, and provider closure,
+including absolute provider deletion by start +28,800 seconds (8.0 hours), or
+`$16.05376344` at `$2.00672043/hour`.
 
 ```bash
 EVIDENCE=/absolute/outside/repo/bloomz-evidence
 mkdir -p "$EVIDENCE"
+: "${PROVIDER_START_EPOCH:?export the trusted provider start epoch before this block}"
+case "$PROVIDER_START_EPOCH" in (*[!0-9]*|'') exit 91;; esac
+export PLANNED_STAGE_SECONDS=23460
+
+authority_stage_fields() {
+  .venv/bin/python -B - "$EVIDENCE/runtime-authority.json" <<'PY'
+import sys
+from forge.tuning import bloomz
+_, authority, digest = bloomz.load_runtime_authority(sys.argv[1])
+lease = authority["lease"]
+print(
+    lease["provider_start_epoch"],
+    lease["science_cutoff_epoch"],
+    lease["provider_deadline_epoch"],
+    lease["budget_sha256"],
+    digest,
+)
+PY
+}
+
+run_stage() {
+  local label=$1 cap=$2
+  shift 2
+  local provider_start science_cutoff provider_deadline budget_sha authority_sha
+  read -r provider_start science_cutoff provider_deadline budget_sha authority_sha < <(authority_stage_fields)
+  local now remaining required
+  now=$(date +%s)
+  test "$science_cutoff" -eq $((provider_start + 24000))
+  test "$provider_deadline" -eq $((provider_start + 28800))
+  test "${#budget_sha}" -eq 64
+  test "${#authority_sha}" -eq 64
+  test "$now" -ge "$provider_start"
+  remaining=$((science_cutoff - now))
+  required=$PLANNED_STAGE_SECONDS
+  if [ "$remaining" -lt "$required" ]; then
+    echo "STOP_NO_SCIENCE: $label cannot fit absolute lease deadline" >&2
+    return 90
+  fi
+  timeout --signal=TERM "$cap" "$@"
+  local status=$?
+  [ "$status" -eq 0 ] || return "$status"
+  PLANNED_STAGE_SECONDS=$((PLANNED_STAGE_SECONDS - cap))
+}
+
+skip_stage() {
+  local cap=$1
+  PLANNED_STAGE_SECONDS=$((PLANNED_STAGE_SECONDS - cap))
+}
+
+authority_science_check() {
+  .venv/bin/python -B - "$EVIDENCE/runtime-authority.json" <<'PY'
+import sys
+from forge.tuning import bloomz
+_, authority, _ = bloomz.load_runtime_authority(sys.argv[1])
+bloomz.require_science_stage(
+    authority["lease"], stage_max_seconds=1, remaining_planned_seconds=1
+)
+PY
+}
 
 python -B "$EXP/inspect_runtime.py" \
   --repo "$REPO" \
   --output "$EVIDENCE/runtime-authority.json" \
   --git /usr/bin/git \
-  --docker /usr/bin/docker
+  --docker /usr/bin/docker \
+  --provider-start-epoch "$PROVIDER_START_EPOCH"
+unset PROVIDER_START_EPOCH
 ```
 
 ## 3. Run the measured H100 admission probes
@@ -97,8 +209,8 @@ MODEL_PARENT=/absolute/path/whose/bloomz-560m-pinned-child-is-bigscience--bloomz
 
 for ARM in control full; do
   LR=1.5e-4
-  [ "$ARM" = full ] && LR=1e-4
-  timeout --signal=TERM 1800 docker run --rm --pull never --network none --gpus 'device=0' \
+  if [ "$ARM" = full ]; then LR=1e-4; fi
+  run_stage "admission-$ARM" 600 docker run --rm --pull never --network none --gpus 'device=0' \
     -e PYTHONPATH=/app \
     -v "$REPO:/app:ro" \
     -v "$MODEL_PARENT:/cache/models:ro" \
@@ -116,14 +228,11 @@ done
 
 ## 4. Train both matched arms
 
-`RUNS` is the only writable checkpoint mount. Confirmation is deliberately
-not mounted. The launcher accepts at most 3.0 hours per arm, reserves 180
-seconds for finalization, writes no visible fallback model, and exits nonzero
-unless the complete four-artifact inventory is `EXTERNAL_SCORE_READY`. The
-two 30-minute admission-command ceilings plus two three-hour training ceilings
-form one hard seven-hour training-H100 budget. At $2.00672043/hour, that ceiling
-is $14.04704301. GNU `timeout` is required on the H100 host; an interrupted or
-incomplete run is a scientific hold.
+`RUNS` is the only writable checkpoint mount. Training sees only
+`TRAIN_FIXTURE`; the full fixture is not mounted. The launcher accepts at most
+2.0 hours per arm, reserves 180 seconds for finalization, writes no visible
+fallback model, and exits nonzero unless the complete four-artifact inventory
+is `EXTERNAL_SCORE_READY`.
 
 ```bash
 RUNS=/absolute/outside/repo/bloomz-runs
@@ -133,35 +242,39 @@ DATASET_TYPE='{"field_instruction":"instruct","field_output":"output","field_sys
 for ARM in control full; do
   PHASE=control
   LR=1.5e-4
-  [ "$ARM" = full ] && PHASE=candidate
-  [ "$ARM" = full ] && LR=1e-4
+  FULL_ENV=()
+  if [ "$ARM" = full ]; then
+    PHASE=candidate
+    LR=1e-4
+    FULL_ENV=(-e FORGE_ENABLE_EXPERIMENTAL_FULL_FT=1)
+  fi
 
-  timeout --signal=TERM 10800 docker run --rm --pull never --network none --gpus 'device=0' \
+  run_stage "training-$ARM" 7200 docker run --rm --pull never --network none --gpus 'device=0' \
     -e PYTHONPATH=/app \
     -e FORGE_BLOOMZ_EXPERIMENT_ARM="$ARM" \
     -e FORGE_BLOOMZ_PHASE="$PHASE" \
     -e FORGE_BLOOMZ_LR="$LR" \
     -e FORGE_BLOOMZ_MAX_STEPS=256 \
-    -e FORGE_BLOOMZ_FIXTURE_MANIFEST=/fixture/manifest.json \
+    -e FORGE_BLOOMZ_TRAINING_MANIFEST=/train-fixture/training-manifest.json \
     -e FORGE_BLOOMZ_RUNTIME_AUTHORITY=/evidence/runtime-authority.json \
     -e FORGE_BLOOMZ_GPU_ADMISSION_RECEIPT="/evidence/$ARM-gpu-admission.json" \
-    $( [ "$ARM" = full ] && printf '%s' '-e FORGE_ENABLE_EXPERIMENTAL_FULL_FT=1' ) \
+    "${FULL_ENV[@]}" \
     -v "$REPO:/app:ro" \
     -v "$BASE:/cache/models/bigscience--bloomz-560m:ro" \
-    -v "$FIXTURE:/fixture:ro" \
+    -v "$TRAIN_FIXTURE:/train-fixture:ro" \
     -v "$EVIDENCE:/evidence:ro" \
     -v "$RUNS:/app/checkpoints" \
     --entrypoint /workspace/axolotl-venv/bin/python \
     "$TRAIN_IMAGE" -B /app/experiments/20260831-bloomz-memory-fullft-v1/run_training.py \
     --task-id "bloomz-$ARM" \
     --model bigscience/bloomz-560m \
-    --dataset /fixture/train.jsonl \
+    --dataset /train-fixture/train.jsonl \
     --dataset-type "$DATASET_TYPE" \
     --task-type InstructTextTask \
     --file-format json \
     --expected-repo-name "$ARM" \
-    --hours-to-complete 3 \
-    --baseline-stats /fixture/baseline-stats.json
+    --hours-to-complete 2 \
+    --baseline-stats /train-fixture/baseline-stats.json
 done
 ```
 
@@ -207,8 +320,10 @@ mapfile -t CANDIDATE_ARTIFACTS < <(read_inventory "$RUNS/bloomz-full/_work/bloom
 score_selection() {
   local artifact=$1 role=$2 transport=$3 output=$4 fingerprint=$5
   local fingerprint_args=(--expected-fingerprint "$fingerprint")
-  [ "$fingerprint" = ANCHOR ] && fingerprint_args=(--selection-fingerprint-anchor)
-  python -B "$EXP/score_external.py" \
+  if [ "$fingerprint" = ANCHOR ]; then
+    fingerprint_args=(--selection-fingerprint-anchor)
+  fi
+  run_stage "dev-score-$role-$(basename "$output")" 570 python -B "$EXP/score_external.py" \
     --artifact "$artifact" \
     --artifact-role "$role" \
     --expected-transport "$transport" \
@@ -220,6 +335,7 @@ score_selection() {
     --output-dir "$output" \
     --gpu 0 \
     --phase selection \
+    --timeout-seconds 540 \
     "${fingerprint_args[@]}"
 }
 
@@ -236,7 +352,7 @@ done
 
 validate_one() {
   local artifact=$1 score_dir=$2 receipt_name=$3
-  docker run --rm --pull never --network none --gpus 'device=0' \
+  run_stage "validation-$receipt_name" 270 docker run --rm --pull never --network none --gpus 'device=0' \
     -e PYTHONPATH=/app \
     -v "$REPO:/app:ro" \
     -v "$BASE:/base:ro" \
@@ -271,6 +387,8 @@ This command passes exactly four score and validation receipts per arm:
 ```bash
 DECISION=/absolute/outside/repo/bloomz-dev-decision.json
 
+authority_science_check
+set +e
 python -B "$EXP/decide_external.py" select \
   --control-inventory "$RUNS/bloomz-control/_work/bloomz-checkpoint-inventory.json" \
   --candidate-inventory "$RUNS/bloomz-full/_work/bloomz-checkpoint-inventory.json" \
@@ -291,6 +409,9 @@ python -B "$EXP/decide_external.py" select \
   --candidate-validation "$VALIDATIONS/candidate-3.json" \
   --candidate-validation "$VALIDATIONS/candidate-4.json" \
   --output "$DECISION"
+DECISION_RC=$?
+set -e
+test "$DECISION_RC" -eq 0 -o "$DECISION_RC" -eq 3
 ```
 
 Ties are broken by artifact tree SHA-256. Confirmation is authorized only when
@@ -314,12 +435,9 @@ score = json.load(open(data["selection"][role]["receipt_path"], encoding="utf-8"
 print(score["artifact"]["root"])
 PY
 }
-CONTROL_WINNER=$(read_winner control)
-CANDIDATE_WINNER=$(read_winner candidate)
-
 score_confirmation() {
   local artifact=$1 role=$2 transport=$3 output=$4
-  python -B "$EXP/score_external.py" \
+  run_stage "confirmation-score-$role" 570 python -B "$EXP/score_external.py" \
     --artifact "$artifact" \
     --artifact-role "$role" \
     --expected-transport "$transport" \
@@ -331,19 +449,45 @@ score_confirmation() {
     --output-dir "$output" \
     --gpu 0 \
     --phase confirmation \
+    --timeout-seconds 540 \
     --decision-authorization "$DECISION"
 }
 
-score_confirmation "$CONTROL_WINNER" control peft_adapter "$SCORES/control-confirmation"
-score_confirmation "$CANDIDATE_WINNER" candidate full_model "$SCORES/candidate-confirmation"
+DECISION_STATUS=$(python -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["status"])' "$DECISION")
+FINAL_DECISION=$DECISION
+if [ "$DECISION_STATUS" = AUTHORIZED_FOR_ONE_CONFIRMATION ]; then
+  CONTROL_WINNER=$(read_winner control)
+  CANDIDATE_WINNER=$(read_winner candidate)
+  score_confirmation "$CONTROL_WINNER" control peft_adapter "$SCORES/control-confirmation"
+  score_confirmation "$CANDIDATE_WINNER" candidate full_model "$SCORES/candidate-confirmation"
+  authority_science_check
+  CONFIRMATION_VERDICT=/absolute/outside/repo/bloomz-confirmation-verdict.json
+  set +e
+  python -B "$EXP/decide_external.py" confirm \
+    --authorization "$DECISION" \
+    --control-receipt "$SCORES/control-confirmation/receipt.json" \
+    --candidate-receipt "$SCORES/candidate-confirmation/receipt.json" \
+    --output "$CONFIRMATION_VERDICT"
+  CONFIRMATION_RC=$?
+  set -e
+  test "$CONFIRMATION_RC" -eq 0 -o "$CONFIRMATION_RC" -eq 3
+  FINAL_DECISION=$CONFIRMATION_VERDICT
+else
+  skip_stage 1140
+fi
 
-python -B "$EXP/decide_external.py" confirm \
-  --authorization "$DECISION" \
-  --control-receipt "$SCORES/control-confirmation/receipt.json" \
-  --candidate-receipt "$SCORES/candidate-confirmation/receipt.json" \
-  --output /absolute/outside/repo/bloomz-confirmation-verdict.json
+authority_science_check
+python -B "$EXP/decide_external.py" complete \
+  --decision "$FINAL_DECISION" \
+  --output /absolute/outside/repo/bloomz-decision-complete.json
+test "$PLANNED_STAGE_SECONDS" = 0
 ```
 
 A successful local result is `LOCAL_PAIRED_CANDIDATE_WIN`. Any failed
 identity, admission, schedule, artifact, score, validation, authorization, or
 paired comparison is the concrete scientific hold `STOP_NO_SCIENCE`.
+The lane ends at the authority-bound `DECISION_COMPLETE` receipt. It makes no
+runtime-zero, process-zero, GPU-zero, evidence-custody, sync, or provider-state
+claim. The unchanged CEO-owned trusted path owns all remaining 4,800 seconds
+and the authority's `provider_deadline_epoch`; there is no provider mutation
+here.

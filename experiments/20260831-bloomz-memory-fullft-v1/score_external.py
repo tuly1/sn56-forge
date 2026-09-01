@@ -60,8 +60,8 @@ CONFIG_REQUIRED = dict(architectures=["BloomForCausalLM"], model_type="bloom",
 TRANSPORTS = frozenset({"full_model", "peft_adapter"})
 FINGERPRINT_RE = re.compile(r"^[0-9a-f]{32}$")
 GPU_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
-DEFAULT_TIMEOUT_SECONDS = 7_200
-MAX_TIMEOUT_SECONDS = 14_400
+DEFAULT_TIMEOUT_SECONDS = 540
+MAX_TIMEOUT_SECONDS = 540
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ADAPTER_BASE_PREFIX = PurePosixPath("/cache/models")
 EXPECTED_LORA_TARGETS = frozenset(
@@ -286,6 +286,11 @@ def load_runtime(path: Path) -> tuple[Path, dict[str, Any]]:
     try:
         resolved, authority, digest = bloomz.load_runtime_authority(
             path, source_root=REPO_ROOT
+        )
+        bloomz.require_science_stage(
+            authority["lease"],
+            stage_max_seconds=570,
+            remaining_planned_seconds=570,
         )
     except Exception as exc:
         raise ScoreError(f"runtime authority rejected: {exc}") from exc

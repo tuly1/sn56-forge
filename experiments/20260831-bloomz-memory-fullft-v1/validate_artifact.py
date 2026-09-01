@@ -412,6 +412,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     authority_path, authority, authority_sha = bloomz.load_runtime_authority(
         args.runtime_authority
     )
+    bloomz.require_science_stage(
+        authority["lease"],
+        stage_max_seconds=270,
+        remaining_planned_seconds=270,
+    )
     external_score, external_score_sha = load_external_score_receipt(
         Path(args.external_score_receipt),
         artifact_tree_sha256=artifact_tree_before,
