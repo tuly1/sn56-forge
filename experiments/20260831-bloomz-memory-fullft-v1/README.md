@@ -103,11 +103,12 @@ from decimal import Decimal
 from forge.tuning import bloomz
 b = bloomz.lease_budget()
 assert b["stage_seconds"] == 23_460
-assert b["science_reserve_seconds"] == 540
-assert b["stage_seconds"] + b["science_reserve_seconds"] == 24_000
-assert b["closure_reserve_seconds"] == 4_800
-assert b["science_window_seconds"] + b["closure_reserve_seconds"] == b["total_seconds"] == 28_800
-assert Decimal(b["hourly_rate_usd"]) * 8 == Decimal(b["maximum_cost_usd"])
+assert b["decision_reserve_seconds"] == 540
+assert b["stage_seconds"] + b["decision_reserve_seconds"] == 24_000
+assert b["bootstrap_start_allowance_seconds"] == 1_200
+assert b["ceo_custody_close_reserve_seconds"] == 5_400
+assert 1_200 + 24_000 + 5_400 == b["total_seconds"] == 30_600
+assert Decimal(b["hourly_rate_usd"]) * Decimal("8.5") == Decimal(b["maximum_cost_usd"])
 print(b)
 PY
 ```
@@ -117,12 +118,14 @@ epoch from the CEO-owned lifecycle path. This package never creates, starts,
 stops, or closes a provider instance.
 The maxima are: admissions `2×600`, training `2×7200`, dev scoring `8×570`,
 validation `8×270`, and optional confirmation scoring `2×570` seconds. These
-total 23,460 seconds, leaving 540 seconds for scientific decisions before the
-immutable science cutoff at provider start +24,000 seconds.
-The CEO-owned trusted path exclusively owns the final 4,800 seconds for
+total 23,460 seconds, leaving 540 seconds for scientific decisions. Runtime
+inspection must finish and bind the actual science start no later than provider
+start +1,200 seconds. The immutable decision deadline is actual science start
++24,000 seconds.
+The CEO-owned trusted path exclusively owns at least the final 5,400 seconds for
 runtime-zero enforcement, byte-verified off-host custody, and provider closure,
-including absolute provider deletion by start +28,800 seconds (8.0 hours), or
-`$16.05376344` at `$2.00672043/hour`.
+including absolute provider deletion by start +30,600 seconds (8.5 hours), or
+`$17.057123655` at `$2.006720430/hour`.
 
 ```bash
 EVIDENCE=/absolute/outside/repo/bloomz-evidence
@@ -139,7 +142,9 @@ _, authority, digest = bloomz.load_runtime_authority(sys.argv[1])
 lease = authority["lease"]
 print(
     lease["provider_start_epoch"],
-    lease["science_cutoff_epoch"],
+    lease["science_start_deadline_epoch"],
+    lease["science_started_epoch"],
+    lease["decision_deadline_epoch"],
     lease["provider_deadline_epoch"],
     lease["budget_sha256"],
     digest,
@@ -150,19 +155,23 @@ PY
 run_stage() {
   local label=$1 cap=$2
   shift 2
-  local provider_start science_cutoff provider_deadline budget_sha authority_sha
-  read -r provider_start science_cutoff provider_deadline budget_sha authority_sha < <(authority_stage_fields)
+  local provider_start science_start_deadline science_started decision_deadline provider_deadline budget_sha authority_sha
+  read -r provider_start science_start_deadline science_started decision_deadline provider_deadline budget_sha authority_sha < <(authority_stage_fields)
   local now remaining required
   now=$(date +%s)
-  test "$science_cutoff" -eq $((provider_start + 24000))
-  test "$provider_deadline" -eq $((provider_start + 28800))
+  test "$science_start_deadline" -eq $((provider_start + 1200))
+  test "$science_started" -ge "$provider_start"
+  test "$science_started" -le "$science_start_deadline"
+  test "$decision_deadline" -eq $((science_started + 24000))
+  test "$provider_deadline" -eq $((provider_start + 30600))
+  test $((decision_deadline + 5400)) -le "$provider_deadline"
   test "${#budget_sha}" -eq 64
   test "${#authority_sha}" -eq 64
-  test "$now" -ge "$provider_start"
-  remaining=$((science_cutoff - now))
+  test "$now" -ge "$science_started"
+  remaining=$((decision_deadline - now))
   required=$PLANNED_STAGE_SECONDS
   if [ "$remaining" -lt "$required" ]; then
-    echo "STOP_NO_SCIENCE: $label cannot fit absolute lease deadline" >&2
+    echo "STOP_NO_SCIENCE: $label cannot fit bound decision deadline" >&2
     return 90
   fi
   timeout --signal=TERM "$cap" "$@"
@@ -414,15 +423,20 @@ set -e
 test "$DECISION_RC" -eq 0 -o "$DECISION_RC" -eq 3
 ```
 
-Ties are broken by artifact tree SHA-256. Confirmation is authorized only when
-the best full artifact has a strictly lower dev scalar than the best control.
+Ties are broken by artifact tree SHA-256. The selected control and candidate
+then face the owner paired gate over their ordered per-row loss vectors:
+deterministic seed `20260808`, 10,000 paired bootstrap resamples, and 99%
+one-sided lower bounds. Confirmation is authorized only when the candidate
+win-rate lower bound is at least 0.55 and the control-minus-candidate mean-gap
+lower bound is at least `max(0.01 nat, 1% * abs(control mean))`.
 
 ## 7. One paired confirmation
 
 Only after the decision prints `AUTHORIZED_FOR_ONE_CONFIRMATION`, resolve the
 two already-validated winners and score each exactly once. Confirmation accepts
 no selection fingerprint or anchor; the authorization binds its fixture,
-artifact role/tree/transport, base, source, and runtime.
+artifact role/tree/transport, base, source, and runtime. The same paired
+bootstrap gate is required for the final confirmation verdict.
 
 ```bash
 read_winner() {
@@ -488,6 +502,6 @@ identity, admission, schedule, artifact, score, validation, authorization, or
 paired comparison is the concrete scientific hold `STOP_NO_SCIENCE`.
 The lane ends at the authority-bound `DECISION_COMPLETE` receipt. It makes no
 runtime-zero, process-zero, GPU-zero, evidence-custody, sync, or provider-state
-claim. The unchanged CEO-owned trusted path owns all remaining 4,800 seconds
-and the authority's `provider_deadline_epoch`; there is no provider mutation
-here.
+claim. The unchanged CEO-owned trusted path owns the bound 5,400-second
+custody/close reserve and the authority's `provider_deadline_epoch`; there is
+no provider mutation here.

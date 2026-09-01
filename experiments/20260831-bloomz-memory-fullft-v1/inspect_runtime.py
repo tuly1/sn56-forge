@@ -11,12 +11,13 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 from typing import Any, Sequence
 
 from forge.tuning import bloomz
 
 
-SCHEMA_VERSION = "sn56.bloomz-runtime-authority.v1"
+SCHEMA_VERSION = "sn56.bloomz-runtime-authority.v2"
 EXPERIMENT_PATH = "experiments/20260831-bloomz-memory-fullft-v1"
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -241,7 +242,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     require(Path(args.git).is_absolute(), "git executable must be absolute")
     source = inspect_source(args.git, repository)
     training_image = inspect_image(args.docker, args.training_image)
-    lease = bloomz.lease_authority(args.provider_start_epoch)
+    lease = bloomz.lease_authority(args.provider_start_epoch, int(time.time()))
     receipt = {
         "schema_version": SCHEMA_VERSION,
         "status": "PASS",

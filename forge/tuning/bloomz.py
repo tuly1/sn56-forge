@@ -68,11 +68,12 @@ EXPECTED_TRAIN_ROWS = 38_346
 EXPECTED_DEV_ROWS = 1_024
 EXPECTED_DEV_TOKENIZED_ROWS = 1_021
 
-LEASE_TOTAL_SECONDS = 8 * 60 * 60
+LEASE_TOTAL_SECONDS = 30_600
+LEASE_BOOTSTRAP_ALLOWANCE_SECONDS = 1_200
 LEASE_SCIENCE_WINDOW_SECONDS = 24_000
-LEASE_HOURLY_RATE = "2.00672043"
-LEASE_MAX_COST = "16.05376344"
-LEASE_CLOSURE_RESERVE_SECONDS = 4_800
+LEASE_HOURLY_RATE = "2.006720430"
+LEASE_MAX_COST = "17.057123655"
+LEASE_CLOSURE_RESERVE_SECONDS = 5_400
 LEASE_STAGE_MAXIMA = {
     "admission": {"count": 2, "max_each_seconds": 600},
     "training": {"count": 2, "max_each_seconds": 7_200},
@@ -639,6 +640,16 @@ def experiment_config() -> dict[str, Any]:
             "external_scores_per_arm": MIN_COMPLETED_EVALS,
             "max_retained_checkpoints": MAX_RETAINED_CHECKPOINTS,
             "matched_control_candidate_steps": MATCHED_DECISION_STEPS,
+            "owner_paired_gate": {
+                "seed": 20_260_808,
+                "bootstrap_resamples": 10_000,
+                "confidence": 0.99,
+                "one_sided_tail": 0.01,
+                "candidate_win_rate_lower_bound": 0.55,
+                "mean_gap_lower_bound_nat_floor": 0.01,
+                "mean_gap_lower_bound_control_fraction": 0.01,
+                "mean_gap_direction": "control_minus_candidate",
+            },
             "evidence_label": (
                 "composite_train_s2048_external_selection_s4096_"
                 "trainer_loss_nomination_only"
@@ -670,37 +681,54 @@ def lease_budget() -> dict[str, Any]:
     science_reserve = LEASE_SCIENCE_WINDOW_SECONDS - stage_seconds
     if (
         science_reserve < 0
-        or LEASE_SCIENCE_WINDOW_SECONDS + LEASE_CLOSURE_RESERVE_SECONDS
+        or LEASE_BOOTSTRAP_ALLOWANCE_SECONDS
+        + LEASE_SCIENCE_WINDOW_SECONDS
+        + LEASE_CLOSURE_RESERVE_SECONDS
         != LEASE_TOTAL_SECONDS
     ):
-        raise BloomzExperimentError("lease-stage arithmetic does not equal eight hours")
+        raise BloomzExperimentError("lease-stage arithmetic exceeds provider cap")
     return {
-        "schema_version": "sn56.bloomz-lease-budget.v1",
+        "schema_version": "sn56.bloomz-lease-budget.v2",
         "total_seconds": LEASE_TOTAL_SECONDS,
         "hourly_rate_usd": LEASE_HOURLY_RATE,
         "maximum_cost_usd": LEASE_MAX_COST,
         "stages": stages,
         "stage_seconds": stage_seconds,
+        "bootstrap_start_allowance_seconds": LEASE_BOOTSTRAP_ALLOWANCE_SECONDS,
         "science_window_seconds": LEASE_SCIENCE_WINDOW_SECONDS,
-        "science_reserve_seconds": science_reserve,
-        "closure_reserve_seconds": LEASE_CLOSURE_RESERVE_SECONDS,
+        "decision_reserve_seconds": science_reserve,
+        "ceo_custody_close_reserve_seconds": LEASE_CLOSURE_RESERVE_SECONDS,
     }
 
 
 def lease_authority(
     provider_start_epoch: Any,
+    science_started_epoch: Any,
 ) -> dict[str, Any]:
-    """Derive immutable science and provider deadlines from the trusted start."""
+    """Bind actual science start and immutable decision/provider deadlines."""
     if not isinstance(provider_start_epoch, int) or isinstance(provider_start_epoch, bool):
         raise BloomzExperimentError("provider start must be an integer epoch")
     if provider_start_epoch <= 0:
         raise BloomzExperimentError("provider start must be positive")
+    if not isinstance(science_started_epoch, int) or isinstance(
+        science_started_epoch, bool
+    ):
+        raise BloomzExperimentError("science start must be an integer epoch")
+    science_start_deadline = provider_start_epoch + LEASE_BOOTSTRAP_ALLOWANCE_SECONDS
+    if not provider_start_epoch <= science_started_epoch <= science_start_deadline:
+        raise BloomzExperimentError("science start exceeds bootstrap allowance")
     budget = lease_budget()
+    decision_deadline = science_started_epoch + LEASE_SCIENCE_WINDOW_SECONDS
+    provider_deadline = provider_start_epoch + LEASE_TOTAL_SECONDS
+    if decision_deadline + LEASE_CLOSURE_RESERVE_SECONDS > provider_deadline:
+        raise BloomzExperimentError("lease arithmetic leaves insufficient CEO reserve")
     return {
-        "schema_version": "sn56.bloomz-lease-authority.v1",
+        "schema_version": "sn56.bloomz-lease-authority.v2",
         "provider_start_epoch": provider_start_epoch,
-        "science_cutoff_epoch": provider_start_epoch + LEASE_SCIENCE_WINDOW_SECONDS,
-        "provider_deadline_epoch": provider_start_epoch + LEASE_TOTAL_SECONDS,
+        "science_start_deadline_epoch": science_start_deadline,
+        "science_started_epoch": science_started_epoch,
+        "decision_deadline_epoch": decision_deadline,
+        "provider_deadline_epoch": provider_deadline,
         "budget": budget,
         "budget_sha256": hashlib.sha256(_canonical_bytes(budget)).hexdigest(),
     }
@@ -712,15 +740,20 @@ def require_science_stage(
     stage_max_seconds: int,
     remaining_planned_seconds: int,
     now_epoch: float | None = None,
-    claimed_science_cutoff_epoch: int | None = None,
+    claimed_decision_deadline_epoch: int | None = None,
 ) -> dict[str, Any]:
     """Fail before a stage if authority or remaining science time has drifted."""
-    expected = lease_authority(lease.get("provider_start_epoch"))
+    expected = lease_authority(
+        lease.get("provider_start_epoch"), lease.get("science_started_epoch")
+    )
     if dict(lease) != expected:
         raise BloomzExperimentError("runtime lease authority drift")
-    cutoff = expected["science_cutoff_epoch"]
-    if claimed_science_cutoff_epoch is not None and claimed_science_cutoff_epoch != cutoff:
-        raise BloomzExperimentError("shell science cutoff differs from runtime authority")
+    cutoff = expected["decision_deadline_epoch"]
+    if (
+        claimed_decision_deadline_epoch is not None
+        and claimed_decision_deadline_epoch != cutoff
+    ):
+        raise BloomzExperimentError("shell decision deadline differs from runtime authority")
     if (
         not isinstance(stage_max_seconds, int)
         or isinstance(stage_max_seconds, bool)
@@ -733,7 +766,7 @@ def require_science_stage(
     now = time.time() if now_epoch is None else float(now_epoch)
     if (
         not math.isfinite(now)
-        or now < expected["provider_start_epoch"]
+        or now < expected["science_started_epoch"]
         or math.ceil(now) + remaining_planned_seconds > cutoff
     ):
         raise BloomzExperimentError("science stage is outside the authority cutoff")
@@ -870,7 +903,7 @@ def load_runtime_authority(
     image = payload.get("training_image")
     lease = payload.get("lease")
     if (
-        payload.get("schema_version") != "sn56.bloomz-runtime-authority.v1"
+        payload.get("schema_version") != "sn56.bloomz-runtime-authority.v2"
         or payload.get("status") != "PASS"
         or payload.get("experiment_config_sha256") != experiment_config_sha256()
         or not isinstance(source, Mapping)
@@ -878,7 +911,9 @@ def load_runtime_authority(
         or not isinstance(lease, Mapping)
     ):
         raise BloomzExperimentError("runtime authority contract drift")
-    expected_lease = lease_authority(lease.get("provider_start_epoch"))
+    expected_lease = lease_authority(
+        lease.get("provider_start_epoch"), lease.get("science_started_epoch")
+    )
     if dict(lease) != expected_lease:
         raise BloomzExperimentError("runtime lease authority drift")
     repository = (
@@ -936,7 +971,11 @@ def authority_fields(payload: Mapping[str, Any], receipt_sha256: str) -> dict[st
         "training_image_id": image["image_id"],
         "experiment_config_sha256": experiment_config_sha256(),
         "provider_start_epoch": payload["lease"]["provider_start_epoch"],
-        "science_cutoff_epoch": payload["lease"]["science_cutoff_epoch"],
+        "science_start_deadline_epoch": payload["lease"][
+            "science_start_deadline_epoch"
+        ],
+        "science_started_epoch": payload["lease"]["science_started_epoch"],
+        "decision_deadline_epoch": payload["lease"]["decision_deadline_epoch"],
         "provider_deadline_epoch": payload["lease"]["provider_deadline_epoch"],
         "lease_budget_sha256": payload["lease"]["budget_sha256"],
     }

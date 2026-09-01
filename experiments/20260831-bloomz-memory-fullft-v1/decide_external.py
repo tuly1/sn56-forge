@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Fail-closed BloomZ dev selection and one-shot confirmation verdict."""
 from __future__ import annotations
-import argparse, hashlib, json, math, os, time
+import argparse, functools, hashlib, json, math, os, random, time
 from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
-SCORE_SCHEMA = "sn56.bloomz-external-score.v1"; DECISION_SCHEMA = "sn56.bloomz-dev-decision.v1"
-VERDICT_SCHEMA = "sn56.bloomz-confirmation-verdict.v1"
-COMPLETE_SCHEMA = "sn56.bloomz-decision-complete.v1"
+SCORE_SCHEMA = "sn56.bloomz-external-score.v2"; DECISION_SCHEMA = "sn56.bloomz-dev-decision.v2"
+VERDICT_SCHEMA = "sn56.bloomz-confirmation-verdict.v2"
+COMPLETE_SCHEMA = "sn56.bloomz-decision-complete.v2"
 AUTHORIZED = "AUTHORIZED_FOR_ONE_CONFIRMATION"
 STOP = "STOP_NO_SCIENCE"
 LOCAL_SCOPE = "matched_public_fixture_only_no_official_calibration"
@@ -15,7 +15,14 @@ IMAGE = "gradientsio/text-evaluator:basilica@sha256:860d49c7317a82b68d93b7e0e257
 DRIVER_SHA256 = "6952bf4a9b365fa00387b87dd813eaf69d1ad8d0a555a668751990a673a1b0a3"
 DEV = {"sha256": "f5548b1864a55c208f9f8061cb0e1d2471a6e58b976bb532ffdbb7a584bbfad6", "row_count": 1024, "vector_count": 1021}
 CONFIRMATION = {"filename": "confirmation.jsonl", "sha256": "2b1a788ed12051688402d6709f75c7e1727d26711f4a52c9925d9eff5892c7ae", "row_count": 512, "expected_vector_count": 511}
-AUTHORITY_KEYS = ("runtime_authority_sha256", "source_commit", "source_tree", "forge_child_tree", "experiment_child_tree", "runtime_source_inventory_sha256", "training_image_reference", "training_image_id", "experiment_config_sha256", "provider_start_epoch", "science_cutoff_epoch", "provider_deadline_epoch", "lease_budget_sha256")
+BOOTSTRAP_SEED = 20260808
+BOOTSTRAP_RESAMPLES = 10_000
+BOOTSTRAP_CONFIDENCE = 0.99
+BOOTSTRAP_ONE_SIDED_TAIL = 0.01
+WIN_RATE_LOWER_BOUND = 0.55
+MIN_MEAN_GAP_NAT = 0.01
+RELATIVE_MEAN_GAP = 0.01
+AUTHORITY_KEYS = ("runtime_authority_sha256", "source_commit", "source_tree", "forge_child_tree", "experiment_child_tree", "runtime_source_inventory_sha256", "training_image_reference", "training_image_id", "experiment_config_sha256", "provider_start_epoch", "science_start_deadline_epoch", "science_started_epoch", "decision_deadline_epoch", "provider_deadline_epoch", "lease_budget_sha256")
 HEX40, HEX64, HEX32 = (re.compile(rf"^[0-9a-f]{{{width}}}$") for width in (40, 64, 32)); IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 class DecisionError(RuntimeError): pass
 def need(condition: object, message: str) -> None:
@@ -56,10 +63,13 @@ def authority(value: Any) -> dict[str, str]:
         hex_value(result[key], 40, key)
     need(isinstance(result["training_image_reference"], str) and "@sha256:" in result["training_image_reference"], "training image reference is not pinned")
     need(isinstance(result["training_image_id"], str) and IMAGE_ID.fullmatch(result["training_image_id"]), "invalid training image ID")
-    for key in ("provider_start_epoch", "science_cutoff_epoch", "provider_deadline_epoch"):
+    for key in ("provider_start_epoch", "science_start_deadline_epoch", "science_started_epoch", "decision_deadline_epoch", "provider_deadline_epoch"):
         need(isinstance(result[key], int) and not isinstance(result[key], bool), f"invalid {key}")
-    need(result["science_cutoff_epoch"] - result["provider_start_epoch"] == 24_000, "science cutoff drift")
-    need(result["provider_deadline_epoch"] - result["provider_start_epoch"] == 28_800, "provider deadline drift")
+    need(result["science_start_deadline_epoch"] - result["provider_start_epoch"] == 1_200, "science-start deadline drift")
+    need(result["provider_start_epoch"] <= result["science_started_epoch"] <= result["science_start_deadline_epoch"], "science start exceeds allowance")
+    need(result["decision_deadline_epoch"] - result["science_started_epoch"] == 24_000, "decision deadline drift")
+    need(result["provider_deadline_epoch"] - result["provider_start_epoch"] == 30_600, "provider deadline drift")
+    need(result["decision_deadline_epoch"] + 5_400 <= result["provider_deadline_epoch"], "CEO custody/close reserve drift")
     return result
 def gpu_admission(value: Any, strategy: str, expected_authority: Mapping[str, str]) -> dict[str, Any]:
     keys = {"receipt_path", "receipt_sha256", "status", "proof", "arm", "strategy", "learning_rate", "geometry", "model", "gpu", "authority"}
@@ -150,16 +160,21 @@ def score(path: Path, phase: str, role: str) -> dict[str, Any]:
     vector = [finite(value, "raw vector value") for value in vector_raw]
     need(len(vector) == result.get("vector_count") == expected["vector_count"], "raw vector count drift")
     need(result.get("vector_sha256") == sha_value(vector), "raw vector fingerprint drift")
+    need(result.get("vector_order") == "evaluator_emission_order", "raw vector order drift")
+    ordered_vector_sha = sha_value({"order": "evaluator_emission_order", "values": vector})
+    need(result.get("ordered_vector_sha256") == ordered_vector_sha, "ordered vector fingerprint drift")
     fingerprint = raw_result.get("eval_set_fingerprint")
     need(isinstance(fingerprint, str) and HEX32.fullmatch(fingerprint) and fingerprint == result.get("eval_set_fingerprint"), "eval fingerprint drift")
     need(raw_result.get("sn56_local_artifact_transport") == result.get("transport") == transport, "artifact transport drift")
     scalar = finite(raw_result.get("eval_loss"), "external scalar")
     need(scalar == finite(result.get("eval_loss"), "receipt scalar"), "external scalar drift")
+    need(math.isclose(sum(vector) / len(vector), scalar, rel_tol=1e-3, abs_tol=1e-4), "external scalar/vector mean drift")
     base = data.get("base")
     need(isinstance(base, Mapping), "base identity is absent")
     return {
         "path": str(resolved), "sha256": digest, "tree": tree, "transport": transport,
         "scalar": scalar, "vector": vector, "vector_sha256": sha_value(vector),
+        "ordered_vector_sha256": ordered_vector_sha,
         "fingerprint": fingerprint, "authority": bound_authority,
         "base_identity": hex_value(base.get("identity_sha256"), 64, "base identity"), "data": data,
     }
@@ -198,20 +213,77 @@ def shared(scores: Sequence[Mapping[str, Any]], expected_authority: Mapping[str,
         need(item["base_identity"] == base, "base identities differ")
         need(item["authority"] == expected_authority, "receipt/runtime authority mismatch")
     return str(fingerprint), str(base)
+@functools.lru_cache(maxsize=32)
+def _bootstrap_lower_bounds(
+    control: tuple[float, ...], candidate: tuple[float, ...]
+) -> tuple[float, float, int]:
+    need(len(control) == len(candidate) and control, "ordered vectors are not pairable")
+    gaps = tuple(left - right for left, right in zip(control, candidate, strict=True))
+    wins = tuple(value > 0 for value in gaps)
+    count = len(gaps)
+    rng = random.Random(BOOTSTRAP_SEED)
+    gap_means: list[float] = []
+    win_rates: list[float] = []
+    for _ in range(BOOTSTRAP_RESAMPLES):
+        gap_total = 0.0
+        win_total = 0
+        for _ in range(count):
+            index = rng.randrange(count)
+            gap_total += gaps[index]
+            win_total += wins[index]
+        gap_means.append(gap_total / count)
+        win_rates.append(win_total / count)
+    gap_means.sort()
+    win_rates.sort()
+    lower_index = math.ceil(BOOTSTRAP_ONE_SIDED_TAIL * BOOTSTRAP_RESAMPLES) - 1
+    return gap_means[lower_index], win_rates[lower_index], lower_index
+
+
 def paired(control: Sequence[float], candidate: Sequence[float]) -> dict[str, Any]:
     need(len(control) == len(candidate) and control, "ordered vectors are not pairable")
-    deltas = [right - left for left, right in zip(control, candidate, strict=True)]
+    control_values = tuple(finite(value, "control vector value") for value in control)
+    candidate_values = tuple(finite(value, "candidate vector value") for value in candidate)
+    mean_gap_lb, win_rate_lb, lower_index = _bootstrap_lower_bounds(
+        control_values, candidate_values
+    )
+    gaps = [left - right for left, right in zip(control_values, candidate_values, strict=True)]
+    control_mean = sum(control_values) / len(control_values)
+    candidate_mean = sum(candidate_values) / len(candidate_values)
+    mean_gap_threshold = max(MIN_MEAN_GAP_NAT, RELATIVE_MEAN_GAP * abs(control_mean))
+    observed_win_rate = sum(value > 0 for value in gaps) / len(gaps)
+    passed = win_rate_lb >= WIN_RATE_LOWER_BOUND and mean_gap_lb >= mean_gap_threshold
     return {
-        "direction": "candidate_minus_control_lower_is_better", "pair_count": len(deltas),
-        "candidate_minus_control_mean": sum(deltas) / len(deltas),
-        "candidate_win_rate": sum(value < 0 for value in deltas) / len(deltas),
-        "tie_rate": sum(value == 0 for value in deltas) / len(deltas),
+        "direction": "control_minus_candidate_positive_is_better",
+        "pair_count": len(gaps),
+        "bindings": {
+            "control_ordered_vector_sha256": sha_value({"order": "evaluator_emission_order", "values": control_values}),
+            "candidate_ordered_vector_sha256": sha_value({"order": "evaluator_emission_order", "values": candidate_values}),
+            "ordered_pair_sha256": sha_value(list(zip(control_values, candidate_values, strict=True))),
+        },
+        "bootstrap": {
+            "seed": BOOTSTRAP_SEED,
+            "resamples": BOOTSTRAP_RESAMPLES,
+            "confidence": BOOTSTRAP_CONFIDENCE,
+            "one_sided_tail": BOOTSTRAP_ONE_SIDED_TAIL,
+            "lower_bound_sorted_index": lower_index,
+        },
+        "control_mean": control_mean,
+        "candidate_mean": candidate_mean,
+        "mean_gap": control_mean - candidate_mean,
+        "candidate_win_rate": observed_win_rate,
+        "tie_rate": sum(value == 0 for value in gaps) / len(gaps),
+        "mean_gap_lower_bound": mean_gap_lb,
+        "win_rate_lower_bound": win_rate_lb,
+        "mean_gap_threshold": mean_gap_threshold,
+        "win_rate_threshold": WIN_RATE_LOWER_BOUND,
+        "passed": passed,
     }
 def public(item: Mapping[str, Any], role: str, validations: Mapping[str, Mapping[str, str]] | None = None) -> dict[str, Any]:
     result = {
         "role": role, "artifact_tree_sha256": item["tree"], "transport": item["transport"],
         "receipt_path": item["path"], "receipt_sha256": item["sha256"],
         "raw_vector_sha256": item["vector_sha256"], "external_scalar": item["scalar"],
+        "ordered_vector_sha256": item["ordered_vector_sha256"],
     }
     if validations is not None:
         result["validation_receipt"] = validations[item["sha256"]]
@@ -235,7 +307,8 @@ def select(
     fingerprint, base = shared([*cs, *fs], ci["authority"])
     control = min(cs, key=lambda item: (item["scalar"], item["tree"]))
     candidate = min(fs, key=lambda item: (item["scalar"], item["tree"]))
-    wins = candidate["scalar"] < control["scalar"]
+    paired_gate = paired(control["vector"], candidate["vector"])
+    wins = paired_gate["passed"]
     authorized = [
         {"role": role, "tree_sha256": item["tree"], "transport": item["transport"]}
         for role, item in (("control", control), ("candidate", candidate))
@@ -264,7 +337,7 @@ def select(
             },
             "control": public(control, "control", cv),
             "candidate": public(candidate, "candidate", fv),
-            "paired": paired(control["vector"], candidate["vector"]), "candidate_strictly_lower": wins,
+            "paired": paired_gate, "owner_paired_gate_passed": wins,
         },
         "confirmation": {**CONFIRMATION, "authorized_artifacts": authorized},
     }
@@ -298,7 +371,8 @@ def confirm(authorization: Path, control_path: Path, candidate_path: Path) -> di
         need(expected == {"path": current["path"], "sha256": current["sha256"], "gpu_admission": current["gpu_admission"]}, f"authorization {role} inventory changed")
         need(current["authority"] == bound_authority, f"authorization {role} authority changed")
     fingerprint, _ = shared([cs, fs], bound_authority)
-    wins = fs["scalar"] < cs["scalar"]
+    paired_gate = paired(cs["vector"], fs["vector"])
+    wins = paired_gate["passed"]
     return {
         "schema_version": VERDICT_SCHEMA, "kind": "bloomz_paired_local_confirmation_verdict",
         "status": "LOCAL_PAIRED_CANDIDATE_WIN" if wins else STOP,
@@ -309,7 +383,7 @@ def confirm(authorization: Path, control_path: Path, candidate_path: Path) -> di
         "confirmation": {
             **CONFIRMATION, "eval_set_fingerprint": fingerprint,
             "control": public(cs, "control"), "candidate": public(fs, "candidate"),
-            "paired": paired(cs["vector"], fs["vector"]), "candidate_strictly_lower": wins,
+            "paired": paired_gate, "owner_paired_gate_passed": wins,
         },
         "field_targets": {"scope": "future_official_or_nonlocal_only", "observed_here": False},
     }
@@ -338,7 +412,7 @@ def complete(decision_path: Path, *, completed_epoch: int | None = None) -> dict
         need(expected == projection and current["authority"] == bound_authority, f"final {role} inventory changed")
     completed = int(time.time()) if completed_epoch is None else completed_epoch
     need(isinstance(completed, int) and not isinstance(completed, bool), "invalid decision-complete epoch")
-    need(bound_authority["provider_start_epoch"] <= completed <= bound_authority["science_cutoff_epoch"], "decision completed outside science cutoff")
+    need(bound_authority["science_started_epoch"] <= completed <= bound_authority["decision_deadline_epoch"], "decision completed outside decision deadline")
     return {
         "schema_version": COMPLETE_SCHEMA,
         "kind": "bloomz_authority_bound_decision_complete",

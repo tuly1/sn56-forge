@@ -17,8 +17,8 @@ import sys
 import tempfile
 from typing import Any, Callable, Mapping, Sequence
 
-SCHEMA_VERSION = "sn56.bloomz-external-score.v1"
-DECISION_SCHEMA = "sn56.bloomz-dev-decision.v1"
+SCHEMA_VERSION = "sn56.bloomz-external-score.v2"
+DECISION_SCHEMA = "sn56.bloomz-dev-decision.v2"
 LOCAL_SCOPE = "matched_public_fixture_only_no_official_calibration"
 IMAGE = (
     "gradientsio/text-evaluator:basilica@"
@@ -579,6 +579,10 @@ def validate_result(raw: Any, inputs: Inputs) -> dict[str, Any]:
         "vector_mean": mean,
         "vector_count": len(values),
         "vector_sha256": canonical_sha256(values),
+        "vector_order": "evaluator_emission_order",
+        "ordered_vector_sha256": canonical_sha256(
+            {"order": "evaluator_emission_order", "values": values}
+        ),
         "eval_set_fingerprint": fingerprint,
         "transport": inputs.transport,
         "is_finetune": True,

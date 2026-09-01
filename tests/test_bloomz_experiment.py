@@ -43,7 +43,7 @@ def _runtime_authority() -> dict[str, object]:
             "architecture": "amd64",
             "repo_digests": [bloomz.TRAINING_IMAGE],
         },
-        "lease": bloomz.lease_authority(4_102_444_800),
+        "lease": bloomz.lease_authority(4_102_444_800, 4_102_445_400),
     }
 
 
@@ -343,6 +343,16 @@ def test_full_arm_has_one_predeclared_matched_schedule() -> None:
         "learning_rate": bloomz.FULL_LR,
     }
     assert "lr_probe_steps" not in config["decision"]
+    assert config["decision"]["owner_paired_gate"] == {
+        "seed": 20_260_808,
+        "bootstrap_resamples": 10_000,
+        "confidence": 0.99,
+        "one_sided_tail": 0.01,
+        "candidate_win_rate_lower_bound": 0.55,
+        "mean_gap_lower_bound_nat_floor": 0.01,
+        "mean_gap_lower_bound_control_fraction": 0.01,
+        "mean_gap_direction": "control_minus_candidate",
+    }
     assert config["model"]["tokenizer_config"] == {
         "bytes": 222,
         "sha256": bloomz.MODEL_TOKENIZER_CONFIG_SHA256,
@@ -366,39 +376,50 @@ def test_total_lease_cap_arithmetic_is_exact() -> None:
         for item in bloomz.LEASE_STAGE_MAXIMA.values()
     )
     assert stage_seconds == budget["stage_seconds"] == 23_460
-    assert budget["science_reserve_seconds"] == 540
-    assert stage_seconds + budget["science_reserve_seconds"] == 24_000
+    assert budget["decision_reserve_seconds"] == 540
+    assert stage_seconds + budget["decision_reserve_seconds"] == 24_000
     assert budget["science_window_seconds"] == 24_000
-    assert budget["science_window_seconds"] + budget["closure_reserve_seconds"] == 28_800
-    assert budget["total_seconds"] == 8 * 60 * 60
-    assert Decimal(budget["hourly_rate_usd"]) * 8 == Decimal(
+    assert budget["bootstrap_start_allowance_seconds"] == 1_200
+    assert budget["ceo_custody_close_reserve_seconds"] == 5_400
+    assert (
+        budget["bootstrap_start_allowance_seconds"]
+        + budget["science_window_seconds"]
+        + budget["ceo_custody_close_reserve_seconds"]
+        == budget["total_seconds"]
+        == 30_600
+    )
+    assert Decimal(budget["hourly_rate_usd"]) * Decimal("8.5") == Decimal(
         budget["maximum_cost_usd"]
     )
-    authority = bloomz.lease_authority(10_000)
-    assert authority["science_cutoff_epoch"] == 34_000
-    assert authority["provider_deadline_epoch"] == 38_800
+    authority = bloomz.lease_authority(10_000, 11_200)
+    assert authority["science_start_deadline_epoch"] == 11_200
+    assert authority["science_started_epoch"] == 11_200
+    assert authority["decision_deadline_epoch"] == 35_200
+    assert authority["provider_deadline_epoch"] == 40_600
+    with pytest.raises(bloomz.BloomzExperimentError, match="bootstrap allowance"):
+        bloomz.lease_authority(10_000, 11_201)
 
 
 def test_shell_deadline_drift_is_rejected() -> None:
-    lease = bloomz.lease_authority(10_000)
-    with pytest.raises(bloomz.BloomzExperimentError, match="shell science cutoff"):
+    lease = bloomz.lease_authority(10_000, 11_000)
+    with pytest.raises(bloomz.BloomzExperimentError, match="shell decision deadline"):
         bloomz.require_science_stage(
             lease,
             stage_max_seconds=600,
             remaining_planned_seconds=600,
-            now_epoch=10_001,
-            claimed_science_cutoff_epoch=lease["science_cutoff_epoch"] + 1,
+            now_epoch=11_001,
+            claimed_decision_deadline_epoch=lease["decision_deadline_epoch"] + 1,
         )
 
 
 def test_post_cutoff_science_stage_is_rejected() -> None:
-    lease = bloomz.lease_authority(10_000)
+    lease = bloomz.lease_authority(10_000, 11_000)
     with pytest.raises(bloomz.BloomzExperimentError, match="outside"):
         bloomz.require_science_stage(
             lease,
             stage_max_seconds=300,
             remaining_planned_seconds=300,
-            now_epoch=lease["science_cutoff_epoch"],
+            now_epoch=lease["decision_deadline_epoch"],
         )
 
 
@@ -592,7 +613,7 @@ def test_runtime_authority_binds_config_live_source_and_inspected_image(tmp_path
         f"{bloomz.EXPERIMENT_PATH}/validate_artifact.py",
     } <= inventoried
     payload = {
-        "schema_version": "sn56.bloomz-runtime-authority.v1",
+        "schema_version": "sn56.bloomz-runtime-authority.v2",
         "status": "PASS",
         "experiment_config_sha256": bloomz.experiment_config_sha256(),
         "source": {
@@ -617,7 +638,7 @@ def test_runtime_authority_binds_config_live_source_and_inspected_image(tmp_path
             "architecture": "amd64",
             "repo_digests": [bloomz.TRAINING_IMAGE],
         },
-        "lease": bloomz.lease_authority(4_102_444_800),
+        "lease": bloomz.lease_authority(4_102_444_800, 4_102_445_400),
     }
     path = tmp_path / "runtime-authority.json"
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
@@ -849,7 +870,9 @@ def test_experiment_launcher_propagates_training_failure_without_fallback(
     request = SimpleNamespace(
         arm="control",
         phase="control",
-        runtime_authority={"lease": bloomz.lease_authority(int(time.time()) - 1)},
+        runtime_authority={
+            "lease": bloomz.lease_authority(int(time.time()) - 2, int(time.time()) - 1)
+        },
     )
     monkeypatch.setattr(launcher.bloomz, "request_from_environment", lambda: request)
     monkeypatch.setattr(launcher.bloomz, "validate_task_contract", lambda spec: None)

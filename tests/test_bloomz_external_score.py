@@ -43,8 +43,10 @@ def _authority(runtime_sha: str) -> dict[str, str]:
         "training_image_id": "sha256:" + "7" * 64,
         "experiment_config_sha256": "8" * 64,
         "provider_start_epoch": 4_102_444_800,
-        "science_cutoff_epoch": 4_102_468_800,
-        "provider_deadline_epoch": 4_102_473_600,
+        "science_start_deadline_epoch": 4_102_446_000,
+        "science_started_epoch": 4_102_445_400,
+        "decision_deadline_epoch": 4_102_469_400,
+        "provider_deadline_epoch": 4_102_475_400,
         "lease_budget_sha256": "9" * 64,
     }
 
@@ -459,6 +461,10 @@ def test_success_receipt_keeps_ordered_raw_vector_logs_and_authority(
     assert receipt["authority"] == inputs.authority_binding
     assert receipt["result"]["vector_count"] == 2
     assert receipt["result"]["vector_sha256"] == score.canonical_sha256([1.0, 1.5])
+    assert receipt["result"]["vector_order"] == "evaluator_emission_order"
+    assert receipt["result"]["ordered_vector_sha256"] == score.canonical_sha256(
+        {"order": "evaluator_emission_order", "values": [1.0, 1.5]}
+    )
     assert (output / "raw-result.json").is_file()
     assert (output / "stdout.log").read_text() == "evaluator stdout"
     assert (output / "stderr.log").read_text() == "evaluator stderr"

@@ -25,8 +25,10 @@ AUTHORITY = {
     "training_image_id": "sha256:" + "8" * 64,
     "experiment_config_sha256": "9" * 64,
     "provider_start_epoch": 4_102_444_800,
-    "science_cutoff_epoch": 4_102_468_800,
-    "provider_deadline_epoch": 4_102_473_600,
+    "science_start_deadline_epoch": 4_102_446_000,
+    "science_started_epoch": 4_102_445_400,
+    "decision_deadline_epoch": 4_102_469_400,
+    "provider_deadline_epoch": 4_102_475_400,
     "lease_budget_sha256": "b" * 64,
 }
 BASE = "a" * 64
@@ -139,6 +141,10 @@ def receipt(
             "transport": transport,
             "vector_count": count,
             "vector_sha256": d.sha_value(vector),
+            "vector_order": "evaluator_emission_order",
+            "ordered_vector_sha256": d.sha_value(
+                {"order": "evaluator_emission_order", "values": vector}
+            ),
         },
     }
     if auth:
@@ -186,6 +192,16 @@ def test_select_is_inventory_exact_deterministic_and_confirmation_blind(tmp_path
     tied = sorted(d.score(path, "selection", "control")["tree"] for path in controls[1:3])
     assert result["selection"]["control"]["artifact_tree_sha256"] == tied[0]
     assert result["selection"]["paired"]["pair_count"] == 1021
+    assert result["selection"]["paired"]["bootstrap"] == {
+        "seed": 20260808,
+        "resamples": 10_000,
+        "confidence": 0.99,
+        "one_sided_tail": pytest.approx(0.01),
+        "lower_bound_sorted_index": 99,
+    }
+    assert result["selection"]["paired"]["win_rate_lower_bound"] == 1.0
+    assert result["selection"]["paired"]["mean_gap_lower_bound"] == pytest.approx(0.1)
+    assert result["selection"]["paired"]["passed"] is True
     args = d.parse_args([
         "select", "--control-inventory", str(ci), "--candidate-inventory", str(fi),
         *sum((["--control-receipt", str(path)] for path in controls), []),
@@ -209,6 +225,46 @@ def test_loser_and_invalid_inventory_do_not_authorize(tmp_path: Path) -> None:
         d.select(ci, fi, controls, candidates, cv, fv)
 
 
+def test_scalar_win_without_owner_confidence_gate_stops(tmp_path: Path) -> None:
+    ci, fi, controls, candidates, cv, fv = setup_selection(
+        tmp_path, (1.095, 1.2, 1.3, 1.4)
+    )
+    result = d.select(ci, fi, controls, candidates, cv, fv)
+    assert result["selection"]["candidate"]["external_scalar"] < result["selection"]["control"]["external_scalar"]
+    assert result["selection"]["paired"]["mean_gap"] == pytest.approx(0.005)
+    assert result["selection"]["paired"]["passed"] is False
+    assert result["status"] == d.STOP
+    assert result["confirmation"]["authorized_artifacts"] == []
+
+
+def test_owner_paired_bootstrap_gate_synthetic_cases() -> None:
+    control = [0.0] * 40 + [10.0] * 60
+    winning = [-0.1] * 40 + [9.9] * 60
+    gate = d.paired(control, winning)
+    assert gate["passed"] is True
+    assert gate["candidate_win_rate"] == 1.0
+    assert gate["mean_gap"] == pytest.approx(0.1)
+    assert gate["mean_gap_threshold"] == pytest.approx(0.06)
+
+    null = d.paired([1.0] * 100, [1.0] * 100)
+    assert null["passed"] is False
+    assert null["mean_gap_lower_bound"] == 0.0
+    assert null["win_rate_lower_bound"] == 0.0
+
+    regression = d.paired([1.0] * 100, [1.2] * 100)
+    assert regression["passed"] is False
+    assert regression["mean_gap_lower_bound"] == pytest.approx(-0.2)
+
+    reordered = d.paired(control, list(reversed(winning)))
+    assert reordered["passed"] is False
+    assert reordered["candidate_win_rate"] == 0.6
+    assert reordered["win_rate_lower_bound"] < 0.55
+    assert gate["bindings"]["ordered_pair_sha256"] != reordered["bindings"]["ordered_pair_sha256"]
+
+    with pytest.raises(d.DecisionError, match="not pairable"):
+        d.paired([1.0, 2.0], [1.0])
+
+
 def test_receipts_must_match_inventory_raw_bytes_and_authority(tmp_path: Path) -> None:
     ci, fi, controls, candidates, cv, fv = setup_selection(tmp_path)
     with pytest.raises(d.DecisionError, match="exactly four"):
@@ -223,6 +279,14 @@ def test_receipts_must_match_inventory_raw_bytes_and_authority(tmp_path: Path) -
     raw_path = candidates[0].with_name("raw-result.json")
     raw = json.loads(raw_path.read_text())
     raw["/artifact"]["per_example_losses"][0] += 1
+    dump(raw_path, raw)
+    with pytest.raises(d.DecisionError, match="raw-result hash"):
+        d.select(ci, fi, controls, candidates, cv, fv)
+
+    ci, fi, controls, candidates, cv, fv = setup_selection(tmp_path / "reorder")
+    raw_path = candidates[0].with_name("raw-result.json")
+    raw = json.loads(raw_path.read_text())
+    raw["/artifact"]["per_example_losses"].reverse()
     dump(raw_path, raw)
     with pytest.raises(d.DecisionError, match="raw-result hash"):
         d.select(ci, fi, controls, candidates, cv, fv)
@@ -257,6 +321,10 @@ def test_authorized_confirmation_is_exact_and_paired_only(tmp_path: Path) -> Non
     assert verdict["confirmation"]["paired"]["pair_count"] == 511
     assert verdict["official_calibration_claimed"] is False
     assert verdict["field_targets"]["observed_here"] is False
+    null_candidate = receipt(tmp_path, "held-null", "candidate", 1.195, "confirmation", tree=entries[1]["tree_sha256"], artifact_files=selected_candidate["artifact"]["files"], auth={**common, "role": "candidate"})
+    null_verdict = d.confirm(auth_path, control, null_candidate)
+    assert null_verdict["confirmation"]["paired"]["passed"] is False
+    assert null_verdict["status"] == d.STOP
     value = json.loads(candidate.read_text())
     value["authorization"]["sha256"] = "c" * 64
     dump(candidate, value)
@@ -282,7 +350,7 @@ def test_final_science_receipt_is_authority_bound_decision_only(tmp_path: Path) 
     d.write_exclusive(verdict_path, verdict)
     completed = d.complete(
         verdict_path,
-        completed_epoch=AUTHORITY["provider_start_epoch"] + 100,
+        completed_epoch=AUTHORITY["science_started_epoch"] + 100,
     )
     assert completed["status"] == "DECISION_COMPLETE"
     assert completed["authority"] == AUTHORITY
@@ -290,10 +358,10 @@ def test_final_science_receipt_is_authority_bound_decision_only(tmp_path: Path) 
         "schema_version", "kind", "status", "local_scope",
         "completed_epoch", "authority", "decision",
     }
-    with pytest.raises(d.DecisionError, match="outside science cutoff"):
+    with pytest.raises(d.DecisionError, match="outside decision deadline"):
         d.complete(
             verdict_path,
-            completed_epoch=AUTHORITY["science_cutoff_epoch"] + 1,
+            completed_epoch=AUTHORITY["decision_deadline_epoch"] + 1,
         )
 
 

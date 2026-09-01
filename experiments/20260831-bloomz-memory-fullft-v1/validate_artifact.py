@@ -143,7 +143,7 @@ def load_external_score_receipt(
     receipt = json.loads(raw)
     require(isinstance(receipt, dict), "external score receipt is not an object")
     require(
-        receipt.get("schema_version") == "sn56.bloomz-external-score.v1"
+        receipt.get("schema_version") == "sn56.bloomz-external-score.v2"
         and receipt.get("status") == "PASS",
         "external score receipt did not pass",
     )
