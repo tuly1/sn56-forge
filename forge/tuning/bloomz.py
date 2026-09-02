@@ -8,6 +8,7 @@ retain exactly four externally scored decision states.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -81,6 +82,17 @@ LEASE_STAGE_MAXIMA = {
     "validation": {"count": 8, "max_each_seconds": 270},
     "confirmation_score": {"count": 2, "max_each_seconds": 570},
 }
+
+NETWORK_DEFAULT_DENY_ERRNOS = frozenset(
+    {
+        errno.EPERM,
+        errno.EACCES,
+        errno.ENETUNREACH,
+        errno.EHOSTUNREACH,
+        errno.ETIMEDOUT,
+    }
+)
+IPV4_TIMEOUT_ERRNOS = frozenset({11, errno.EAGAIN, errno.EWOULDBLOCK})
 
 GPU_ADMISSION_PROOF = (
     "actual_b1_s2048_forward_backward_fused_adamw_step_plus_"
@@ -699,6 +711,49 @@ def lease_budget() -> dict[str, Any]:
         "decision_reserve_seconds": science_reserve,
         "ceo_custody_close_reserve_seconds": LEASE_CLOSURE_RESERVE_SECONDS,
     }
+
+
+def classify_outbound_connect_result(
+    *,
+    family: str,
+    connect_ex: int,
+    connected: bool,
+    elapsed_seconds: float,
+    timeout_seconds: float,
+) -> bool:
+    """Classify one exact TCP probe without treating a connection as denial."""
+    if family not in {"IPv4", "IPv6"}:
+        raise BloomzExperimentError("network probe family is invalid")
+    if (
+        not isinstance(connect_ex, int)
+        or isinstance(connect_ex, bool)
+        or connect_ex < 0
+    ):
+        raise BloomzExperimentError("network probe connect_ex is invalid")
+    if not isinstance(connected, bool) or connected != (connect_ex == 0):
+        raise BloomzExperimentError("network probe connected state is inconsistent")
+    for value, label in (
+        (elapsed_seconds, "elapsed seconds"),
+        (timeout_seconds, "timeout seconds"),
+    ):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            or float(value) < 0
+        ):
+            raise BloomzExperimentError(f"network probe {label} is invalid")
+    if timeout_seconds <= 0:
+        raise BloomzExperimentError("network probe timeout seconds must be positive")
+    if connected:
+        return False
+    if connect_ex in NETWORK_DEFAULT_DENY_ERRNOS:
+        return True
+    return (
+        family == "IPv4"
+        and connect_ex in IPV4_TIMEOUT_ERRNOS
+        and elapsed_seconds >= timeout_seconds
+    )
 
 
 def lease_authority(

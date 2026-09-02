@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.util
 import json
@@ -398,6 +399,55 @@ def test_total_lease_cap_arithmetic_is_exact() -> None:
     assert authority["provider_deadline_epoch"] == 40_600
     with pytest.raises(bloomz.BloomzExperimentError, match="bootstrap allowance"):
         bloomz.lease_authority(10_000, 11_201)
+
+
+def test_network_classifier_accepts_exact_timed_out_ipv4_default_deny() -> None:
+    assert bloomz.classify_outbound_connect_result(
+        family="IPv4",
+        connect_ex=11,
+        connected=False,
+        elapsed_seconds=2.002144169000019,
+        timeout_seconds=2.0,
+    ) is True
+    assert bloomz.classify_outbound_connect_result(
+        family="IPv4",
+        connect_ex=errno.ENETUNREACH,
+        connected=False,
+        elapsed_seconds=0.00001987,
+        timeout_seconds=2.0,
+    ) is True
+
+
+def test_network_classifier_rejects_connections_and_ambiguous_eagain() -> None:
+    assert bloomz.classify_outbound_connect_result(
+        family="IPv4",
+        connect_ex=0,
+        connected=True,
+        elapsed_seconds=0.01,
+        timeout_seconds=2.0,
+    ) is False
+    assert bloomz.classify_outbound_connect_result(
+        family="IPv4",
+        connect_ex=errno.EAGAIN,
+        connected=False,
+        elapsed_seconds=1.999999,
+        timeout_seconds=2.0,
+    ) is False
+    assert bloomz.classify_outbound_connect_result(
+        family="IPv6",
+        connect_ex=errno.EAGAIN,
+        connected=False,
+        elapsed_seconds=2.1,
+        timeout_seconds=2.0,
+    ) is False
+    with pytest.raises(bloomz.BloomzExperimentError, match="inconsistent"):
+        bloomz.classify_outbound_connect_result(
+            family="IPv4",
+            connect_ex=0,
+            connected=False,
+            elapsed_seconds=2.1,
+            timeout_seconds=2.0,
+        )
 
 
 def test_shell_deadline_drift_is_rejected() -> None:
