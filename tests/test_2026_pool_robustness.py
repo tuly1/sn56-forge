@@ -199,13 +199,19 @@ def test_floor_best_export_and_non_sft_handlers_remain_unchanged():
     lora = source.index("model = attach_lora(")
     floor = source.index("truth_reason=\"pretraining_floor\"")
     tokenize_start = source.index("initial_seq_len = effective_sft_seq_len(")
-    trainer_policy = source.index("return _make_sft_trainer(")
-    train = source.index("_train_sft_geometry_ladder(")
+    trainer_policy = source.index("return _make_trainer(")
+    train = source.index("_train_ladder(")
     final_guard = source.index("if should_final_save(tracker, final_step=final_step):")
     assert route < lora < floor < tokenize_start
     assert trainer_policy < train < final_guard
 
     expected = {
+        "forge/tasks/common.py": (
+            "9a7c9d546e0c9e4c8a344e767480d252b6aebb7c72f79acca62ef118111f93a0"
+        ),
+        "forge/tasks/fallback.py": (
+            "16a556b7c5104f45584b0bdc24bb2f050835eb2945be496a9e659cef6e9ceed0"
+        ),
         "forge/tasks/dpo.py": (
             "25bb3d48c2ff1a568d434d3983d4384af1e060967072429cbab68a0b74e1ccd5"
         ),

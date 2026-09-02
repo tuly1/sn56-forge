@@ -65,34 +65,16 @@ def emit_untrained_copy(spec: TaskSpec) -> None:
     # (e.g. adapter_config.json without weights) can't shadow the next rung.
     if _emit_lora_adapter(src, dst):
         telemetry.event("fallback_emitted", rung="lora_adapter")
-        _mark_floor(dst, reason="fallback_lora_adapter")
         return
     _clear_dir(dst)
     if _emit_perturbed_copy(src, dst):
         telemetry.event("fallback_emitted", rung="perturbed_copy")
-        _mark_floor(dst, reason="fallback_perturbed_copy")
         return
     _clear_dir(dst)
     if _emit_plain_copy(src, dst):
         telemetry.event("fallback_emitted", rung="plain_copy")
-        _mark_floor(dst, reason="fallback_plain_copy")
     else:
         telemetry.event("fallback_plain_copy_invalid")
-
-
-def _mark_floor(path: str, *, reason: str) -> None:
-    """Label only a newly emitted fallback; never relabel retained training."""
-    try:
-        from forge.tasks.common import ARTIFACT_FLOOR, write_artifact_truth
-
-        write_artifact_truth(
-            path,
-            ARTIFACT_FLOOR,
-            optimizer_step=0,
-            reason=reason,
-        )
-    except Exception:
-        pass
 
 
 def _clear_dir(path: str) -> None:
