@@ -211,6 +211,22 @@ def test_bloom_plan_freezes_identical_safe_geometry(arm: str, strategy: str, lr:
     assert routed.learning_rate == lr
 
 
+def test_bloom_tokenization_counts_match_frozen_retained_row_attestation() -> None:
+    assert bloomz.EXPECTED_TRAIN_ROWS == 38_346
+    assert bloomz.EXPECTED_TRAIN_TOKENIZED_ROWS == 38_099
+    assert bloomz.EXPECTED_TRAIN_DROPPED_ROWS == 247
+    assert (
+        bloomz.EXPECTED_TRAIN_ROWS - bloomz.EXPECTED_TRAIN_TOKENIZED_ROWS
+        == bloomz.EXPECTED_TRAIN_DROPPED_ROWS
+    )
+    bloomz.validate_tokenization_counts(train_count=38_099, dev_count=1_021)
+
+    with pytest.raises(bloomz.BloomzExperimentError, match="train tokenization count"):
+        bloomz.validate_tokenization_counts(train_count=38_100, dev_count=1_021)
+    with pytest.raises(bloomz.BloomzExperimentError, match="dev tokenization count"):
+        bloomz.validate_tokenization_counts(train_count=38_099, dev_count=1_022)
+
+
 def _write_training_fixture(root: Path) -> tuple[Path, dict[str, object]]:
     root.mkdir()
     splits = {}

@@ -66,6 +66,8 @@ MIN_COMPLETED_EVALS = 4
 MATCHED_DECISION_STEPS = 256
 MODEL_PARAMS_B = 0.559214592
 EXPECTED_TRAIN_ROWS = 38_346
+EXPECTED_TRAIN_TOKENIZED_ROWS = 38_099
+EXPECTED_TRAIN_DROPPED_ROWS = 247
 EXPECTED_DEV_ROWS = 1_024
 EXPECTED_DEV_TOKENIZED_ROWS = 1_021
 
@@ -421,6 +423,17 @@ def apply_plan(plan: TrainPlan, request: BloomzRequest) -> TrainPlan:
     )
 
 
+def validate_tokenization_counts(*, train_count: int, dev_count: int) -> None:
+    """Reopen the frozen post-tokenization row-count attestation."""
+    if (
+        train_count != EXPECTED_TRAIN_TOKENIZED_ROWS
+        or EXPECTED_TRAIN_ROWS - train_count != EXPECTED_TRAIN_DROPPED_ROWS
+    ):
+        raise BloomzExperimentError("frozen train tokenization count drift")
+    if dev_count != EXPECTED_DEV_TOKENIZED_ROWS:
+        raise BloomzExperimentError("frozen dev tokenization count drift")
+
+
 def run_matched_training(spec: Any, deadline: Any) -> Path:
     """Run the experiment-local matched LoRA/full training protocol.
 
@@ -531,10 +544,10 @@ def run_matched_training(spec: Any, deadline: Any) -> Path:
     dev_tokens = tokenize.tokenize_instruct(
         dev_examples, tokenizer, SELECTION_SEQUENCE_LENGTH
     )
-    if len(train_tokens) != EXPECTED_TRAIN_ROWS:
-        raise BloomzExperimentError("frozen train tokenization count drift")
-    if len(dev_tokens) != EXPECTED_DEV_TOKENIZED_ROWS:
-        raise BloomzExperimentError("frozen dev tokenization count drift")
+    validate_tokenization_counts(
+        train_count=len(train_tokens),
+        dev_count=len(dev_tokens),
+    )
 
     kwargs = build_training_kwargs(spec, plan, neftune_alpha=5.0)
     kwargs.pop("num_train_epochs", None)
