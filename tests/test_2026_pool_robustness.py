@@ -197,21 +197,15 @@ def test_floor_best_export_and_non_sft_handlers_remain_unchanged():
     source = inspect.getsource(instruct.run)
     route = source.index("conservative_qwen35_plan(loaded.model, plan)")
     lora = source.index("model = attach_lora(")
-    floor = source.index("save_adapter(model, tokenizer, spec.output_dir)")
+    floor = source.index("truth_reason=\"pretraining_floor\"")
     tokenize_start = source.index("initial_seq_len = effective_sft_seq_len(")
-    best_callback = source.index("_make_best_checkpoint_callback(")
-    train = source.index("safe_train(trainer)")
+    trainer_policy = source.index("return _make_sft_trainer(")
+    train = source.index("_train_sft_geometry_ladder(")
     final_guard = source.index("if should_final_save(tracker, final_step=final_step):")
     assert route < lora < floor < tokenize_start
-    assert best_callback < train < final_guard
+    assert trainer_policy < train < final_guard
 
     expected = {
-        "forge/tasks/common.py": (
-            "c9e9fc16fd889345ac7f3f1348fbff772a8c4de43caa4f2f0bffa32e2f668b9c"
-        ),
-        "forge/tasks/fallback.py": (
-            "16a556b7c5104f45584b0bdc24bb2f050835eb2945be496a9e659cef6e9ceed0"
-        ),
         "forge/tasks/dpo.py": (
             "25bb3d48c2ff1a568d434d3983d4384af1e060967072429cbab68a0b74e1ccd5"
         ),

@@ -370,9 +370,250 @@ class _AtomicExchangeUnavailable(OSError):
 _READY_MARKER = ".forge_artifact_ready"
 _READY_MARKER_TMP = _READY_MARKER + ".tmp"
 _READY_MAGIC = b"sn56-forge-artifact-ready-v1\n"
+_ARTIFACT_TRUTH_FILE = "forge_artifact_truth.json"
+ARTIFACT_FLOOR = "FLOOR"
+ARTIFACT_PARTIAL_TRAINED_BEST = "PARTIAL_TRAINED_BEST"
+ARTIFACT_COMPLETE_BEST = "COMPLETE_BEST"
+_ARTIFACT_TRUTHS = frozenset(
+    {ARTIFACT_FLOOR, ARTIFACT_PARTIAL_TRAINED_BEST, ARTIFACT_COMPLETE_BEST}
+)
 
 
-def save_adapter(model: Any, tokenizer: Any, output_dir: str) -> None:
+def _base_config_architectures(base_dir: str) -> list | None:
+    """Read `architectures` from a base model's own config.json on disk."""
+    config_path = os.path.join(base_dir, "config.json")
+    with open(config_path, encoding="utf-8") as fh:
+        config = json.load(fh)
+    value = config.get("architectures") if isinstance(config, dict) else None
+    if isinstance(value, list) and value and all(isinstance(x, str) for x in value):
+        return value
+    return None
+
+
+def _infer_base_model_dir(model: Any) -> str | None:
+    """Best-effort local base-model directory for a trained model object.
+
+    PEFT records the path the base was loaded from; `_name_or_path` is the
+    fallback, and is often scrubbed, hence the candidate list.
+    """
+    candidates: list[str] = []
+    peft_config = getattr(model, "peft_config", None)
+    if isinstance(peft_config, Mapping):
+        for cfg in peft_config.values():
+            path = getattr(cfg, "base_model_name_or_path", None)
+            if isinstance(path, str) and path:
+                candidates.append(path)
+    inner = getattr(model, "config", None)
+    path = getattr(inner, "_name_or_path", None)
+    if isinstance(path, str) and path:
+        candidates.append(path)
+    for candidate in candidates:
+        if not os.path.isdir(candidate):
+            continue
+        try:
+            from forge.model import resolve_model_dir
+
+            resolved = resolve_model_dir(candidate)
+        except Exception:
+            resolved = candidate
+        if os.path.isfile(os.path.join(resolved, "config.json")):
+            return resolved
+    return None
+
+
+def _restore_base_architectures(staged_dir: str, model: Any) -> None:
+    """Post-save: put the BASE model's `architectures` back into config.json.
+
+    Transformers normalises this field on load for aliased families (a Mistral
+    checkpoint loaded through the Llama class reports `LlamaForCausalLM`). The
+    validator's is_finetune check compares the submitted config against the
+    base, and a mismatch is a REJECTED submission (-1) — worse than losing, and
+    invisible in our own logs.
+
+    Reads the truth from the base config on disk rather than from the in-memory
+    config, because the in-memory value is exactly what was rewritten.
+
+    This is cosmetic metadata repair on an already-complete artifact, so it
+    never raises: a finished run must not be turned into a nonzero exit here.
+    """
+    try:
+        from forge import telemetry
+
+        staged_config = os.path.join(staged_dir, "config.json")
+        if not os.path.isfile(staged_config):
+            # Adapter-only export: nothing to correct. Still recorded, so the
+            # artifact proves the check ran rather than silently not existing.
+            telemetry.event("architectures_restore_skipped", reason="no_config_json")
+            return
+        base_dir = _infer_base_model_dir(model)
+        if base_dir is None:
+            telemetry.event("architectures_restore_skipped", reason="base_dir_unresolved")
+            return
+        base_arch = _base_config_architectures(base_dir)
+        if base_arch is None:
+            telemetry.event("architectures_restore_skipped", reason="base_architectures_absent")
+            return
+        with open(staged_config, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        if not isinstance(saved, dict):
+            telemetry.event("architectures_restore_skipped", reason="saved_config_not_object")
+            return
+        current = saved.get("architectures")
+        if current == base_arch:
+            telemetry.event("architectures_restore_noop", architectures=base_arch)
+            return
+        saved["architectures"] = base_arch
+        tmp_path = staged_config + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(saved, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, staged_config)
+        telemetry.event(
+            "architectures_restored", before=current, after=base_arch, base_dir=base_dir
+        )
+    except Exception as exc:  # never crash a completed run over metadata
+        try:
+            from forge import telemetry
+
+            telemetry.event(
+                "architectures_restore_failed", error=f"{type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            pass
+
+
+def _artifact_truth_payload(
+    truth: str, *, optimizer_step: int, reason: str
+) -> dict[str, Any]:
+    if truth not in _ARTIFACT_TRUTHS:
+        raise ValueError(f"unknown artifact truth: {truth!r}")
+    step = int(optimizer_step)
+    if step < 0:
+        raise ValueError("optimizer_step must be non-negative")
+    return {
+        "schema": 1,
+        "truth": truth,
+        "optimizer_step": step,
+        "reason": str(reason),
+    }
+
+
+def _stage_artifact_truth(
+    output_dir: str, truth: str, *, optimizer_step: int, reason: str
+) -> None:
+    payload = _artifact_truth_payload(
+        truth, optimizer_step=optimizer_step, reason=reason
+    )
+    path = os.path.join(output_dir, _ARTIFACT_TRUTH_FILE)
+    _write_artifact_truth_file(path, payload)
+
+
+def _write_artifact_truth_file(path: str, payload: dict[str, Any]) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def _record_artifact_truth_telemetry(
+    output_dir: str, truth: str, *, optimizer_step: int, reason: str
+) -> None:
+    """Best-effort diagnostics after the truth itself is durably committed."""
+    try:
+        from forge import telemetry
+
+        telemetry.set_meta(artifact_truth=truth, artifact_step=int(optimizer_step))
+        telemetry.event(
+            "artifact_truth",
+            truth=truth,
+            optimizer_step=int(optimizer_step),
+            reason=str(reason),
+        )
+        telemetry.write_into(output_dir)
+    except Exception:
+        pass
+
+
+def write_artifact_truth(
+    output_dir: str, truth: str, *, optimizer_step: int, reason: str
+) -> bool:
+    """Atomically relabel an already-complete artifact without changing weights.
+
+    This is used when a completed schedule retains an earlier atomic best, or
+    when a progressed OOM must preserve that best.  Failure is conservative:
+    the older truth remains and the diagnostic never destroys valid weights.
+    """
+    tmp: str | None = None
+    try:
+        payload = _artifact_truth_payload(
+            truth, optimizer_step=optimizer_step, reason=reason
+        )
+        if not _is_structurally_complete_artifact(output_dir):
+            return False
+        path = os.path.join(output_dir, _ARTIFACT_TRUTH_FILE)
+        tmp = path + ".tmp"
+        _write_artifact_truth_file(tmp, payload)
+        os.replace(tmp, path)
+        _fsync_dir(output_dir)
+    except Exception as exc:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        try:
+            from forge import telemetry
+
+            telemetry.event(
+                "artifact_truth_write_failed",
+                truth=truth,
+                optimizer_step=int(optimizer_step),
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except Exception:
+            pass
+        return False
+    _record_artifact_truth_telemetry(
+        output_dir,
+        truth,
+        optimizer_step=optimizer_step,
+        reason=reason,
+    )
+    return True
+
+
+def read_artifact_truth(output_dir: str) -> dict[str, Any] | None:
+    """Return a validated truth marker, or ``None`` for absent/untrusted data."""
+    try:
+        with open(os.path.join(output_dir, _ARTIFACT_TRUTH_FILE), encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if not isinstance(payload, dict) or payload.get("schema") != 1:
+            return None
+        truth = payload.get("truth")
+        step = payload.get("optimizer_step")
+        if (
+            truth not in _ARTIFACT_TRUTHS
+            or isinstance(step, bool)
+            or not isinstance(step, int)
+            or step < 0
+        ):
+            return None
+        return payload
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def save_adapter(
+    model: Any,
+    tokenizer: Any,
+    output_dir: str,
+    *,
+    artifact_truth: str | None = None,
+    optimizer_step: int = 0,
+    truth_reason: str = "unspecified",
+) -> None:
     """Stage, validate, durably flush and promote a complete model artifact.
 
     Linux uses ``renameat2(RENAME_EXCHANGE)`` when replacing an existing output,
@@ -397,6 +638,17 @@ def save_adapter(model: Any, tokenizer: Any, output_dir: str) -> None:
             save_kwargs["selected_adapters"] = ["default"]
         model.save_pretrained(tmp, **save_kwargs)
         tokenizer.save_pretrained(tmp)
+        # Carry forward the exact, already-proven architecture restoration from
+        # 54fa0344. It runs inside the staged generation and does not alter the
+        # Falcon LoRA path (adapter-only exports have no config.json here).
+        _restore_base_architectures(tmp, model)
+        if artifact_truth is not None:
+            _stage_artifact_truth(
+                tmp,
+                artifact_truth,
+                optimizer_step=optimizer_step,
+                reason=truth_reason,
+            )
 
         # Carry the flight recorder into staging before promotion, so weights
         # and diagnostics become visible as one directory-generation.
@@ -410,6 +662,16 @@ def save_adapter(model: Any, tokenizer: Any, output_dir: str) -> None:
         _write_ready_marker(tmp)
         staged_ready = True
         _promote_staged_dir(tmp, final)
+        if artifact_truth is not None:
+            # The truth file was part of the atomically promoted generation.
+            # Update diagnostics only after that succeeds; telemetry must never
+            # make an already-promoted always-best generation look failed.
+            _record_artifact_truth_telemetry(
+                final,
+                artifact_truth,
+                optimizer_step=optimizer_step,
+                reason=truth_reason,
+            )
     except BaseException:
         # Only a fully validated+flushed generation may participate in startup
         # recovery. A model write followed by tokenizer/telemetry/fsync failure
@@ -841,7 +1103,13 @@ def should_final_save(
     return tracker.last is not None and tracker.last <= tracker.persisted_best + 1e-9
 
 
-def _make_best_checkpoint_callback(spec: TaskSpec, tokenizer: Any, tracker: BestTracker):
+def _make_best_checkpoint_callback(
+    spec: TaskSpec,
+    tokenizer: Any,
+    tracker: BestTracker,
+    *,
+    label_artifact_truth: bool = False,
+):
     """Export the eval-minimum checkpoint the moment it becomes the minimum.
 
     On the production Linux filesystem, the atomic directory exchange keeps a
@@ -889,7 +1157,16 @@ def _make_best_checkpoint_callback(spec: TaskSpec, tokenizer: Any, tracker: Best
                 if model is None:
                     return control
                 try:
-                    save_adapter(model, tokenizer, spec.output_dir)
+                    truth_kwargs = (
+                        {
+                            "artifact_truth": ARTIFACT_PARTIAL_TRAINED_BEST,
+                            "optimizer_step": step,
+                            "truth_reason": "persisted_eval_minimum",
+                        }
+                        if label_artifact_truth
+                        else {}
+                    )
+                    save_adapter(model, tokenizer, spec.output_dir, **truth_kwargs)
                 except Exception as exc:
                     telemetry.event(
                         "best_checkpoint_export_failed",
@@ -912,7 +1189,12 @@ def _make_best_checkpoint_callback(spec: TaskSpec, tokenizer: Any, tracker: Best
 
 
 def _make_periodic_save_callback(
-    spec: TaskSpec, tokenizer: Any, *, every: int = 25, tracker: BestTracker | None = None
+    spec: TaskSpec,
+    tokenizer: Any,
+    *,
+    every: int = 25,
+    tracker: BestTracker | None = None,
+    label_artifact_truth: bool = False,
 ):
     """Mirror the adapter into the output path every `every` optimizer steps.
 
@@ -934,7 +1216,16 @@ def _make_periodic_save_callback(
                 model = kwargs.get("model")
                 if model is not None:
                     try:
-                        save_adapter(model, tokenizer, spec.output_dir)
+                        truth_kwargs = (
+                            {
+                                "artifact_truth": ARTIFACT_PARTIAL_TRAINED_BEST,
+                                "optimizer_step": int(state.global_step),
+                                "truth_reason": "periodic_trained_recovery",
+                            }
+                            if label_artifact_truth
+                            else {}
+                        )
+                        save_adapter(model, tokenizer, spec.output_dir, **truth_kwargs)
                     except Exception as exc:
                         from forge import telemetry
 
