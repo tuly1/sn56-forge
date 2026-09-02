@@ -302,9 +302,9 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         telemetry.event("time_aware_epochs", epochs=ta_epochs, planned=plan.num_epochs,
                         probe_per_step_s=round(probe_per_step, 4))
 
-    model = rebuild(plan)
+    holder = [rebuild(plan)]
     trainer, tracker, soup_route, plan = _train_ladder(
-        plan, model, rebuild, make, spec, tokenizer, ta_epochs
+        plan, holder.pop(), rebuild, make, spec, tokenizer, ta_epochs
     )
     model = trainer.model
     final_step = int(getattr(trainer.state, "global_step", 0) or 0)

@@ -63,7 +63,7 @@ def test_probe_is_real_production_trainer_and_generations_are_separate():
     run = inspect.getsource(instruct.run)
     first = run.index("timing_model = rebuild(plan)")
     discard = run.index("_discard(holder.pop())", first)
-    real = run.index("model = rebuild(plan)", discard)
+    real = run.index("holder = [rebuild(plan)]", discard)
     assert first < discard < real
 
 
@@ -166,6 +166,33 @@ def test_zero_progress_oom_rebuilds_next_trainer(monkeypatch):
     assert rebuilds == [2]
     assert trainer.model == "fresh-2"
     assert selected.per_device_batch_size == 2
+
+
+def test_zero_progress_model_is_released_before_lower_geometry_rebuild(monkeypatch):
+    references = []
+
+    class Model:
+        def __init__(self):
+            references.append(weakref.ref(self))
+
+        def zero_grad(self, **_kwargs):
+            pass
+
+    def make(plan, model, _rows, _epochs):
+        oom = 0 if plan.per_device_batch_size == 4 else None
+        return _Trainer(model, oom), common.BestTracker(), None
+
+    def rebuild(_plan):
+        assert references[0]() is None
+        return Model()
+
+    monkeypatch.setattr(instruct, "_free_cuda", lambda: None)
+    holder = [Model()]
+    trainer, _, _, _ = instruct._train_ladder(
+        _plan(), holder.pop(), rebuild, make,
+        SimpleNamespace(output_dir="/unused"), object(), None
+    )
+    assert trainer.model is not None
 
 
 def test_progressed_oom_preserves_and_never_retries(monkeypatch):
