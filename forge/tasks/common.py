@@ -176,6 +176,7 @@ def time_aware_epochs(
     for k in ("eval_strategy", "eval_steps", "per_device_eval_batch_size"):
         probe_kwargs.pop(k, None)
     timer = _Timer()
+    probe = None
     try:
         probe = trainer_cls(
             model=model,
@@ -192,10 +193,23 @@ def time_aware_epochs(
             **(trainer_extra or {}),
         )
         probe.train()
-        del probe
-        torch.cuda.empty_cache()
     except Exception:
         return None, None
+    finally:
+        if probe is not None:
+            try:
+                accelerator = getattr(probe, "accelerator", None)
+                if accelerator is not None and hasattr(accelerator, "free_memory"):
+                    accelerator.free_memory()
+            except Exception:
+                pass
+            for name in ("optimizer", "lr_scheduler", "model_wrapped", "model"):
+                try:
+                    setattr(probe, name, None)
+                except Exception:
+                    pass
+            del probe
+        _free_cuda()
     if timer.t10 is None or timer.t30 is None:
         return None, None
 

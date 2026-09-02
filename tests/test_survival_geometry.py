@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import inspect
 import weakref
 from dataclasses import replace
 from types import SimpleNamespace
@@ -53,6 +54,20 @@ def test_geometry_ladder_preserves_falcon_recipe_and_effective_batch():
         assert candidate.per_device_batch_size * candidate.grad_accum_steps == 16
 
 
+def test_geometry_ladder_never_invents_nonapproved_microbatch_rungs():
+    oversized = instruct._geometry_plans(_plan(batch=8, accum=8))
+    assert [(p.per_device_batch_size, p.grad_accum_steps) for p in oversized] == [
+        (4, 4),
+        (2, 8),
+        (1, 16),
+    ]
+    odd = instruct._geometry_plans(_plan(batch=3, accum=1))
+    assert [(p.per_device_batch_size, p.grad_accum_steps) for p in odd] == [
+        (2, 8),
+        (1, 16),
+    ]
+
+
 def test_probe_rows_are_actual_deterministic_p99_and_worst_batches():
     rows = [{"input_ids": list(range(length))} for length in range(1, 101)]
     selected = instruct._memory_probe_rows(rows, batch_size=4)
@@ -67,72 +82,18 @@ def test_probe_rows_are_actual_deterministic_p99_and_worst_batches():
     ))
 
 
-def test_probe_checkpointing_matches_plan_and_supports_legacy_models():
-    calls: list[object] = []
-
-    class Modern:
-        def gradient_checkpointing_enable(self, **kwargs):
-            calls.append(kwargs)
-
-    class Legacy:
-        def gradient_checkpointing_enable(self):
-            calls.append("legacy")
-
-    enabled = replace(_plan(), gradient_checkpointing=True)
-    instruct._enable_probe_gradient_checkpointing(Modern(), enabled)
-    instruct._enable_probe_gradient_checkpointing(Legacy(), enabled)
-    instruct._enable_probe_gradient_checkpointing(
-        Modern(), replace(_plan(), gradient_checkpointing=False)
-    )
-    assert calls == [
-        {"gradient_checkpointing_kwargs": {"use_reentrant": False}},
-        "legacy",
-    ]
-
-
-def test_kl_probe_uses_existing_adapter_disabled_reference_forward():
-    torch = pytest.importorskip("torch")
-
-    class Model:
-        training = True
-        reference_calls = 0
-
-        def eval(self):
-            self.training = False
-
-        def train(self, mode=True):
-            self.training = mode
-
-        def disable_adapter(self):
-            from contextlib import nullcontext
-
-            return nullcontext()
-
-        def __call__(self, **_inputs):
-            self.reference_calls += 1
-            return SimpleNamespace(logits=torch.zeros(1, 2, 3))
-
-    model = Model()
-    policy_logits = torch.tensor(
-        [[[2.0, 0.0, -1.0], [1.0, -1.0, 0.0]]], requires_grad=True
-    )
-    ce = torch.tensor(1.0, requires_grad=True)
-    batch = {
-        "input_ids": torch.tensor([[1, 2]]),
-        "labels": torch.tensor([[1, 2]]),
-    }
-    loss = instruct._probe_sft_loss(
-        model,
-        batch,
-        SimpleNamespace(loss=ce, logits=policy_logits),
-        is_kl=True,
-        kl_coef=0.5,
-    )
-    assert model.reference_calls == 1
-    assert model.training is True
-    assert loss > ce
-    loss.backward()
-    assert policy_logits.grad is not None
+def test_probe_uses_production_trainer_arguments_not_manual_surrogate():
+    source = inspect.getsource(instruct._make_sft_probe_trainer)
+    assert "build_training_kwargs(" in source
+    assert "neftune_alpha=None if is_kl else 5.0" in source
+    assert 'kwargs["max_steps"] = 1' in source
+    assert "TrainingArguments(" in source
+    assert "KLSFTTrainer" in source
+    assert "Trainer(**trainer_kwargs)" in source
+    measurement = inspect.getsource(instruct._measure_sft_geometry)
+    assert "trainer.train()" in measurement
+    assert "global_step" in measurement
+    assert "peak_reserved_fraction" in measurement
 
 
 def test_admission_rebuilds_failed_and_selected_models_from_pristine(monkeypatch):
@@ -142,12 +103,13 @@ def test_admission_rebuilds_failed_and_selected_models_from_pristine(monkeypatch
 
     monkeypatch.setattr(instruct, "_cuda_available", lambda: True)
 
-    def measure(*, model, train_ex, collator, plan, **_kwargs):
+    def measure(*, model, plan, identity, **_kwargs):
         batch_size = plan.per_device_batch_size
-        measured.append((model, batch_size))
+        measured.append((model, batch_size, identity["label"]))
+        instruct._discard_model(model)
         return {
             "status": "HEADROOM_EXCEEDED" if batch_size == 4 else "PASS",
-            "batches": [{"label": "p99"}, {"label": "worst"}],
+            "peak_reserved_fraction": 0.91 if batch_size == 4 else 0.8,
         }
 
     def rebuild(plan):
@@ -156,18 +118,21 @@ def test_admission_rebuilds_failed_and_selected_models_from_pristine(monkeypatch
 
     monkeypatch.setattr(instruct, "_measure_sft_geometry", measure)
     monkeypatch.setattr(instruct, "_discard_model", discarded.append)
-    plan, model, attempts = instruct._admit_sft_geometry(
+    plan, attempts = instruct._admit_sft_geometry(
         plan=_plan(),
         model="initial-4",
         train_ex=[{"input_ids": [1], "labels": [1]}],
-        collator=object(),
         rebuild_model=rebuild,
+        build_probe_trainer=lambda *_args: None,
     )
     assert (plan.per_device_batch_size, plan.grad_accum_steps) == (2, 8)
-    assert measured == [("initial-4", 4), ("fresh-2-1", 2)]
-    assert discarded == ["initial-4", "fresh-2-1"]
+    assert measured == [
+        ("initial-4", 4, "p99"),
+        ("fresh-2-1", 2, "p99"),
+        ("fresh-2-2", 2, "worst"),
+    ]
+    assert discarded == ["initial-4", "fresh-2-1", "fresh-2-2"]
     assert rebuilt == [2, 2]
-    assert model == "fresh-2-2", "training must not reuse the probed model"
     assert [attempt["status"] for attempt in attempts] == [
         "HEADROOM_EXCEEDED",
         "PASS",
@@ -186,31 +151,93 @@ def test_admission_releases_original_model_before_rebuild(monkeypatch):
 
     monkeypatch.setattr(instruct, "_cuda_available", lambda: True)
     monkeypatch.setattr(instruct, "_free_cuda", lambda: None)
-    monkeypatch.setattr(
-        instruct,
-        "_measure_sft_geometry",
-        lambda **kwargs: {
-            "status": (
-                "HEADROOM_EXCEEDED"
-                if kwargs["plan"].per_device_batch_size == 4
-                else "PASS"
-            ),
-            "batches": [],
-        },
-    )
+    def measure(**kwargs):
+        batch = kwargs["plan"].per_device_batch_size
+        holder = [kwargs["model"]]
+        kwargs["model"] = None
+        instruct._discard_model(holder.pop())
+        return {
+            "status": "HEADROOM_EXCEEDED" if batch == 4 else "PASS",
+            "peak_reserved_fraction": 0.91 if batch == 4 else 0.8,
+        }
+
+    monkeypatch.setattr(instruct, "_measure_sft_geometry", measure)
 
     def rebuild(_plan):
         assert references[0]() is None, "discarded probe model remained pinned"
         return Model()
 
-    _plan_out, selected, _attempts = instruct._admit_sft_geometry(
+    _plan_out, _attempts = instruct._admit_sft_geometry(
         plan=_plan(),
         model=Model(),
         train_ex=[{"input_ids": [1], "labels": [1]}],
-        collator=object(),
         rebuild_model=rebuild,
+        build_probe_trainer=lambda *_args: None,
     )
-    assert selected is not None
+    assert all(reference() is None for reference in references)
+
+
+def test_timing_generation_is_released_before_real_rebuild(monkeypatch):
+    references: list[weakref.ReferenceType] = []
+
+    class Model:
+        def __init__(self):
+            references.append(weakref.ref(self))
+
+        def zero_grad(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(instruct, "_free_cuda", lambda: None)
+    monkeypatch.setattr(instruct, "time_aware_epochs", lambda **_kwargs: (1.5, 2.0))
+    monkeypatch.setattr(instruct, "build_training_kwargs", lambda *_args, **_kwargs: {})
+    holder = [Model()]
+    assert instruct._time_sft_schedule(
+        plan=_plan(),
+        model=holder.pop(),
+        train_ex=[{"input_ids": [1], "labels": [1]}],
+        collator=object(),
+        deadline=SimpleNamespace(),
+        strategy="lora",
+        is_kl=False,
+        kl_coef=0.0,
+        spec=SimpleNamespace(task_id="release-contract"),
+    ) == (1.5, 2.0)
+    assert references[0]() is None
+
+
+def test_discard_trainer_releases_model_optimizer_and_accelerator(monkeypatch):
+    freed: list[bool] = []
+
+    class Accelerator:
+        def free_memory(self):
+            freed.append(True)
+
+    class Value:
+        pass
+
+    class Trainer:
+        pass
+
+    model = Value()
+    optimizer = Value()
+    model_ref = weakref.ref(model)
+    optimizer_ref = weakref.ref(optimizer)
+    trainer = Trainer()
+    trainer.accelerator = Accelerator()
+    trainer.model = model
+    trainer.model_wrapped = model
+    trainer.optimizer = optimizer
+    trainer.lr_scheduler = Value()
+    trainer_ref = weakref.ref(trainer)
+    del model, optimizer
+    monkeypatch.setattr(instruct, "_free_cuda", lambda: None)
+    holder = [trainer]
+    del trainer
+    instruct._discard_trainer(holder.pop())
+    assert freed == [True]
+    assert trainer_ref() is None
+    assert model_ref() is None
+    assert optimizer_ref() is None
 
 
 class _Trainer:
@@ -285,8 +312,26 @@ def test_zero_progress_retry_releases_original_model_before_rebuild(monkeypatch)
 
 
 def test_normal_return_without_optimizer_progress_remains_floor():
-    assert instruct._completed_artifact_truth(0) == common.ARTIFACT_FLOOR
-    assert instruct._completed_artifact_truth(1) == common.ARTIFACT_COMPLETE_BEST
+    assert instruct._completed_artifact_truth(0, 10) == common.ARTIFACT_FLOOR
+
+
+def test_deadline_cut_is_partial_and_true_schedule_completion_is_complete():
+    assert (
+        instruct._completed_artifact_truth(7, 10)
+        == common.ARTIFACT_PARTIAL_TRAINED_BEST
+    )
+    assert (
+        instruct._completed_artifact_truth(10, 10)
+        == common.ARTIFACT_COMPLETE_BEST
+    )
+    assert (
+        instruct._completed_artifact_truth(11, 10)
+        == common.ARTIFACT_COMPLETE_BEST
+    )
+    assert (
+        instruct._completed_artifact_truth(7, 0)
+        == common.ARTIFACT_PARTIAL_TRAINED_BEST
+    )
 
 
 def test_progressed_oom_preserves_and_never_retries_geometry(monkeypatch):

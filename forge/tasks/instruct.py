@@ -116,9 +116,6 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     )
     original_batch = plan.per_device_batch_size
     original_grad_accum = plan.grad_accum_steps
-    # On CUDA the measured real-batch admission below supersedes the old
-    # Qwen-only formula. CPU has no training geometry to measure, so retain the
-    # historical conservative route there for compatibility.
     plan, qwen35_geometry_changed = (
         conservative_qwen35_plan(loaded.model, plan)
         if n_gpus == 0
@@ -164,8 +161,6 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         model = attach_lora(
             loaded.model, r=plan.lora_r, alpha=plan.lora_alpha, dropout=plan.lora_dropout
         )
-    # `model` now owns the trainable wrapper/base. Drop the LoadedModel's second
-    # reference so a failed memory probe can genuinely release this generation.
     loaded.model = None
     del loaded
 
@@ -266,18 +261,26 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             dropout=candidate_plan.lora_dropout,
         )
 
-    # Give admission sole ownership of the model so failed geometry really
-    # releases it before the next pristine reconstruction.
+    def build_probe_trainer(
+        candidate_plan: TrainPlan, candidate_model: Any, examples: list
+    ):
+        return _make_sft_probe_trainer(
+            spec=spec,
+            plan=candidate_plan,
+            model=candidate_model,
+            train_ex=examples,
+            collator=collator,
+            is_kl=is_kl,
+        )
+
     model_holder = [model]
     del model
-    plan, model, geometry_attempts = _admit_sft_geometry(
+    plan, geometry_attempts = _admit_sft_geometry(
         plan=plan,
         model=model_holder.pop(),
         train_ex=train_ex,
-        collator=collator,
         rebuild_model=rebuild_trainable,
-        is_kl=is_kl,
-        kl_coef=spec.kl_coef,
+        build_probe_trainer=build_probe_trainer,
     )
     eff_batch = plan.per_device_batch_size * plan.grad_accum_steps
     telemetry.set_meta(
@@ -303,6 +306,28 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         geometry_admission=geometry_attempts,
     )
 
+    timing_model = rebuild_trainable(plan)
+    scheduled_epochs, probe_per_step = _time_sft_schedule(
+        plan=plan,
+        model=timing_model,
+        train_ex=train_ex,
+        collator=collator,
+        deadline=deadline,
+        strategy=strategy,
+        is_kl=is_kl,
+        kl_coef=spec.kl_coef,
+        spec=spec,
+    )
+    if scheduled_epochs is not None:
+        telemetry.event(
+            "time_aware_epochs",
+            epochs=scheduled_epochs,
+            planned=plan.num_epochs,
+            probe_per_step_s=round(probe_per_step, 4),
+            batch=int(plan.per_device_batch_size),
+            grad_accum=int(plan.grad_accum_steps),
+        )
+
     def build_trainer(candidate_plan: TrainPlan, candidate_model: Any):
         return _make_sft_trainer(
             spec=spec,
@@ -316,11 +341,10 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             is_kl=is_kl,
             strategy=strategy,
             n_gpus=n_gpus,
+            scheduled_epochs=scheduled_epochs,
         )
 
-    # The actual train path uses the admitted pristine reconstruction. A rare
-    # step-zero OOM discards the complete Trainer/model and rebuilds at the next
-    # measured ladder rung; it never mutates Accelerator geometry in place.
+    model = rebuild_trainable(plan)
     model_holder = [model]
     del model
     trainer, tracker, soup_route, plan = _train_sft_geometry_ladder(
@@ -339,9 +363,9 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         eff_batch=eff_batch,
     )
     final_step = int(getattr(trainer.state, "global_step", 0) or 0)
-    if _completed_artifact_truth(final_step) == ARTIFACT_FLOOR:
-        # A deadline can stop cleanly during the first accumulation window.
-        # That is not trained progress: keep the already-valid floor generation.
+    max_steps = int(getattr(trainer.state, "max_steps", 0) or 0)
+    terminal_truth = _completed_artifact_truth(final_step, max_steps)
+    if terminal_truth == ARTIFACT_FLOOR:
         write_artifact_truth(
             spec.output_dir,
             ARTIFACT_FLOOR,
@@ -351,18 +375,18 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         telemetry.event("training_returned_without_optimizer_progress")
         return
     selected_artifact_step = final_step
+    completed = terminal_truth == ARTIFACT_COMPLETE_BEST
+    phase = "completed_schedule" if completed else "deadline_cut"
     if should_final_save(tracker, final_step=final_step):
         save_adapter(
             model,
             tokenizer,
             spec.output_dir,
-            artifact_truth=ARTIFACT_COMPLETE_BEST,
+            artifact_truth=terminal_truth,
             optimizer_step=final_step,
-            truth_reason="completed_schedule_final_is_best",
+            truth_reason=f"{phase}_final_is_best",
         )
     else:
-        # The exported best checkpoint is strictly better than final weights;
-        # leave it in place and record why.
         telemetry.event(
             "kept_best_checkpoint",
             best=round(tracker.best, 5),
@@ -373,9 +397,9 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         )
         write_artifact_truth(
             spec.output_dir,
-            ARTIFACT_COMPLETE_BEST,
+            terminal_truth,
             optimizer_step=int(tracker.best_step or 0),
-            reason="completed_schedule_retained_eval_minimum",
+            reason=f"{phase}_retained_eval_minimum",
         )
         selected_artifact_step = int(tracker.best_step or 0)
     apply_qwen35_soup_override(
@@ -384,19 +408,22 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         model=model,
         tokenizer=tokenizer,
     )
-    # The optional fixed soup promotion replaces a directory generation. State
-    # the terminal truth again after it, without changing its existing policy.
     write_artifact_truth(
         spec.output_dir,
-        ARTIFACT_COMPLETE_BEST,
+        terminal_truth,
         optimizer_step=selected_artifact_step,
-        reason="completed_schedule_selected_export",
+        reason=f"{phase}_selected_export",
     )
 
 
-def _completed_artifact_truth(final_step: int) -> str:
-    """A normal Trainer return is complete only after optimizer progress."""
-    return ARTIFACT_COMPLETE_BEST if int(final_step) > 0 else ARTIFACT_FLOOR
+def _completed_artifact_truth(final_step: int, max_steps: int) -> str:
+    """Label only a genuinely exhausted Trainer schedule as complete."""
+    step = int(final_step)
+    if step <= 0:
+        return ARTIFACT_FLOOR
+    if int(max_steps) > 0 and step >= int(max_steps):
+        return ARTIFACT_COMPLETE_BEST
+    return ARTIFACT_PARTIAL_TRAINED_BEST
 
 
 def _capture_random_state() -> dict[str, Any]:
@@ -444,20 +471,14 @@ def _cuda_available() -> bool:
 
 
 def _geometry_plans(plan: TrainPlan) -> tuple[TrainPlan, ...]:
-    """Return the 4 -> 2 -> 1 ladder while preserving effective batch >=16."""
-    start = max(1, int(plan.per_device_batch_size))
-    original_effective = start * max(1, int(plan.grad_accum_steps))
-    target = max(_GEOMETRY_TARGET_EFFECTIVE_BATCH, original_effective)
+    """Return only the 4 -> 2 -> 1 ladder at effective batch 16."""
+    start = min(4, max(1, int(plan.per_device_batch_size)))
     batches = [batch for batch in _GEOMETRY_BATCH_LADDER if batch <= start]
-    if start not in batches:
-        batches.insert(0, start)
     return tuple(
         replace(
             plan,
             per_device_batch_size=batch,
-            grad_accum_steps=max(
-                int(plan.grad_accum_steps), math.ceil(target / batch)
-            ),
+            grad_accum_steps=math.ceil(_GEOMETRY_TARGET_EFFECTIVE_BATCH / batch),
         )
         for batch in batches
     )
@@ -495,205 +516,104 @@ def _memory_probe_rows(
     return [selected("p99", p99_indices), selected("worst", worst_indices)]
 
 
-def _model_input_device(model: Any) -> Any:
-    import torch
-
-    for parameter in model.parameters():
-        device = getattr(parameter, "device", None)
-        if device is not None and device.type == "cuda":
-            return device
-    return torch.device("cuda", torch.cuda.current_device())
-
-
 def _model_cuda_devices(model: Any) -> tuple[Any, ...]:
     """All CUDA devices carrying parameters, in stable index order."""
     import torch
 
-    indices = {
-        int(parameter.device.index)
-        if parameter.device.index is not None
-        else int(torch.cuda.current_device())
-        for parameter in model.parameters()
-        if getattr(parameter, "device", None) is not None
-        and parameter.device.type == "cuda"
-    }
+    indices = set(range(int(torch.cuda.device_count())))
+    indices.update(
+        {
+            int(parameter.device.index)
+            if parameter.device.index is not None
+            else int(torch.cuda.current_device())
+            for parameter in model.parameters()
+            if getattr(parameter, "device", None) is not None
+            and parameter.device.type == "cuda"
+        }
+    )
     if not indices:
         indices.add(int(torch.cuda.current_device()))
     return tuple(torch.device("cuda", index) for index in sorted(indices))
 
 
-def _enable_probe_gradient_checkpointing(model: Any, plan: TrainPlan) -> None:
-    """Mirror Trainer's checkpointing mode before measuring activations."""
-    if not plan.gradient_checkpointing:
-        return
-    enable = getattr(model, "gradient_checkpointing_enable", None)
-    if not callable(enable):
-        return
-    try:
-        enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    except TypeError:
-        # Older/custom model implementations expose the no-argument form.
-        enable()
-
-
-def _probe_sft_loss(
-    model: Any,
-    batch: dict[str, Any],
-    output: Any,
-    *,
-    is_kl: bool,
-    kl_coef: float,
-) -> Any:
-    """Use the real policy/reference KL memory path when the task requires it."""
-    loss = getattr(output, "loss", None)
-    if loss is None or not is_kl:
-        return loss
-    # Reuse the exact existing implementation. Its method is state-free: the
-    # Trainer instance is not needed for the adapter-disabled reference forward
-    # or chunked KL graph.
-    from forge.tuning.kl import KLSFTTrainer
-
-    kl_sum, kl_tokens = KLSFTTrainer._completion_kl_sum(
-        None, model, batch, output.logits, batch["labels"]
-    )
-    if kl_tokens:
-        loss = loss + float(kl_coef) * (kl_sum / float(kl_tokens))
-    return loss
-
-
 def _measure_sft_geometry(
     *,
     model: Any,
-    train_ex: list,
-    collator: Any,
+    examples: list,
+    identity: dict[str, Any],
     plan: TrainPlan,
-    is_kl: bool = False,
-    kl_coef: float = 0.0,
+    build_probe_trainer: Callable[[TrainPlan, Any, list], Any],
 ) -> dict[str, Any]:
-    """Measure real p99/worst train steps, including optimizer-state creation."""
+    """Measure one exact Trainer step and discard its complete generation."""
     import torch
 
     if not torch.cuda.is_available():
-        return {"status": "SKIP_NO_CUDA", "batches": []}
-    input_device = _model_input_device(model)
+        raise RuntimeError("exact CUDA geometry measurement is unavailable")
     devices = _model_cuda_devices(model)
-    observations: list[dict[str, Any]] = []
-    trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    if not trainable:
-        raise RuntimeError("memory admission found no trainable parameters")
-    optimizer_kwargs: dict[str, Any] = {"lr": 0.0, "weight_decay": 0.0}
-    if plan.optimizer == "adamw_torch_fused":
-        optimizer_kwargs["fused"] = True
-    optimizer = torch.optim.AdamW(trainable, **optimizer_kwargs)
-    _enable_probe_gradient_checkpointing(model, plan)
-    model.train()
-    for label, examples, identity in _memory_probe_rows(
-        train_ex, batch_size=plan.per_device_batch_size
-    ):
-        batch = None
-        output = None
-        loss = None
-        try:
-            model.zero_grad(set_to_none=True)
-            optimizer.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-            for device in devices:
-                torch.cuda.reset_peak_memory_stats(device)
-            batch = collator(examples)
-            padded_tokens = int(batch["input_ids"].numel())
-            batch = {
-                key: value.to(input_device) if hasattr(value, "to") else value
-                for key, value in batch.items()
-            }
-            if plan.bf16:
-                autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-            elif plan.fp16:
-                autocast = torch.autocast(device_type="cuda", dtype=torch.float16)
-            else:
-                from contextlib import nullcontext
-
-                autocast = nullcontext()
-            with autocast:
-                output = model(**batch)
-                loss = _probe_sft_loss(
-                    model,
-                    batch,
-                    output,
-                    is_kl=is_kl,
-                    kl_coef=kl_coef,
-                )
-            if loss is None or not bool(torch.isfinite(loss.detach()).all()):
-                raise RuntimeError("memory admission produced no finite loss")
-            loss.backward()
-            # lr=0 keeps weights pristine while the exact AdamW state footprint
-            # is allocated. The whole measured model is discarded afterward.
-            optimizer.step()
-            for device in devices:
-                torch.cuda.synchronize(device)
-            device_peaks = []
-            for device in devices:
-                total = int(torch.cuda.get_device_properties(device).total_memory)
-                reserved = int(torch.cuda.max_memory_reserved(device))
-                allocated = int(torch.cuda.max_memory_allocated(device))
-                device_peaks.append(
-                    {
-                        "device": str(device),
-                        "peak_allocated_bytes": allocated,
-                        "peak_reserved_bytes": reserved,
-                        "total_memory_bytes": total,
-                        "peak_reserved_fraction": round(
-                            (reserved / total) if total else 1.0, 6
-                        ),
-                    }
-                )
-            peak = max(device_peaks, key=lambda item: item["peak_reserved_fraction"])
-            observations.append(
+    trainer = None
+    try:
+        torch.cuda.empty_cache()
+        for device in devices:
+            torch.cuda.reset_peak_memory_stats(device)
+        trainer = build_probe_trainer(plan, model, examples)
+        model = None
+        trainer.train()
+        step = int(getattr(getattr(trainer, "state", None), "global_step", 0) or 0)
+        if step != 1:
+            raise RuntimeError(f"exact geometry probe completed {step} optimizer steps")
+        for device in devices:
+            torch.cuda.synchronize(device)
+        device_peaks = []
+        for device in devices:
+            total = int(torch.cuda.get_device_properties(device).total_memory)
+            reserved = int(torch.cuda.max_memory_reserved(device))
+            allocated = int(torch.cuda.max_memory_allocated(device))
+            device_peaks.append(
                 {
-                    "label": label,
-                    **identity,
-                    "padded_tokens": padded_tokens,
-                    "optimizer": str(plan.optimizer),
-                    "peak_allocated_bytes": peak["peak_allocated_bytes"],
-                    "peak_reserved_bytes": peak["peak_reserved_bytes"],
-                    "total_memory_bytes": peak["total_memory_bytes"],
-                    "peak_reserved_fraction": peak["peak_reserved_fraction"],
-                    "device_peaks": device_peaks,
+                    "device": str(device),
+                    "peak_allocated_bytes": allocated,
+                    "peak_reserved_bytes": reserved,
+                    "total_memory_bytes": total,
+                    "peak_reserved_fraction": round(
+                        (reserved / total) if total else 1.0, 6
+                    ),
                 }
             )
-        except Exception as exc:
-            if not _is_oom(exc):
-                raise
-            observations.append(
-                {
-                    "label": label,
-                    **identity,
-                    "status": "OOM",
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
-            return {"status": "OOM", "batches": observations}
-        finally:
-            try:
-                model.zero_grad(set_to_none=True)
-                optimizer.zero_grad(set_to_none=True)
-            except Exception:
-                pass
-            del loss, output, batch
-            _free_cuda()
-    del optimizer, trainable
-    _free_cuda()
-    highest = max(item["peak_reserved_fraction"] for item in observations)
-    status = (
-        "PASS"
-        if highest <= _GEOMETRY_MAX_RESERVED_FRACTION
-        else "HEADROOM_EXCEEDED"
-    )
-    return {
-        "status": status,
-        "max_reserved_fraction": round(highest, 6),
-        "limit": _GEOMETRY_MAX_RESERVED_FRACTION,
-        "batches": observations,
-    }
+        peak = max(device_peaks, key=lambda item: item["peak_reserved_fraction"])
+        fraction = peak["peak_reserved_fraction"]
+        return {
+            **identity,
+            "status": (
+                "PASS"
+                if fraction <= _GEOMETRY_MAX_RESERVED_FRACTION
+                else "HEADROOM_EXCEEDED"
+            ),
+            "optimizer": str(plan.optimizer),
+            "peak_allocated_bytes": peak["peak_allocated_bytes"],
+            "peak_reserved_bytes": peak["peak_reserved_bytes"],
+            "total_memory_bytes": peak["total_memory_bytes"],
+            "peak_reserved_fraction": fraction,
+            "device_peaks": device_peaks,
+        }
+    except Exception as exc:
+        if not _is_oom(exc):
+            raise RuntimeError(
+                "exact production geometry measurement could not be established"
+            ) from exc
+        return {
+            **identity,
+            "status": "OOM",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        if trainer is not None:
+            holder = [trainer]
+            trainer = None
+            _discard_trainer(holder.pop())
+        elif model is not None:
+            holder = [model]
+            model = None
+            _discard_model(holder.pop())
 
 
 def _discard_model(model: Any) -> None:
@@ -711,12 +631,10 @@ def _admit_sft_geometry(
     plan: TrainPlan,
     model: Any,
     train_ex: list,
-    collator: Any,
     rebuild_model: Callable[[TrainPlan], Any],
-    is_kl: bool = False,
-    kl_coef: float = 0.0,
-) -> tuple[TrainPlan, Any, list[dict[str, Any]]]:
-    """Measure before Trainer construction and return a pristine selected model."""
+    build_probe_trainer: Callable[[TrainPlan, Any, list], Any],
+) -> tuple[TrainPlan, list[dict[str, Any]]]:
+    """Select geometry using exact one-step production Trainer probes."""
     if not _cuda_available():
         observation = {
             "status": "SKIP_NO_CUDA",
@@ -724,45 +642,52 @@ def _admit_sft_geometry(
             "grad_accum": int(plan.grad_accum_steps),
         }
         telemetry.event("geometry_admission_skipped", **observation)
-        return plan, model, [observation]
+        _discard_model(model)
+        return plan, [observation]
 
     attempts: list[dict[str, Any]] = []
     current_model = model
-    # The parameter itself is a strong reference. Clear it before any discard
-    # so a failed probe can actually release this generation before rebuilding.
     model = None
-    for index, candidate in enumerate(_geometry_plans(plan)):
-        if index > 0:
-            current_model = rebuild_model(candidate)
-        try:
-            measured = _measure_sft_geometry(
-                model=current_model,
-                train_ex=train_ex,
-                collator=collator,
-                plan=candidate,
-                is_kl=is_kl,
-                kl_coef=kl_coef,
-            )
-        finally:
-            # Remove the caller alias before the discard helper collects CUDA
-            # storage; otherwise its own gc runs while this frame still pins it.
-            discard_holder = [current_model]
+    for candidate_index, candidate in enumerate(_geometry_plans(plan)):
+        observations = []
+        passed = True
+        for batch_index, (label, examples, identity) in enumerate(
+            _memory_probe_rows(train_ex, batch_size=candidate.per_device_batch_size)
+        ):
+            if candidate_index or batch_index:
+                current_model = rebuild_model(candidate)
+            holder = [current_model]
             current_model = None
-            _discard_model(discard_holder.pop())
+            measured = _measure_sft_geometry(
+                model=holder.pop(),
+                examples=examples,
+                identity={"label": label, **identity},
+                plan=candidate,
+                build_probe_trainer=build_probe_trainer,
+            )
+            observations.append(measured)
+            if measured["status"] != "PASS":
+                passed = False
+                break
+        fractions = [
+            item["peak_reserved_fraction"]
+            for item in observations
+            if "peak_reserved_fraction" in item
+        ]
         attempt = {
             "batch": int(candidate.per_device_batch_size),
             "grad_accum": int(candidate.grad_accum_steps),
             "effective_batch": int(
                 candidate.per_device_batch_size * candidate.grad_accum_steps
             ),
-            **measured,
+            "status": "PASS" if passed else observations[-1]["status"],
+            "max_reserved_fraction": max(fractions) if fractions else None,
+            "limit": _GEOMETRY_MAX_RESERVED_FRACTION,
+            "batches": observations,
         }
         attempts.append(attempt)
         telemetry.event("geometry_admission_attempt", **attempt)
-        if measured["status"] == "PASS":
-            # The measured model has seen backward passes. Reopen base bytes and
-            # reproduce the original trainable initialization for real training.
-            selected_model = rebuild_model(candidate)
+        if passed:
             telemetry.event(
                 "geometry_admission_selected",
                 batch=int(candidate.per_device_batch_size),
@@ -772,9 +697,87 @@ def _admit_sft_geometry(
                 ),
                 attempts=len(attempts),
             )
-            return candidate, selected_model, attempts
+            return candidate, attempts
     telemetry.event("geometry_admission_failed", attempts=attempts)
     raise RuntimeError("no measured SFT geometry passed p99/worst memory admission")
+
+
+def _make_sft_probe_trainer(
+    *,
+    spec: TaskSpec,
+    plan: TrainPlan,
+    model: Any,
+    train_ex: list,
+    collator: Any,
+    is_kl: bool,
+) -> Any:
+    """Build the production Trainer stack for one throwaway optimizer step."""
+    from datasets import Dataset
+    from transformers import Trainer, TrainingArguments
+
+    kwargs = build_training_kwargs(spec, plan, neftune_alpha=None if is_kl else 5.0)
+    kwargs["max_steps"] = 1
+    args = TrainingArguments(
+        **compatible_dataclass_kwargs(
+            TrainingArguments,
+            kwargs,
+            allow_removed={"overwrite_output_dir"},
+        )
+    )
+    trainer_kwargs = dict(
+        model=model,
+        args=args,
+        train_dataset=Dataset.from_list(train_ex),
+        data_collator=collator,
+        callbacks=[],
+    )
+    if is_kl:
+        from forge.tuning.kl import KLSFTTrainer
+
+        return KLSFTTrainer(kl_coef=spec.kl_coef, **trainer_kwargs)
+    return Trainer(**trainer_kwargs)
+
+
+def _time_sft_schedule(
+    *,
+    plan: TrainPlan,
+    model: Any,
+    train_ex: list,
+    collator: Any,
+    deadline: Deadline,
+    strategy: str,
+    is_kl: bool,
+    kl_coef: float,
+    spec: TaskSpec,
+) -> tuple[float | None, float | None]:
+    """Consume a separate model generation for the existing timing probe."""
+    from transformers import Trainer
+
+    trainer_cls: Any = Trainer
+    trainer_extra = None
+    if is_kl:
+        from forge.tuning.kl import KLSFTTrainer
+
+        trainer_cls = KLSFTTrainer
+        trainer_extra = {"kl_coef": kl_coef}
+    try:
+        return time_aware_epochs(
+            trainer_cls=trainer_cls,
+            model=model,
+            kwargs=build_training_kwargs(
+                spec, plan, neftune_alpha=None if is_kl else 5.0
+            ),
+            train_ex=train_ex,
+            collator=collator,
+            deadline=deadline,
+            eff_batch=plan.per_device_batch_size * plan.grad_accum_steps,
+            strategy=strategy,
+            trainer_extra=trainer_extra,
+        )
+    finally:
+        holder = [model]
+        model = None
+        _discard_model(holder.pop())
 
 
 def _make_sft_trainer(
@@ -790,6 +793,7 @@ def _make_sft_trainer(
     is_kl: bool,
     strategy: str,
     n_gpus: int,
+    scheduled_epochs: float | None,
 ) -> tuple[Any, BestTracker, Any]:
     """Construct the existing SFT Trainer/callback policy at one geometry."""
     from datasets import Dataset
@@ -797,34 +801,8 @@ def _make_sft_trainer(
 
     eff_batch = plan.per_device_batch_size * plan.grad_accum_steps
     kwargs = build_training_kwargs(spec, plan, neftune_alpha=None if is_kl else 5.0)
-    if is_kl:
-        from forge.tuning.kl import KLSFTTrainer as probe_cls
-
-        probe_extra = {"kl_coef": spec.kl_coef}
-    else:
-        probe_cls = Trainer
-        probe_extra = None
-    ta_epochs, probe_per_step = time_aware_epochs(
-        trainer_cls=probe_cls,
-        model=model,
-        kwargs=kwargs,
-        train_ex=train_ex,
-        collator=collator,
-        deadline=deadline,
-        eff_batch=eff_batch,
-        strategy=strategy,
-        trainer_extra=probe_extra,
-    )
-    if ta_epochs is not None:
-        kwargs["num_train_epochs"] = ta_epochs
-        telemetry.event(
-            "time_aware_epochs",
-            epochs=ta_epochs,
-            planned=plan.num_epochs,
-            probe_per_step_s=round(probe_per_step, 4),
-            batch=int(plan.per_device_batch_size),
-            grad_accum=int(plan.grad_accum_steps),
-        )
+    if scheduled_epochs is not None:
+        kwargs["num_train_epochs"] = scheduled_epochs
 
     tracker = BestTracker()
     soup_route = eligible_qwen35_soup_route(
@@ -977,8 +955,6 @@ def _train_sft_geometry_ladder(
     """Train, rebuilding only after a genuine zero-progress OOM."""
     plans = _geometry_plans(initial_plan)
     current_model = initial_model
-    # As in admission, do not let the function parameter pin a discarded base
-    # while the next geometry reloads another complete generation.
     initial_model = None
     for index, candidate in enumerate(plans):
         trainer = None
