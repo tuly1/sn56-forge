@@ -12,10 +12,12 @@ replace that measured minimum.
 from __future__ import annotations
 
 import gc
+import hashlib
+import json
 import math
 import os
 import random
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from forge import telemetry
@@ -33,6 +35,7 @@ from forge.model import (
     decide_full_finetune,
     effective_sft_seq_len,
     gpu_topology,
+    is_quasar_model,
     load_base,
     model_param_billions,
     prepare_full_finetune,
@@ -67,6 +70,43 @@ from forge.tuning.qwen35_soup import (
 _EVAL_VAL_ROWS = 256
 _EVAL_MIN_DATASET = 1000
 _BATCHES = (4, 2, 1)
+_CAP_QUANTUM = 256
+
+
+@dataclass(frozen=True)
+class _DataView:
+    """One sequence-cap-specific dataset, split, and ordering authority."""
+
+    cap: int
+    cap_basis: str
+    source_rows: int
+    retained_source_rows: int
+    retained_rows: int
+    retained_fraction: float
+    ordering_sha256: str
+    train: list
+    validation: list
+    authorized: bool = True
+    required_retained_fraction: float = 0.0
+
+    def identity(self) -> dict[str, Any]:
+        return {
+            "sequence_cap": self.cap,
+            "sequence_cap_basis": self.cap_basis,
+            "source_rows": self.source_rows,
+            "retained_source_rows": self.retained_source_rows,
+            "rows_retained": self.retained_source_rows,
+            "retained_rows": self.retained_rows,
+            "tokenized_examples": self.retained_rows,
+            "retained_fraction": self.retained_fraction,
+            "train_rows": len(self.train),
+            "train_n": len(self.train),
+            "validation_rows": len(self.validation),
+            "val_n": len(self.validation),
+            "ordering_sha256": self.ordering_sha256,
+            "cap_authorized": self.authorized,
+            "required_retained_fraction": self.required_retained_fraction,
+        }
 
 
 def run(spec: TaskSpec, deadline: Deadline) -> None:
@@ -128,6 +168,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             reason="h100_proven_pretrainer_geometry",
         )
     plan, quasar_geometry_changed = conservative_quasar_plan(loaded.model, plan)
+    checkpointing_supported = not is_quasar_model(loaded.model)
     if quasar_geometry_changed:
         # The mandatory Quasar remote code advertises gradient checkpointing,
         # but its decoder never invokes Transformers' checkpoint function. Start
@@ -186,14 +227,16 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         save_adapter(model, tokenizer, spec.output_dir, artifact_truth=ARTIFACT_FLOOR,
                      optimizer_step=0, truth_reason="pretraining_floor")
 
-    # Baseline stats are provenance-only for SFT length. Shrinking below G.O.D's
-    # evaluator ladder changes which rows retain supervised completion tokens.
+    # Start at G.O.D's evaluator-equivalent cap. If measured memory rejects every
+    # full-cap geometry, later rungs may use smaller caps, but only when those
+    # caps are derived from a validated task distribution and the exact rows are
+    # retokenized, fingerprinted, and threaded through every downstream phase.
     initial_seq_len = effective_sft_seq_len(model, plan.max_seq_len)
     seq_candidates = tokenize.sft_sequence_len_candidates(
         model, tokenizer, initial_seq_len
     )
     if spec.chat is not None:
-        conversations = prompts.build_chat_conversations(rows, spec.chat)
+        source_items = prompts.build_chat_conversations(rows, spec.chat)
         template_resolution = tokenize.resolve_chat_template(
             spec.chat.chat_template, tokenizer
         )
@@ -202,36 +245,80 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             # before processing rows so even a kill during tokenization explains
             # why native/ChatML semantics replaced the requested future name.
             telemetry.write_into(spec.output_dir)
-        tokenized, seq_len = tokenize.first_nonempty_tokenization(
-            seq_candidates,
-            lambda candidate: tokenize.tokenize_chat_resolved(
-                conversations,
-                tokenizer,
-                candidate,
+        def tokenize_one(source_index: int, candidate: int) -> list:
+            return tokenize.tokenize_chat_resolved(
+                [source_items[source_index]], tokenizer, candidate,
                 resolution=template_resolution,
-            ),
-        )
+            )
     else:
         assert spec.instruct is not None, "instruct task missing instruct columns"
         if spec.instruct.output is None:
-            documents = prompts.build_completion_documents(rows, spec.instruct)
-            seq_len = seq_candidates[0]
-            tokenized = tokenize.tokenize_completion(documents, tokenizer, seq_len)
+            source_items = prompts.build_completion_documents(rows, spec.instruct)
+
+            def tokenize_one(source_index: int, candidate: int) -> list:
+                return tokenize.tokenize_completion(
+                    [source_items[source_index]], tokenizer, candidate
+                )
         else:
-            examples = prompts.build_instruct_examples(rows, spec.instruct)
-            tokenized, seq_len = tokenize.first_nonempty_tokenization(
-                seq_candidates,
-                lambda candidate: tokenize.tokenize_instruct(
-                    examples, tokenizer, candidate
-                ),
-            )
+            source_items = prompts.build_instruct_examples(rows, spec.instruct)
 
-    if not tokenized:
+            def tokenize_one(source_index: int, candidate: int) -> list:
+                return tokenize.tokenize_instruct(
+                    [source_items[source_index]], tokenizer, candidate
+                )
+
+    initial_view = None
+    for candidate in seq_candidates:
+        basis = ("evaluator_initial" if candidate == seq_candidates[0]
+                 else "evaluator_nonempty_retry")
+        view = _make_data_view(
+            candidate, basis, len(source_items), tokenize_one, is_kl
+        )
+        if view.retained_rows:
+            initial_view = view
+            break
+    if initial_view is None:
         raise RuntimeError("no trainable examples after tokenization")
+    seq_len = initial_view.cap
+    plan = replace(plan, max_seq_len=seq_len)
+    reduced_cap_rows, cap_authority = _reduced_sequence_caps(
+        baseline_summary, initial_view, expected_records=len(rows)
+    )
+    plans = _plans(
+        plan,
+        tuple(cap for cap, _basis, _minimum in reduced_cap_rows),
+        checkpointing_supported=checkpointing_supported,
+    )
+    cap_basis = {
+        seq_len: initial_view.cap_basis,
+        **{cap: basis for cap, basis, _minimum in reduced_cap_rows},
+    }
+    cap_minimum = {
+        cap: minimum for cap, _basis, minimum in reduced_cap_rows
+    }
+    views = {seq_len: initial_view}
 
-    # Eval-loss selection holds out a small slice — but NOT on KL tasks, where
-    # each eval reruns the full KL double-forward and would eat the time budget.
-    train_ex, val_ex = (tokenized, []) if is_kl else _split_for_eval(tokenized)
+    telemetry.event("sequence_cap_view", **initial_view.identity())
+    telemetry.event("sequence_cap_authority", **cap_authority)
+    initial_view = None
+    view = None
+
+    def data_for(candidate: TrainPlan) -> _DataView:
+        cap = int(candidate.max_seq_len)
+        if cap not in views:
+            views.clear()
+            gc.collect()
+            views[cap] = _make_data_view(
+                cap,
+                cap_basis[cap],
+                len(source_items),
+                tokenize_one,
+                is_kl,
+                required_retained_fraction=cap_minimum.get(cap, 0.0),
+            )
+            telemetry.event("sequence_cap_view", **views[cap].identity())
+        return views[cap]
+
     collator = tokenize.PadCollator(tokenizer.pad_token_id)
 
     def rebuild(candidate: TrainPlan) -> Any:
@@ -244,18 +331,23 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         return attach_lora(base, r=candidate.lora_r, alpha=candidate.lora_alpha,
                            dropout=candidate.lora_dropout)
 
-    def make(candidate: TrainPlan, candidate_model: Any,
+    def make(candidate: TrainPlan, candidate_model: Any, view: _DataView,
              probe_rows: list | None = None, epochs: float | None = None):
         return _make_trainer(
             spec, deadline, candidate, candidate_model, tokenizer,
-            probe_rows or train_ex,
-            [] if probe_rows is not None else val_ex,
+            probe_rows if probe_rows is not None else view.train,
+            [] if probe_rows is not None else view.validation,
             collator, is_kl, strategy, n_gpus,
             probe=probe_rows is not None, epochs=epochs)
 
     holder = [model]
     del model
-    plan, admission = _admit(plan, holder.pop(), train_ex, rebuild, make)
+    plan, admitted_view, admitted_index, admission, admitted = _admit(
+        plans, holder.pop(), data_for, rebuild, make
+    )
+    views.clear()
+    views[admitted_view.cap] = admitted_view
+    gc.collect()
     eff_batch = plan.per_device_batch_size * plan.grad_accum_steps
     telemetry.set_meta(
         handler="chat" if spec.chat is not None else "instruct",
@@ -263,24 +355,35 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         params_b=round(params_b, 3),
         n_gpus=n_gpus,
         gpu_gb=per_gpu_gb,
-        seq_len=seq_len,
+        seq_len=plan.max_seq_len,
+        sequence_cap_basis=admitted_view.cap_basis,
         seq_len_candidates=seq_candidates,
-        baseline_seq_policy="provenance_only",
-        tokenized=len(tokenized),
-        train_n=len(train_ex),
-        val_n=len(val_ex),
+        survival_seq_caps=list(dict.fromkeys(
+            candidate.max_seq_len for candidate in plans
+        )),
+        baseline_seq_policy="validated_distribution_survival_fallback_only",
+        tokenized=admitted_view.retained_rows,
+        source_rows=admitted_view.source_rows,
+        rows_retained=admitted_view.retained_source_rows,
+        retained_source_rows=admitted_view.retained_source_rows,
+        retained_fraction=admitted_view.retained_fraction,
+        dataset_ordering_sha256=admitted_view.ordering_sha256,
+        train_n=len(admitted_view.train),
+        val_n=len(admitted_view.validation),
         lora_r=plan.lora_r,
         lr=plan.learning_rate,
         batch=plan.per_device_batch_size,
         grad_accum=plan.grad_accum_steps,
         eff_batch=eff_batch,
+        gradient_checkpointing=plan.gradient_checkpointing,
         epochs=plan.num_epochs,
         neftune=not is_kl,
-        tokens_per_step_cap=eff_batch * seq_len,
+        tokens_per_step_cap=eff_batch * plan.max_seq_len,
         geometry_admission=admission,
+        geometry_admitted=admitted,
     )
+    admitted_view = None
 
-    kwargs = build_training_kwargs(spec, plan, neftune_alpha=None if is_kl else 5.0)
     if is_kl:
         from forge.tuning.kl import KLSFTTrainer as probe_cls
 
@@ -288,24 +391,77 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     else:
         probe_cls = Trainer
         probe_extra = None
-    timing_model = rebuild(plan)
-    try:
-        ta_epochs, probe_per_step = time_aware_epochs(
-            trainer_cls=probe_cls, model=timing_model, kwargs=kwargs,
-            train_ex=train_ex, collator=collator, deadline=deadline,
-            eff_batch=eff_batch, strategy=strategy, trainer_extra=probe_extra)
-    finally:
-        holder = [timing_model]
-        timing_model = None
-        _discard(holder.pop())
-    if ta_epochs is not None:
-        telemetry.event("time_aware_epochs", epochs=ta_epochs, planned=plan.num_epochs,
-                        probe_per_step_s=round(probe_per_step, 4))
 
-    holder = [rebuild(plan)]
-    trainer, tracker, soup_route, plan = _train_ladder(
-        plan, holder.pop(), rebuild, make, spec, tokenizer, ta_epochs
+    def measure_epochs(candidate: TrainPlan, view: _DataView) -> float | None:
+        kwargs = build_training_kwargs(
+            spec, candidate, neftune_alpha=None if is_kl else 5.0
+        )
+        timing_model = rebuild(candidate)
+        try:
+            candidate_epochs, probe_per_step = time_aware_epochs(
+                trainer_cls=probe_cls,
+                model=timing_model,
+                kwargs=kwargs,
+                train_ex=view.train,
+                collator=collator,
+                deadline=deadline,
+                eff_batch=(candidate.per_device_batch_size
+                           * candidate.grad_accum_steps),
+                strategy=strategy,
+                trainer_extra=probe_extra,
+            )
+        finally:
+            holder = [timing_model]
+            timing_model = None
+            _discard(holder.pop())
+        if candidate_epochs is not None:
+            telemetry.event(
+                "time_aware_epochs",
+                epochs=candidate_epochs,
+                planned=candidate.num_epochs,
+                probe_per_step_s=round(probe_per_step, 4),
+                **_plan_identity(candidate),
+                **view.identity(),
+            )
+        return candidate_epochs
+
+    trainer, tracker, soup_route, plan, training_view, training_outcome = _train_ladder(
+        plans[admitted_index:], data_for, rebuild, make, measure_epochs,
+        spec, tokenizer,
     )
+    _record_training_selection(plan, training_view, training_outcome)
+    if training_outcome == "progressed_oom_preserved":
+        telemetry.event(
+            "training_progressed_oom_preserved",
+            **_plan_identity(plan),
+            **training_view.identity(),
+        )
+        telemetry.write_into(spec.output_dir)
+        return
+    if training_outcome == "progressed_oom_export_failed":
+        telemetry.event(
+            "training_progressed_oom_export_failed",
+            **_plan_identity(plan),
+            **training_view.identity(),
+        )
+        telemetry.write_into(spec.output_dir)
+        return
+    if trainer is None or tracker is None or training_view is None:
+        telemetry.event(
+            "training_geometry_exhausted",
+            terminal_artifact_truth=ARTIFACT_FLOOR,
+            training_outcome=training_outcome,
+            **_plan_identity(plan),
+            **training_view.identity(),
+        )
+        write_artifact_truth(
+            spec.output_dir,
+            ARTIFACT_FLOOR,
+            optimizer_step=0,
+            reason="zero_progress_oom_ladder_exhausted",
+        )
+        telemetry.write_into(spec.output_dir)
+        return
     model = trainer.model
     final_step = int(getattr(trainer.state, "global_step", 0) or 0)
     truth = _truth(final_step, int(getattr(trainer.state, "max_steps", 0) or 0))
@@ -342,12 +498,220 @@ def _restore_torch_rng(state: tuple[Any, Any]) -> None:
         torch.cuda.set_rng_state_all(state[1])
 
 
-def _plans(plan: TrainPlan) -> tuple[TrainPlan, ...]:
-    start = min(4, max(1, int(plan.per_device_batch_size)))
-    return tuple(
-        replace(plan, per_device_batch_size=batch, grad_accum_steps=math.ceil(16 / batch))
-        for batch in _BATCHES if batch <= start
+def _make_data_view(
+    cap: int,
+    cap_basis: str,
+    source_rows: int,
+    tokenize_one: Callable[[int, int], list],
+    is_kl: bool,
+    *,
+    required_retained_fraction: float = 0.0,
+) -> _DataView:
+    """Retokenize exact source rows at ``cap`` and fingerprint their ordering."""
+    tokenized = []
+    retained_sources: set[int] = set()
+    ordering = hashlib.sha256()
+    for source_index in range(source_rows):
+        chunks = tokenize_one(source_index, cap)
+        if chunks:
+            retained_sources.add(source_index)
+        for chunk_index, row in enumerate(chunks):
+            payload = json.dumps(
+                {
+                    "source_index": source_index,
+                    "chunk_index": chunk_index,
+                    "row": row,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            ordering.update(len(payload).to_bytes(8, "big"))
+            ordering.update(payload)
+            tokenized.append(row)
+    train, validation = (tokenized, []) if is_kl else _split_for_eval(tokenized)
+    retained = len(retained_sources)
+    retained_fraction = round(retained / source_rows, 12) if source_rows else 0.0
+    return _DataView(
+        cap=int(cap),
+        cap_basis=cap_basis,
+        source_rows=source_rows,
+        retained_source_rows=retained,
+        retained_rows=len(tokenized),
+        retained_fraction=retained_fraction,
+        ordering_sha256=ordering.hexdigest(),
+        train=train,
+        validation=validation,
+        authorized=(
+            bool(train) and retained_fraction >= required_retained_fraction
+        ),
+        required_retained_fraction=required_retained_fraction,
     )
+
+
+def _reduced_sequence_caps(
+    summary: Any,
+    initial: _DataView,
+    *,
+    expected_records: int,
+):
+    """Return only distribution-authorized caps below the evaluator cap.
+
+    The validator summary is schema-checked before reaching this function.  p99
+    is the first quality-preserving rescue and p95 is the final survival rung;
+    both round upward so the reported quantile remains inside the cap.
+    """
+    authority = {
+        "policy": "validated_p99_then_p95_round_up_256",
+        "quantum": _CAP_QUANTUM,
+        "initial_cap": initial.cap,
+        "source": "unavailable",
+        "current_task_records": int(expected_records),
+        "caps": [],
+    }
+    if summary is None:
+        return (), authority
+    authority.update(
+        source="validated_baseline_summary",
+        baseline_stats_sha256=summary.sha256,
+        baseline_num_records=summary.num_records,
+        sequence_p99=summary.sequence_p99,
+        sequence_p95=summary.sequence_p95,
+        record_count_matches=(summary.num_records == int(expected_records)),
+    )
+    if summary.num_records != int(expected_records):
+        authority["source"] = "rejected_record_count_mismatch"
+        return (), authority
+    rows: list[tuple[int, str, float]] = []
+    for quantile, value, minimum in (
+        ("p99", summary.sequence_p99, 0.99),
+        ("p95", summary.sequence_p95, 0.95),
+    ):
+        if value <= 0:
+            continue
+        cap = min(
+            initial.cap,
+            math.ceil(int(value) / _CAP_QUANTUM) * _CAP_QUANTUM,
+        )
+        if cap >= initial.cap:
+            continue
+        duplicate = next(
+            (index for index, (existing, _, _) in enumerate(rows)
+             if existing == cap),
+            None,
+        )
+        if duplicate is not None:
+            _cap, old_basis, old_minimum = rows[duplicate]
+            rows[duplicate] = (
+                cap,
+                old_basis.replace("_round_up_", f"_{quantile}_round_up_"),
+                min(old_minimum, minimum),
+            )
+            continue
+        rows.append(
+            (
+                cap,
+                f"validated_baseline_{quantile}_round_up_{_CAP_QUANTUM}",
+                minimum,
+            )
+        )
+    authority["caps"] = [cap for cap, _, _ in rows]
+    return tuple(rows), authority
+
+
+def _plan_identity(plan: TrainPlan) -> dict[str, Any]:
+    batch = int(plan.per_device_batch_size)
+    accum = int(plan.grad_accum_steps)
+    return {
+        "batch": batch,
+        "grad_accum": accum,
+        "effective_batch": batch * accum,
+        "gradient_checkpointing": bool(plan.gradient_checkpointing),
+        "seq_cap": int(plan.max_seq_len),
+    }
+
+
+def _record_training_selection(
+    plan: TrainPlan, view: _DataView, outcome: str
+) -> None:
+    """Refresh top-level telemetry to the rung that actually ended training."""
+    telemetry.set_meta(
+        seq_len=plan.max_seq_len,
+        sequence_cap_basis=view.cap_basis,
+        tokenized=view.retained_rows,
+        rows_retained=view.retained_source_rows,
+        retained_source_rows=view.retained_source_rows,
+        retained_fraction=view.retained_fraction,
+        dataset_ordering_sha256=view.ordering_sha256,
+        train_n=len(view.train),
+        val_n=len(view.validation),
+        batch=plan.per_device_batch_size,
+        grad_accum=plan.grad_accum_steps,
+        eff_batch=plan.per_device_batch_size * plan.grad_accum_steps,
+        gradient_checkpointing=plan.gradient_checkpointing,
+        tokens_per_step_cap=(plan.per_device_batch_size
+                             * plan.grad_accum_steps * plan.max_seq_len),
+        training_outcome=outcome,
+    )
+
+
+def _plans(
+    plan: TrainPlan,
+    reduced_caps: tuple[int, ...] = (),
+    *,
+    checkpointing_supported: bool = True,
+) -> tuple[TrainPlan, ...]:
+    """Ordered survival rungs with one fixed effective batch of 16."""
+    requested = min(4, max(1, int(plan.per_device_batch_size)))
+    start = next(batch for batch in _BATCHES if batch <= requested)
+    first = replace(
+        plan,
+        per_device_batch_size=start,
+        grad_accum_steps=16 // start,
+        gradient_checkpointing=(
+            plan.gradient_checkpointing if checkpointing_supported else False
+        ),
+    )
+    candidates = [first]
+    rescue_gc = checkpointing_supported
+    if checkpointing_supported and not first.gradient_checkpointing:
+        candidates.append(replace(first, gradient_checkpointing=True))
+    for batch in _BATCHES:
+        if batch >= start:
+            continue
+        candidates.append(
+            replace(
+                first,
+                per_device_batch_size=batch,
+                grad_accum_steps=16 // batch,
+                gradient_checkpointing=rescue_gc,
+            )
+        )
+    for cap in reduced_caps:
+        cap = int(cap)
+        if cap <= 0 or cap >= first.max_seq_len:
+            continue
+        candidates.append(
+            replace(
+                first,
+                per_device_batch_size=1,
+                grad_accum_steps=16,
+                gradient_checkpointing=rescue_gc,
+                max_seq_len=cap,
+            )
+        )
+    unique: list[TrainPlan] = []
+    identities = set()
+    for candidate in candidates:
+        identity = (
+            candidate.per_device_batch_size,
+            candidate.grad_accum_steps,
+            candidate.gradient_checkpointing,
+            candidate.max_seq_len,
+        )
+        if identity not in identities:
+            identities.add(identity)
+            unique.append(candidate)
+    return tuple(unique)
 
 
 def _probe_rows(rows: list, batch: int) -> list[tuple[str, list, dict[str, Any]]]:
@@ -444,7 +808,12 @@ def _make_trainer(
 
 
 def _probe_once(
-    plan: TrainPlan, model: Any, rows: list, identity: dict[str, Any], make: Callable
+    plan: TrainPlan,
+    model: Any,
+    rows: list,
+    identity: dict[str, Any],
+    view: _DataView,
+    make: Callable,
 ) -> dict[str, Any]:
     import torch
 
@@ -454,7 +823,7 @@ def _probe_once(
         torch.cuda.empty_cache()
         for device in devices:
             torch.cuda.reset_peak_memory_stats(device)
-        trainer = make(plan, model, rows)[0]
+        trainer = make(plan, model, view, rows)[0]
         model = None
         trainer.train()
         if int(getattr(trainer.state, "global_step", 0) or 0) != 1:
@@ -482,78 +851,241 @@ def _probe_once(
             _discard(holder.pop())
 
 
-def _admit(plan: TrainPlan, model: Any, rows: list,
-           rebuild: Callable, make: Callable):
+def _admit(
+    plans: tuple[TrainPlan, ...],
+    model: Any,
+    data_for: Callable[[TrainPlan], _DataView],
+    rebuild: Callable,
+    make: Callable,
+):
     import torch
 
     if not torch.cuda.is_available():
         _discard(model)
-        return plan, [{"status": "SKIP_NO_CUDA"}]
+        view = data_for(plans[0])
+        attempt = {
+            **_plan_identity(plans[0]),
+            **view.identity(),
+            "status": "SKIP_NO_CUDA",
+        }
+        return plans[0], view, 0, [attempt], False
     attempts = []
     current = model
     model = None
-    for plan_index, candidate in enumerate(_plans(plan)):
+    fallback = None
+    view = None
+    current_cap = None
+    for plan_index, candidate in enumerate(plans):
+        if current_cap is not None and candidate.max_seq_len != current_cap:
+            view = None
+            gc.collect()
+        view = data_for(candidate)
+        current_cap = candidate.max_seq_len
+        if not view.authorized:
+            attempt = {
+                **_plan_identity(candidate),
+                **view.identity(),
+                "status": "CAP_AUTHORITY_REJECTED",
+                "batches": [],
+            }
+            attempts.append(attempt)
+            telemetry.event("geometry_admission_attempt", **attempt)
+            continue
+        if not view.train:
+            attempt = {
+                **_plan_identity(candidate),
+                **view.identity(),
+                "status": "NO_RETAINED_ROWS",
+                "batches": [],
+            }
+            attempts.append(attempt)
+            telemetry.event("geometry_admission_attempt", **attempt)
+            continue
+        fallback = (candidate, plan_index)
         observations = []
         for batch_index, (label, selected, identity) in enumerate(
-                _probe_rows(rows, candidate.per_device_batch_size)):
+                _probe_rows(view.train, candidate.per_device_batch_size)):
             if plan_index or batch_index:
                 current = rebuild(candidate)
             holder = [current]
             current = None
-            observation = _probe_once(candidate, holder.pop(), selected,
-                                      {"label": label, **identity}, make)
+            observation = _probe_once(
+                candidate,
+                holder.pop(),
+                selected,
+                {
+                    "label": label,
+                    **_plan_identity(candidate),
+                    **view.identity(),
+                    **identity,
+                },
+                view,
+                make,
+            )
             observations.append(observation)
             if observation["status"] != "PASS":
                 break
         status = ("PASS" if len(observations) == 2
                   and all(o["status"] == "PASS" for o in observations)
                   else observations[-1]["status"])
-        attempt = dict(batch=candidate.per_device_batch_size,
-                       grad_accum=candidate.grad_accum_steps,
-                       status=status, batches=observations)
+        attempt = {
+            **_plan_identity(candidate),
+            **view.identity(),
+            "status": status,
+            "batches": observations,
+        }
         attempts.append(attempt)
         telemetry.event("geometry_admission_attempt", **attempt)
         if status == "PASS":
-            return candidate, attempts
-    raise RuntimeError("no exact 4->2->1 SFT geometry passed admission")
+            return candidate, view, plan_index, attempts, True
+    if fallback is None:
+        raise RuntimeError("all distribution-authorized SFT geometries were empty")
+    candidate, plan_index = fallback
+    view = None
+    gc.collect()
+    view = data_for(candidate)
+    telemetry.event(
+        "geometry_admission_exhausted_fallback",
+        attempts=len(attempts),
+        admitted=False,
+        **_plan_identity(candidate),
+        **view.identity(),
+    )
+    return candidate, view, plan_index, attempts, False
+
+
+def _truth_matches(output_dir: str, truth: str, step: int) -> bool:
+    try:
+        with open(
+            os.path.join(output_dir, "forge_artifact_truth.json"),
+            encoding="utf-8",
+        ) as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            return False
+        return (
+            payload.get("truth") == truth
+            and int(payload.get("optimizer_step", -1)) == int(step)
+        )
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def _preserve_progress(trainer: Any, tracker: BestTracker, spec: TaskSpec,
-                       tokenizer: Any, step: int) -> None:
+                       tokenizer: Any, step: int) -> bool:
     if tracker.persisted_best is not None:
-        write_artifact_truth(spec.output_dir, ARTIFACT_PARTIAL_TRAINED_BEST,
-                             optimizer_step=int(tracker.persisted_best_step or 0),
-                             reason="progressed_oom_retained_best")
-    else:
-        try:
-            save_adapter(
-                trainer.model, tokenizer, spec.output_dir,
-                artifact_truth=ARTIFACT_PARTIAL_TRAINED_BEST,
-                optimizer_step=step, truth_reason="progressed_oom_latest")
-        except Exception as exc:
-            telemetry.event("progressed_oom_export_failed", error=repr(exc), step=step)
+        selected_step = int(tracker.persisted_best_step or 0)
+        written = write_artifact_truth(
+            spec.output_dir,
+            ARTIFACT_PARTIAL_TRAINED_BEST,
+            optimizer_step=selected_step,
+            reason="progressed_oom_retained_best",
+        )
+        return written and _truth_matches(
+            spec.output_dir, ARTIFACT_PARTIAL_TRAINED_BEST, selected_step
+        )
+    try:
+        save_adapter(
+            trainer.model, tokenizer, spec.output_dir,
+            artifact_truth=ARTIFACT_PARTIAL_TRAINED_BEST,
+            optimizer_step=step, truth_reason="progressed_oom_latest")
+        return _truth_matches(
+            spec.output_dir, ARTIFACT_PARTIAL_TRAINED_BEST, step
+        )
+    except Exception as exc:
+        telemetry.event("progressed_oom_export_failed", error=repr(exc), step=step)
+        return False
 
 
-def _train_ladder(plan: TrainPlan, model: Any, rebuild: Callable, make: Callable,
-                  spec: TaskSpec, tokenizer: Any, epochs: float | None):
-    plans = _plans(plan)
-    current = model
-    model = None
+def _train_ladder(
+    plans: tuple[TrainPlan, ...],
+    data_for: Callable[[TrainPlan], _DataView],
+    rebuild: Callable,
+    make: Callable,
+    measure_epochs: Callable[[TrainPlan, _DataView], float | None],
+    spec: TaskSpec,
+    tokenizer: Any,
+):
+    last_plan = None
+    view = None
+    current_cap = None
     for index, candidate in enumerate(plans):
+        if current_cap is not None and candidate.max_seq_len != current_cap:
+            view = None
+            gc.collect()
+        view = data_for(candidate)
+        current_cap = candidate.max_seq_len
+        if not view.authorized:
+            telemetry.event(
+                "training_geometry_attempt",
+                status="CAP_AUTHORITY_REJECTED",
+                **_plan_identity(candidate),
+                **view.identity(),
+            )
+            continue
+        if not view.train:
+            telemetry.event(
+                "training_geometry_attempt",
+                status="NO_RETAINED_ROWS",
+                **_plan_identity(candidate),
+                **view.identity(),
+            )
+            continue
+        last_plan = candidate
         trainer = None
+        tracker = None
+        route = None
+        current = None
         try:
-            trainer, tracker, route = make(candidate, current, None, epochs)
+            epochs = measure_epochs(candidate, view)
+            current = rebuild(candidate)
+            trainer, tracker, route = make(candidate, current, view, None, epochs)
             current = None
             trainer.train()
-            return trainer, tracker, route, candidate
+            telemetry.event(
+                "training_geometry_attempt",
+                status="PASS",
+                **_plan_identity(candidate),
+                **view.identity(),
+            )
+            return trainer, tracker, route, candidate, view, "trained"
         except Exception as exc:
             if not _is_oom(exc):
                 raise
             step = int(getattr(getattr(trainer, "state", None),
                                "global_step", 0) or 0)
             if step:
-                _preserve_progress(trainer, tracker, spec, tokenizer, step)
-                raise RuntimeError(f"training OOM after progress at step {step}") from None
+                preserved = _preserve_progress(
+                    trainer, tracker, spec, tokenizer, step
+                )
+                status = (
+                    "PROGRESSED_OOM_PRESERVED"
+                    if preserved else "PROGRESSED_OOM_EXPORT_FAILED"
+                )
+                telemetry.event(
+                    "training_geometry_attempt",
+                    status=status,
+                    optimizer_step=step,
+                    **_plan_identity(candidate),
+                    **view.identity(),
+                )
+                return (
+                    None,
+                    tracker,
+                    route,
+                    candidate,
+                    view,
+                    (
+                        "progressed_oom_preserved"
+                        if preserved else "progressed_oom_export_failed"
+                    ),
+                )
+            telemetry.event(
+                "training_geometry_attempt",
+                status="ZERO_PROGRESS_OOM",
+                **_plan_identity(candidate),
+                **view.identity(),
+            )
             if trainer is not None:
                 holder = [trainer]
                 trainer = None
@@ -562,10 +1094,19 @@ def _train_ladder(plan: TrainPlan, model: Any, rebuild: Callable, make: Callable
                 holder = [current]
                 current = None
                 _discard(holder.pop())
-        if index + 1 == len(plans):
-            raise RuntimeError("zero-progress OOM exhausted 4->2->1 ladder") from None
-        current = rebuild(plans[index + 1])
-    raise AssertionError("unreachable")
+    if last_plan is None:
+        raise RuntimeError("training ladder contained no nonempty dataset view")
+    view = None
+    gc.collect()
+    terminal_view = data_for(last_plan)
+    return (
+        None,
+        None,
+        None,
+        last_plan,
+        terminal_view,
+        "zero_progress_exhausted",
+    )
 
 
 def _truth(step: int, max_steps: int) -> str:
