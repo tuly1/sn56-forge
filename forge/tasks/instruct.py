@@ -17,6 +17,7 @@ import json
 import math
 import os
 import random
+import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable
 
@@ -71,6 +72,52 @@ _EVAL_VAL_ROWS = 256
 _EVAL_MIN_DATASET = 1000
 _BATCHES = (4, 2, 1)
 _CAP_QUANTUM = 256
+
+# --- Admission headroom -------------------------------------------------------
+# Calibrated 2026-09-03 on a real H100 80 GB (survival smoke, lease
+# 20260903T105152Z, exact axolotl image, --network none; nine cells, host
+# memory.used sampled every 5 s).  `_probe_once` measures max_memory_reserved /
+# total for ONE fresh optimizer step; real training then grows the reserved pool
+# (variable-length batches fragment the caching allocator, optimizer state and
+# eval passes settle in).  Admitted rung, its worst-batch probe, then the host
+# fraction seen during training (peak / plateau):
+#   bloomz-560m   b4/ga4/gc   0.831 -> 0.916 / 0.771
+#   qwen3.5-9b    b1/ga16     0.857 -> 0.919 / 0.908
+#   granite-4.1   b4/ga4/gc   0.629 -> 0.948 / 0.948
+#   gemma-4-e4b   b2/ga8/gc   0.629 -> 0.957 / 0.701
+#   lfm2.5-8b     b4/ga4/gc   0.604 -> 0.922 / 0.589
+#   minicpm5-1b   b4/ga4/gc   0.413 -> 0.750 / 0.359
+#   falcon-rw-1b  b4/ga4      0.176 -> 0.289 / 0.288   (p99 probe 0.213)
+# A rung is admitted only when every measured probe batch plus this headroom
+# still fits under the ceiling (worst <= 0.78).  That steps the two rungs that
+# went on to train above 0.90 from a high probe (bloomz gc rung, qwen3.5-9b)
+# down exactly one rung, and leaves Falcon's first rung trivially admitted
+# (0.213 + 0.12 = 0.333).  Growth from a moderate probe (granite: 0.629 ->
+# 0.948) is allocator fragmentation that no fixed headroom predicts; it is
+# recorded, not modelled, here.
+_ADMISSION_CEILING = 0.90
+_STEADY_STATE_HEADROOM = 0.12
+
+# --- Wall-budget step planning -------------------------------------------------
+# Same smoke.  Four of the six 2026-pool cells hit `deadline_stop` and exported
+# PARTIAL_TRAINED_BEST: the epoch plan carried no evaluation cost, and the
+# zero-LR timing probe was cut by its own budget cap on Qwen3.5 (4.4-20 s per
+# step) so the default two epochs were scheduled.  Measured, net of evaluation:
+#   cell          schedule       step s     eval s (256 rows)   stopped at
+#   granite-4.1   2.51 ep / 211  5.7        23.7 (eval batch 4)  206
+#   gemma-4-e4b   2.40 ep / 202  6.05       20.5 (eval batch 2)  192
+#   qwen3.5-9b    2 ep / 168     4.4-20     27 (batch 1; 83 first) 118
+#   qwen3.5-4b    2 ep / 168     ~13        26 (batch 1; 82 first)  66
+#   lfm2.5-8b     4.0 ep / 336   1.65       7.2                  completed
+#   bloomz-560m   2 ep / 168     1.5        6.3                  completed
+#   falcon-rw-1b  2 ep / 110     0.72       2.7                  completed
+# eval_s / (step_s * val_rows / eff_batch) measured 0.21-0.38 (mean 0.26); the
+# probe's per-step drifted -5%..+10% over a run; the first Qwen3.5 eval ran 3x
+# its steady cost.  The plan discounts the remaining soft budget (which already
+# excludes the 180 s export reserve) by a setup allowance and this margin.
+_WALL_PLAN_MARGIN = 0.90
+_WALL_PLAN_EVAL_ROW_FACTOR = 0.30
+_WALL_PLAN_SETUP_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -332,13 +379,14 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                            dropout=candidate.lora_dropout)
 
     def make(candidate: TrainPlan, candidate_model: Any, view: _DataView,
-             probe_rows: list | None = None, epochs: float | None = None):
+             probe_rows: list | None = None, epochs: float | None = None,
+             max_steps: int | None = None):
         return _make_trainer(
             spec, deadline, candidate, candidate_model, tokenizer,
             probe_rows if probe_rows is not None else view.train,
             [] if probe_rows is not None else view.validation,
             collator, is_kl, strategy, n_gpus,
-            probe=probe_rows is not None, epochs=epochs)
+            probe=probe_rows is not None, epochs=epochs, max_steps=max_steps)
 
     holder = [model]
     del model
@@ -381,8 +429,15 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         tokens_per_step_cap=eff_batch * plan.max_seq_len,
         geometry_admission=admission,
         geometry_admitted=admitted,
+        admission_ceiling=_ADMISSION_CEILING,
+        admission_headroom=_STEADY_STATE_HEADROOM,
+        admitted_predicted_steady_state_fraction=_admitted_prediction(
+            admission, admitted
+        ),
     )
     admitted_view = None
+    admitted_plan = plan
+    admitted_step_s = _admitted_step_s(admission, admitted)
 
     if is_kl:
         from forge.tuning.kl import KLSFTTrainer as probe_cls
@@ -392,10 +447,13 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         probe_cls = Trainer
         probe_extra = None
 
+    timing: dict[str, float | None] = {}
+
     def measure_epochs(candidate: TrainPlan, view: _DataView) -> float | None:
         kwargs = build_training_kwargs(
             spec, candidate, neftune_alpha=None if is_kl else 5.0
         )
+        timing["probe_per_step"] = None
         timing_model = rebuild(candidate)
         try:
             candidate_epochs, probe_per_step = time_aware_epochs(
@@ -415,6 +473,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             timing_model = None
             _discard(holder.pop())
         if candidate_epochs is not None:
+            timing["probe_per_step"] = probe_per_step
             telemetry.event(
                 "time_aware_epochs",
                 epochs=candidate_epochs,
@@ -425,9 +484,34 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             )
         return candidate_epochs
 
+    def plan_steps(candidate: TrainPlan, view: _DataView,
+                   epochs: float | None) -> int | None:
+        # Measured seconds per optimizer step, best instrument first: the
+        # zero-LR timing probe (steps 10->30 of the exact geometry), else the
+        # admitted rung's worst-batch admission probe (one cold step on the
+        # longest rows: an upper bound).  Without either, the schedule is left
+        # to the deadline callback exactly as before.
+        step_s, source = timing.get("probe_per_step"), "timing_probe"
+        if step_s is None and admitted_step_s is not None and (
+                _plan_identity(candidate) == _plan_identity(admitted_plan)):
+            step_s, source = admitted_step_s, "admission_worst_batch"
+        wall = _plan_wall_steps(
+            budget_s=deadline.remaining(),
+            step_s=step_s,
+            step_source=source if step_s is not None else "none",
+            train_rows=len(view.train),
+            val_rows=len(view.validation),
+            per_device_batch=candidate.per_device_batch_size,
+            grad_accum=candidate.grad_accum_steps,
+            epochs=candidate.num_epochs if epochs is None else epochs,
+            n_gpus=n_gpus,
+        )
+        _record_wall_plan(wall, candidate, view)
+        return int(wall["planned_steps"]) if wall["cap_applied"] else None
+
     trainer, tracker, soup_route, plan, training_view, training_outcome = _train_ladder(
         plans[admitted_index:], data_for, rebuild, make, measure_epochs,
-        spec, tokenizer,
+        spec, tokenizer, plan_steps=plan_steps,
     )
     _record_training_selection(plan, training_view, training_outcome)
     if training_outcome == "progressed_oom_preserved":
@@ -756,6 +840,7 @@ def _make_trainer(
     *,
     probe: bool = False,
     epochs: float | None = None,
+    max_steps: int | None = None,
 ):
     from datasets import Dataset
     from transformers import Trainer, TrainingArguments
@@ -763,15 +848,21 @@ def _make_trainer(
     kwargs = build_training_kwargs(spec, plan, neftune_alpha=None if is_kl else 5.0)
     if probe:
         kwargs["max_steps"] = 1
-    elif epochs is not None:
-        kwargs["num_train_epochs"] = epochs
+    else:
+        if epochs is not None:
+            kwargs["num_train_epochs"] = epochs
+        if max_steps is not None:
+            # Wall-budget cap: the Trainer builds its schedule (cosine floor,
+            # warm-up) over exactly this many optimizer steps, so the anneal
+            # completes inside the budget instead of being cut by the clock.
+            kwargs["max_steps"] = int(max_steps)
     tracker = BestTracker()
     route = None if probe else eligible_qwen35_soup_route(
         spec, model, strategy=strategy, n_gpus=n_gpus,
         capture_root=os.path.join(workdir(spec), "qwen35-r4-r2-captures"))
     if val_ex:
         eff = plan.per_device_batch_size * plan.grad_accum_steps
-        kwargs.update(eval_strategy="steps", eval_steps=max(1, (len(train_ex) // eff) // 4),
+        kwargs.update(eval_strategy="steps", eval_steps=_eval_every(len(train_ex), eff),
                       per_device_eval_batch_size=max(1, plan.per_device_batch_size))
     args = TrainingArguments(
         **compatible_dataclass_kwargs(
@@ -807,6 +898,43 @@ def _make_trainer(
     return trainer, tracker, route
 
 
+def _admission_verdict(peak: float) -> tuple[str, float]:
+    """PASS only if the measured peak plus the calibrated headroom fits."""
+    predicted = round(float(peak) + _STEADY_STATE_HEADROOM, 6)
+    status = "PASS" if predicted <= _ADMISSION_CEILING else "HEADROOM_EXCEEDED"
+    return status, predicted
+
+
+def _admitted_attempt(admission: list, admitted: bool) -> dict[str, Any] | None:
+    if not admitted or not admission:
+        return None
+    attempt = admission[-1]
+    return attempt if attempt.get("status") == "PASS" else None
+
+
+def _admitted_prediction(admission: list, admitted: bool) -> float | None:
+    attempt = _admitted_attempt(admission, admitted)
+    return None if attempt is None else attempt.get("predicted_steady_state_fraction")
+
+
+def _admitted_step_s(admission: list, admitted: bool) -> float | None:
+    """Wall seconds of the admitted rung's worst-batch single-step probe."""
+    attempt = _admitted_attempt(admission, admitted)
+    if attempt is None:
+        return None
+    worst = [
+        batch for batch in attempt.get("batches") or []
+        if batch.get("label") == "worst" and batch.get("step_wall_s") is not None
+    ]
+    if not worst:
+        return None
+    try:
+        value = float(worst[-1]["step_wall_s"])
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
 def _probe_once(
     plan: TrainPlan,
     model: Any,
@@ -825,7 +953,9 @@ def _probe_once(
             torch.cuda.reset_peak_memory_stats(device)
         trainer = make(plan, model, view, rows)[0]
         model = None
+        started = time.monotonic()
         trainer.train()
+        step_wall = time.monotonic() - started
         if int(getattr(trainer.state, "global_step", 0) or 0) != 1:
             raise RuntimeError("exact Trainer probe did not complete one optimizer step")
         for device in devices:
@@ -834,8 +964,13 @@ def _probe_once(
             torch.cuda.max_memory_reserved(device)
             / torch.cuda.get_device_properties(device).total_memory
             for device in devices)
-        return {**identity, "status": "PASS" if peak <= 0.90 else "HEADROOM_EXCEEDED",
-                "peak_reserved_fraction": round(peak, 6)}
+        status, predicted = _admission_verdict(peak)
+        return {**identity, "status": status,
+                "peak_reserved_fraction": round(peak, 6),
+                "predicted_steady_state_fraction": predicted,
+                "headroom": _STEADY_STATE_HEADROOM,
+                "admission_ceiling": _ADMISSION_CEILING,
+                "step_wall_s": round(step_wall, 3)}
     except Exception as exc:
         if not _is_oom(exc):
             raise RuntimeError("exact production geometry measurement failed") from exc
@@ -928,10 +1063,17 @@ def _admit(
         status = ("PASS" if len(observations) == 2
                   and all(o["status"] == "PASS" for o in observations)
                   else observations[-1]["status"])
+        predicted = [
+            o["predicted_steady_state_fraction"] for o in observations
+            if o.get("predicted_steady_state_fraction") is not None
+        ]
         attempt = {
             **_plan_identity(candidate),
             **view.identity(),
             "status": status,
+            "headroom": _STEADY_STATE_HEADROOM,
+            "admission_ceiling": _ADMISSION_CEILING,
+            "predicted_steady_state_fraction": max(predicted) if predicted else None,
             "batches": observations,
         }
         attempts.append(attempt)
@@ -1005,6 +1147,8 @@ def _train_ladder(
     measure_epochs: Callable[[TrainPlan, _DataView], float | None],
     spec: TaskSpec,
     tokenizer: Any,
+    *,
+    plan_steps: Callable[[TrainPlan, _DataView, float | None], int | None] | None = None,
 ):
     last_plan = None
     view = None
@@ -1039,7 +1183,13 @@ def _train_ladder(
         try:
             epochs = measure_epochs(candidate, view)
             current = rebuild(candidate)
-            trainer, tracker, route = make(candidate, current, view, None, epochs)
+            step_cap = None if plan_steps is None else plan_steps(candidate, view, epochs)
+            if step_cap is None:
+                trainer, tracker, route = make(candidate, current, view, None, epochs)
+            else:
+                trainer, tracker, route = make(
+                    candidate, current, view, None, epochs, max_steps=step_cap
+                )
             current = None
             trainer.train()
             telemetry.event(
@@ -1106,6 +1256,122 @@ def _train_ladder(
         last_plan,
         terminal_view,
         "zero_progress_exhausted",
+    )
+
+
+def _eval_every(train_rows: int, eff_batch: int) -> int:
+    """The unchanged evaluation cadence: about four evaluations per epoch."""
+    return max(1, (int(train_rows) // max(1, int(eff_batch))) // 4)
+
+
+def _steps_per_epoch(
+    train_rows: int, per_device_batch: int, grad_accum: int, n_gpus: int = 1
+) -> int:
+    """Optimizer steps per epoch exactly as the Trainer derives them."""
+    sampler_batch = max(1, int(per_device_batch)) * max(1, int(n_gpus))
+    batches = math.ceil(max(0, int(train_rows)) / sampler_batch)
+    accum = max(1, int(grad_accum))
+    return max(1, batches // accum + int(batches % accum > 0))
+
+
+def _plan_wall_steps(
+    *,
+    budget_s: float,
+    step_s: float | None,
+    step_source: str,
+    train_rows: int,
+    val_rows: int,
+    per_device_batch: int,
+    grad_accum: int,
+    epochs: float,
+    n_gpus: int = 1,
+) -> dict[str, Any]:
+    """Cap the optimizer-step schedule so it completes inside the wall budget.
+
+    ``budget_s`` is ``deadline.remaining()``: seconds to the soft stop, which
+    already excludes the export reserve.  ``step_s`` is a measured seconds per
+    optimizer step.  The schedule is the Trainer's own step count for
+    ``epochs``; the cap only ever lowers it, so a run that fits keeps its epoch
+    plan untouched, and an unmeasured run is left to the deadline callback.
+    """
+    batch = max(1, int(per_device_batch))
+    accum = max(1, int(grad_accum))
+    eff = batch * accum
+    per_epoch = _steps_per_epoch(train_rows, batch, accum, n_gpus)
+    schedule = max(1, math.ceil(float(epochs) * per_epoch))
+    every = _eval_every(train_rows, eff)
+    plan: dict[str, Any] = {
+        "schedule_steps": schedule,
+        "steps_per_epoch": per_epoch,
+        "eval_every": every,
+        "eval_rows": int(val_rows),
+        "measured_step_s": None,
+        "step_source": step_source,
+        "budget_s": round(float(budget_s), 1),
+        "setup_s": _WALL_PLAN_SETUP_S,
+        "margin": _WALL_PLAN_MARGIN,
+        "eval_row_factor": _WALL_PLAN_EVAL_ROW_FACTOR,
+        "estimated_eval_s": None,
+        "affordable_steps": None,
+        "estimated_wall_s": None,
+        "planned_steps": schedule,
+        "cap_applied": False,
+        "reason": "unmeasured_step_time",
+    }
+    try:
+        step = float(step_s)
+    except (TypeError, ValueError):
+        return plan
+    if not math.isfinite(step) or step <= 0:
+        return plan
+    plan["measured_step_s"] = round(step, 4)
+    eval_s = (
+        step * (int(val_rows) / eff) * _WALL_PLAN_EVAL_ROW_FACTOR
+        if int(val_rows) > 0 else 0.0
+    )
+    plan["estimated_eval_s"] = round(eval_s, 2)
+    usable = max(0.0, float(budget_s) - _WALL_PLAN_SETUP_S) * _WALL_PLAN_MARGIN
+
+    def cost(steps: int) -> float:
+        # Every `every` steps evaluates, and the Trainer evaluates once more at
+        # the final step unless that step is already an evaluation step.
+        return steps * step + math.ceil(steps / every) * eval_s
+
+    if usable < cost(1):
+        plan["affordable_steps"] = 0
+        plan["reason"] = "budget_below_one_step"
+        return plan
+    affordable = max(1, int(usable // (step + eval_s / every)))
+    while affordable > 1 and cost(affordable) > usable:
+        affordable -= 1
+    while cost(affordable + 1) <= usable:
+        affordable += 1
+    plan["affordable_steps"] = affordable
+    if affordable >= schedule:
+        plan["estimated_wall_s"] = round(cost(schedule), 1)
+        plan["reason"] = "schedule_fits"
+        return plan
+    plan.update(
+        planned_steps=affordable,
+        cap_applied=True,
+        estimated_wall_s=round(cost(affordable), 1),
+        reason="wall_budget_cap",
+    )
+    return plan
+
+
+def _record_wall_plan(wall: dict[str, Any], plan: TrainPlan, view: _DataView) -> None:
+    # Merged explicitly: the plan's keys are disjoint from the identities (a
+    # test pins that), and a diagnostic must never raise inside the ladder.
+    telemetry.event(
+        "wall_budget_plan", **{**view.identity(), **_plan_identity(plan), **wall}
+    )
+    telemetry.set_meta(
+        planned_steps=wall["planned_steps"],
+        measured_step_s=wall["measured_step_s"],
+        budget_s=wall["budget_s"],
+        plan_reason=wall["reason"],
+        wall_plan=wall,
     )
 
 

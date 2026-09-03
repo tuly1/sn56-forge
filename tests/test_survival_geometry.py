@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import math
 import os
 import weakref
 from types import SimpleNamespace
@@ -787,3 +788,454 @@ def test_frozen_recipe_files_are_unchanged():
     for path, digest in expected.items():
         with open(path, "rb") as handle:
             assert hashlib.sha256(handle.read()).hexdigest() == digest
+
+
+# ---------------------------------------------------------------------------
+# Admission headroom and wall-budget planning, calibrated against the
+# 2026-09-03 survival smoke (H100 80 GB, lease 20260903T105152Z).  The numbers
+# below are the measured `peak_reserved_fraction`, probe `train_runtime`,
+# per-step and per-eval wall costs recorded in that lease's forge_run.json and
+# train.log files.
+# ---------------------------------------------------------------------------
+
+
+def test_admission_headroom_constants_and_verdict_boundary():
+    assert instruct._ADMISSION_CEILING == 0.90
+    assert instruct._STEADY_STATE_HEADROOM == 0.12
+    assert instruct._admission_verdict(0.78) == ("PASS", 0.9)
+    assert instruct._admission_verdict(0.780001) == ("HEADROOM_EXCEEDED", 0.900001)
+    assert instruct._admission_verdict(0.0) == ("PASS", 0.12)
+    # The old bare ceiling would have admitted these; the headroom does not.
+    assert instruct._admission_verdict(0.85)[0] == "HEADROOM_EXCEEDED"
+    assert instruct._admission_verdict(0.9)[0] == "HEADROOM_EXCEEDED"
+
+
+# Measured admission probes (label, rung) -> (peak_reserved_fraction, verdict).
+_MEASURED_PROBES = {
+    "falcon-candidate b4/ga4 seq1024 p99": (0.213246, "PASS"),
+    "falcon-candidate b4/ga4 seq1024 worst": (0.176127, "PASS"),
+    "minicpm5-1b b4/ga4 gc-off worst": (0.903768, "HEADROOM_EXCEEDED"),
+    "minicpm5-1b b4/ga4 gc worst": (0.412976, "PASS"),
+    "bloomz-560m b4/ga4 gc p99": (0.491211, "PASS"),
+    "bloomz-560m b4/ga4 gc worst": (0.831206, "HEADROOM_EXCEEDED"),
+    "qwen3.5-9b b1/ga16 p99": (0.569618, "PASS"),
+    "qwen3.5-9b b1/ga16 worst": (0.857276, "HEADROOM_EXCEEDED"),
+    "granite-4.1-8b b4/ga4 gc worst": (0.629281, "PASS"),
+    "gemma-4-e4b-it b4/ga4 gc worst": (0.933858, "HEADROOM_EXCEEDED"),
+    "gemma-4-e4b-it b2/ga8 gc worst": (0.628541, "PASS"),
+    "lfm2.5-8b-a1b b4/ga4 gc worst": (0.603828, "PASS"),
+}
+
+
+def test_admission_verdict_on_every_measured_probe():
+    for label, (peak, expected) in _MEASURED_PROBES.items():
+        status, predicted = instruct._admission_verdict(peak)
+        assert status == expected, label
+        assert predicted == round(peak + 0.12, 6), label
+        assert (predicted <= 0.90) == (expected == "PASS"), label
+
+
+def test_probe_once_records_prediction_headroom_and_step_wall(monkeypatch):
+    import torch
+
+    total = 81_559 * 1024 * 1024
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device=None: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device=None: None)
+    monkeypatch.setattr(
+        torch.cuda, "max_memory_reserved", lambda device=None: int(0.831206 * total)
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties",
+        lambda device=None: SimpleNamespace(total_memory=total),
+    )
+    monkeypatch.setattr(instruct, "_free_cuda", lambda: None)
+
+    class Probe:
+        def __init__(self):
+            self.state = SimpleNamespace(global_step=0)
+            self.accelerator = SimpleNamespace(free_memory=lambda: None)
+
+        def train(self):
+            self.state.global_step = 1
+
+    view = _view(4096)
+    observation = instruct._probe_once(
+        _plan(gc=True), object(), view.train[:1], {"label": "worst"}, view,
+        lambda plan, model, candidate_view, rows: (Probe(), None, None),
+    )
+    assert observation["label"] == "worst"
+    assert observation["status"] == "HEADROOM_EXCEEDED"
+    assert observation["peak_reserved_fraction"] == 0.831206
+    assert observation["predicted_steady_state_fraction"] == 0.951206
+    assert observation["headroom"] == 0.12
+    assert observation["admission_ceiling"] == 0.90
+    assert observation["step_wall_s"] >= 0.0
+
+    monkeypatch.setattr(
+        torch.cuda, "max_memory_reserved", lambda device=None: int(0.176127 * total)
+    )
+    falcon = instruct._probe_once(
+        _plan(cap=1024), object(), view.train[:1], {"label": "worst"}, view,
+        lambda plan, model, candidate_view, rows: (Probe(), None, None),
+    )
+    assert falcon["status"] == "PASS"
+    assert falcon["predicted_steady_state_fraction"] == 0.296127
+
+
+def _probe_table(table, step_wall_s):
+    def probe(plan, model, rows, identity, view, make):
+        instruct._discard(model)
+        key = (plan.per_device_batch_size, plan.gradient_checkpointing, identity["label"])
+        peak = table[key]
+        if peak is None:
+            return {**identity, "status": "OOM",
+                    "error": "OutOfMemoryError: CUDA out of memory"}
+        status, predicted = instruct._admission_verdict(peak)
+        return {**identity, "status": status, "peak_reserved_fraction": peak,
+                "predicted_steady_state_fraction": predicted,
+                "headroom": instruct._STEADY_STATE_HEADROOM,
+                "admission_ceiling": instruct._ADMISSION_CEILING,
+                "step_wall_s": step_wall_s}
+    return probe
+
+
+def test_falcon_measured_probes_admit_the_first_rung_unchanged(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(instruct, "_free_cuda", lambda: None)
+    falcon_model = SimpleNamespace(
+        config=SimpleNamespace(model_type="falcon", max_position_embeddings=2048)
+    )
+    falcon = _plan(cap=instruct.effective_sft_seq_len(falcon_model, 4096))
+    plans = instruct._plans(falcon, (768,))
+    # 2026-09-03 falcon-candidate: p99 0.213246 (cold first probe), worst 0.176127;
+    # probe train_runtime 0.738 s and 0.344 s.
+    table = {(4, False, "p99"): 0.213246, (4, False, "worst"): 0.176127}
+    monkeypatch.setattr(instruct, "_probe_once", _probe_table(table, 0.344))
+    views = {1024: _view(1024, (832, 944)), 768: _view(768)}
+    selected, view, index, attempts, admitted = instruct._admit(
+        plans, "initial", lambda c: views[c.max_seq_len],
+        lambda c: f"fresh-{c.max_seq_len}", object(),
+    )
+    assert admitted is True and index == 0 and selected == falcon
+    assert _geometry((selected,)) == [(4, 4, False, 1024)]
+    assert [item["status"] for item in attempts] == ["PASS"]
+    assert [b["label"] for b in attempts[0]["batches"]] == ["p99", "worst"]
+    assert attempts[0]["predicted_steady_state_fraction"] == 0.333246
+    assert attempts[0]["headroom"] == 0.12
+    assert instruct._admitted_prediction(attempts, admitted) == 0.333246
+    assert instruct._admitted_step_s(attempts, admitted) == 0.344
+
+
+def test_measured_bloomz_and_qwen35_9b_step_down_exactly_one_rung(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(instruct, "_free_cuda", lambda: None)
+
+    # bloomz-560m: gc-off p99 OOM; gc-on p99 0.491 / worst 0.831, then trained
+    # at a 0.916 host peak.  The b2/ga8/gc rung was not probed that day; it is
+    # assumed to fit here.
+    bloomz = {
+        (4, False, "p99"): None,
+        (4, True, "p99"): 0.491211, (4, True, "worst"): 0.831206,
+        (2, True, "p99"): 0.30, (2, True, "worst"): 0.50,
+    }
+    monkeypatch.setattr(instruct, "_probe_once", _probe_table(bloomz, 2.51))
+    plans = instruct._plans(_plan(), (2560, 1536))
+    views = {4096: _view(4096), 2560: _view(2560), 1536: _view(1536)}
+    selected, view, index, attempts, admitted = instruct._admit(
+        plans, "initial", lambda c: views[c.max_seq_len],
+        lambda c: f"fresh-{c.max_seq_len}", object(),
+    )
+    assert admitted is True and index == 2 and view is views[4096]
+    assert _geometry((selected,)) == [(2, 8, True, 4096)]
+    assert [item["status"] for item in attempts] == [
+        "OOM", "HEADROOM_EXCEEDED", "PASS"
+    ]
+    assert attempts[1]["predicted_steady_state_fraction"] == 0.951206
+    assert attempts[1]["batches"][-1]["label"] == "worst"
+    assert attempts[1]["batches"][-1]["status"] == "HEADROOM_EXCEEDED"
+    assert attempts[2]["predicted_steady_state_fraction"] == 0.62
+    assert instruct._admitted_prediction(attempts, admitted) == 0.62
+    assert instruct._admitted_step_s(attempts, admitted) == 2.51
+
+    # qwen3.5-9b on its proven b1/ga16 route: p99 0.570 / worst 0.857, then
+    # trained at a 0.908 host plateau (65.8 GiB allocated).  The gc rescue rung
+    # keeps b1/ga16 and is assumed to fit.
+    qwen = {
+        (1, False, "p99"): 0.569618, (1, False, "worst"): 0.857276,
+        (1, True, "p99"): 0.35, (1, True, "worst"): 0.55,
+    }
+    monkeypatch.setattr(instruct, "_probe_once", _probe_table(qwen, 20.92))
+    plans = instruct._plans(_plan(1, 16), (2816, 1536))
+    views = {4096: _view(4096), 2816: _view(2816), 1536: _view(1536)}
+    selected, view, index, attempts, admitted = instruct._admit(
+        plans, "initial", lambda c: views[c.max_seq_len],
+        lambda c: f"fresh-{c.max_seq_len}", object(),
+    )
+    assert admitted is True and index == 1
+    assert _geometry((selected,)) == [(1, 16, True, 4096)]
+    assert [item["status"] for item in attempts] == ["HEADROOM_EXCEEDED", "PASS"]
+    assert attempts[0]["predicted_steady_state_fraction"] == 0.977276
+    assert instruct._admitted_step_s(attempts, admitted) == 20.92
+
+
+def test_admitted_extraction_is_none_without_a_passing_measured_rung():
+    exhausted = [{"status": "OOM", "batches": []}]
+    assert instruct._admitted_prediction(exhausted, False) is None
+    assert instruct._admitted_step_s(exhausted, False) is None
+    assert instruct._admitted_step_s(exhausted, True) is None
+    unmeasured = [{"status": "PASS", "batches": [
+        {"label": "p99", "status": "PASS", "step_wall_s": 0.7},
+        {"label": "worst", "status": "PASS"},
+    ]}]
+    assert instruct._admitted_step_s(unmeasured, True) is None
+    zero = [{"status": "PASS", "batches": [{"label": "worst", "step_wall_s": 0.0}]}]
+    assert instruct._admitted_step_s(zero, True) is None
+    assert instruct._admitted_step_s([{"status": "SKIP_NO_CUDA"}], False) is None
+
+
+def test_steps_per_epoch_and_eval_cadence_match_the_trainer():
+    # (train rows, batch, accum) -> steps/epoch, cross-checked against each
+    # cell's train_end / train_steps_per_second in the smoke.
+    assert instruct._steps_per_epoch(875, 4, 4) == 55      # falcon: 110 = 2 epochs
+    assert instruct._steps_per_epoch(1339, 4, 4) == 84     # bloomz: 168
+    assert instruct._steps_per_epoch(1338, 4, 4) == 84     # minicpm 168 / lfm 336
+    assert instruct._steps_per_epoch(1337, 1, 16) == 84    # qwen3.5-9b: 168
+    assert instruct._steps_per_epoch(1340, 4, 4) == 84     # granite: ceil(2.51*84)
+    assert instruct._steps_per_epoch(1337, 2, 8) == 84     # gemma: ceil(2.4*84)
+    assert math.ceil(2.51 * 84) == 211 and math.ceil(2.4 * 84) == 202
+    assert instruct._steps_per_epoch(1337, 1, 16, n_gpus=2) == 42
+    assert instruct._steps_per_epoch(0, 4, 4) == 1
+    assert instruct._eval_every(875, 16) == 13   # falcon evaluated at 13, 26, ...
+    assert instruct._eval_every(1337, 16) == 20  # 2026-pool cells: every 20
+    assert instruct._eval_every(10, 16) == 1
+
+
+def test_falcon_smoke_fixture_keeps_all_110_steps_with_measured_numbers():
+    # falcon-candidate, 2026-09-03: hours 0.2 -> 540 s soft budget, admission
+    # finished at 10.4 s; admission probes 0.738 s (p99, cold) and 0.344 s
+    # (worst); real training 0.68-0.78 s/step net, 2.7 s per eval.
+    budget = 540.0 - 10.4
+    for step_s in (0.3436, 0.7381, 0.78):
+        wall = instruct._plan_wall_steps(
+            budget_s=budget, step_s=step_s, step_source="admission_worst_batch",
+            train_rows=875, val_rows=256, per_device_batch=4, grad_accum=4,
+            epochs=2,
+        )
+        assert wall["schedule_steps"] == 110
+        assert wall["eval_every"] == 13
+        assert wall["reason"] == "schedule_fits"
+        assert wall["cap_applied"] is False
+        assert wall["planned_steps"] == 110
+        assert wall["affordable_steps"] >= 3 * 110
+    # Replay of the real run: 110 steps + 9 evaluations fit with room to spare.
+    replay = 110 * 0.78 + math.ceil(110 / 13) * 2.7 + instruct._WALL_PLAN_SETUP_S
+    assert replay < 0.4 * budget
+
+
+def test_wall_plan_caps_granite_and_gemma_inside_their_measured_budgets():
+    # granite-4.1-8b: planned at t=206.7 s of a 1620 s soft budget; probe
+    # 5.8429 s/step; 1340 rows b4/ga4; 2.51 epochs -> 211 steps; the deadline
+    # stopped it at 206 with the anneal unfinished.
+    budget = 1620.0 - 206.7
+    granite = instruct._plan_wall_steps(
+        budget_s=budget, step_s=5.8429, step_source="timing_probe",
+        train_rows=1340, val_rows=256, per_device_batch=4, grad_accum=4,
+        epochs=2.51,
+    )
+    assert granite["schedule_steps"] == 211 and granite["eval_every"] == 20
+    assert granite["reason"] == "wall_budget_cap" and granite["cap_applied"] is True
+    assert granite["planned_steps"] == 165
+    assert granite["measured_step_s"] == 5.8429
+    assert granite["estimated_wall_s"] <= (budget - 60.0) * 0.9
+    # Replay with the measured run costs (5.7 s/step net, 23.7 s per eval,
+    # final evaluation included): completes inside the budget, using most of it.
+    replay = 165 * 5.7 + math.ceil(165 / 20) * 23.7 + instruct._WALL_PLAN_SETUP_S
+    assert replay < budget
+    assert replay > 0.75 * budget
+
+    # gemma-4-e4b-it: planned at t=257.4 s; probe 5.8863 s/step; 1337 rows
+    # b2/ga8; 2.4 epochs -> 202 steps; stopped at 192.
+    budget = 1620.0 - 257.4
+    gemma = instruct._plan_wall_steps(
+        budget_s=budget, step_s=5.8863, step_source="timing_probe",
+        train_rows=1337, val_rows=256, per_device_batch=2, grad_accum=8,
+        epochs=2.4,
+    )
+    assert gemma["schedule_steps"] == 202
+    assert gemma["reason"] == "wall_budget_cap"
+    assert gemma["planned_steps"] == 160
+    replay = 160 * 6.05 + math.ceil(160 / 20) * 20.5 + instruct._WALL_PLAN_SETUP_S
+    assert replay < budget
+    assert replay > 0.75 * budget
+
+
+def test_wall_plan_leaves_completed_cells_uncapped():
+    # lfm2.5-8b-a1b: planned at t=97.4 s; probe 1.5725 s/step; 1338 rows
+    # b4/ga4; 4.0 epochs -> 336 steps; completed at 782 s.
+    lfm = instruct._plan_wall_steps(
+        budget_s=1620.0 - 97.4, step_s=1.5725, step_source="timing_probe",
+        train_rows=1338, val_rows=256, per_device_batch=4, grad_accum=4,
+        epochs=4.0,
+    )
+    assert lfm["schedule_steps"] == 336
+    assert lfm["reason"] == "schedule_fits" and lfm["planned_steps"] == 336
+    assert lfm["estimated_eval_s"] == 7.55  # measured 7.1-7.3 s
+
+    # bloomz-560m and minicpm5-1b (0.3 h): the timing probe declines below
+    # 900 s remaining, so the admission worst-batch probe (2.51 s / 1.70 s) is
+    # the measurement; both two-epoch schedules of 168 steps fit.
+    for step_s, rows in ((2.51, 1339), (1.697, 1338)):
+        wall = instruct._plan_wall_steps(
+            budget_s=900.0 - 22.0, step_s=step_s,
+            step_source="admission_worst_batch", train_rows=rows,
+            val_rows=256, per_device_batch=4, grad_accum=4, epochs=2,
+        )
+        assert wall["schedule_steps"] == 168
+        assert wall["reason"] == "schedule_fits" and wall["cap_applied"] is False
+
+
+def test_wall_plan_caps_qwen35_from_the_admission_probe_when_timing_probe_is_cut():
+    # qwen3.5-9b: the timing probe was cut at 180 s (per-step 4.4-20 s) and
+    # returned nothing, so the default two epochs (168 steps) were scheduled
+    # and the deadline stopped training at 118.  The admitted rung's worst-
+    # batch probe took 20.92 s (a cold upper bound of the 4.4 s steady step).
+    # Planning at ~t=310 s of the 1620 s soft budget:
+    qwen9b = instruct._plan_wall_steps(
+        budget_s=1620.0 - 310.0, step_s=20.92, step_source="admission_worst_batch",
+        train_rows=1337, val_rows=256, per_device_batch=1, grad_accum=16,
+        epochs=2,
+    )
+    assert qwen9b["schedule_steps"] == 168
+    assert qwen9b["reason"] == "wall_budget_cap"
+    assert qwen9b["planned_steps"] == 40
+    # Replay with the measured costs (20 steps at 20.6 s warm-up, then 4.4 s;
+    # first eval 83 s, later 27 s): the capped schedule completes early.
+    replay = 20 * 20.6 + 20 * 4.4 + 83 + 27 + instruct._WALL_PLAN_SETUP_S
+    assert replay < 1620.0 - 310.0
+
+    # qwen3.5-4b (0.4 h): same shape; worst-batch probe 20.93 s; planning at
+    # ~t=256 s of the 1260 s soft budget (66 steps of 168 ran before the stop).
+    qwen4b = instruct._plan_wall_steps(
+        budget_s=1260.0 - 256.0, step_s=20.93, step_source="admission_worst_batch",
+        train_rows=1337, val_rows=256, per_device_batch=1, grad_accum=16,
+        epochs=2,
+    )
+    assert qwen4b["reason"] == "wall_budget_cap"
+    assert qwen4b["planned_steps"] == 30
+    assert 30 * 13.0 + 2 * 26.2 + 82 + instruct._WALL_PLAN_SETUP_S < 1260.0 - 256.0
+
+
+def test_wall_plan_without_measurement_or_budget_leaves_schedule_to_deadline():
+    for step_s in (None, 0.0, -1.0, float("nan"), float("inf"), "n/a"):
+        wall = instruct._plan_wall_steps(
+            budget_s=1000.0, step_s=step_s, step_source="none",
+            train_rows=1337, val_rows=256, per_device_batch=1, grad_accum=16,
+            epochs=2,
+        )
+        assert wall["reason"] == "unmeasured_step_time"
+        assert wall["cap_applied"] is False
+        assert wall["planned_steps"] == 168
+        assert wall["measured_step_s"] is None
+    tiny = instruct._plan_wall_steps(
+        budget_s=70.0, step_s=20.92, step_source="admission_worst_batch",
+        train_rows=1337, val_rows=256, per_device_batch=1, grad_accum=16,
+        epochs=2,
+    )
+    assert tiny["reason"] == "budget_below_one_step"
+    assert tiny["cap_applied"] is False and tiny["affordable_steps"] == 0
+    assert tiny["planned_steps"] == 168
+    # No validation rows (KL or tiny datasets): no evaluation cost is charged.
+    no_eval = instruct._plan_wall_steps(
+        budget_s=1000.0, step_s=10.0, step_source="timing_probe",
+        train_rows=1337, val_rows=0, per_device_batch=1, grad_accum=16,
+        epochs=2,
+    )
+    assert no_eval["estimated_eval_s"] == 0.0
+    assert no_eval["affordable_steps"] == int((1000.0 - 60.0) * 0.9 // 10.0)
+
+
+def test_ladder_passes_the_cap_only_when_it_binds(monkeypatch):
+    received = []
+
+    def make(plan, model, view, probe_rows, epochs, **kwargs):
+        received.append((epochs, kwargs))
+        return _Trainer(model, None), common.BestTracker(), None
+
+    monkeypatch.setattr(instruct, "_free_cuda", lambda: None)
+    args = (
+        (_plan(),), lambda _c: _view(4096), lambda _p: "fresh", make,
+        lambda _p, _v: 2.51, SimpleNamespace(output_dir="/unused"), object(),
+    )
+    fits = instruct._train_ladder(*args, plan_steps=lambda plan, view, epochs: None)
+    assert received == [(2.51, {})] and fits[-1] == "trained"
+    received.clear()
+    seen = []
+
+    def plan_steps(plan, view, epochs):
+        seen.append((plan, view.cap, epochs))
+        return 165
+
+    capped = instruct._train_ladder(*args, plan_steps=plan_steps)
+    assert received == [(2.51, {"max_steps": 165})] and capped[-1] == "trained"
+    assert seen == [(_plan(), 4096, 2.51)]
+    received.clear()
+    legacy = instruct._train_ladder(*args)
+    assert received == [(2.51, {})] and legacy[-1] == "trained"
+
+
+def test_wall_plan_is_recorded_in_event_and_meta(monkeypatch):
+    events, metas = [], []
+    monkeypatch.setattr(
+        instruct.telemetry, "event", lambda name, **kv: events.append((name, kv))
+    )
+    monkeypatch.setattr(instruct.telemetry, "set_meta", lambda **kv: metas.append(kv))
+    wall = instruct._plan_wall_steps(
+        budget_s=1620.0 - 206.7, step_s=5.8429, step_source="timing_probe",
+        train_rows=1340, val_rows=256, per_device_batch=4, grad_accum=4,
+        epochs=2.51,
+    )
+    view = _view(4096, (700, 4084))
+    instruct._record_wall_plan(wall, _plan(gc=True), view)
+    assert [name for name, _ in events] == ["wall_budget_plan"]
+    recorded = events[0][1]
+    assert recorded["planned_steps"] == 165
+    assert recorded["schedule_steps"] == 211
+    assert recorded["reason"] == "wall_budget_cap"
+    assert recorded["budget_s"] == 1413.3
+    assert recorded["batch"] == 4 and recorded["gradient_checkpointing"] is True
+    assert recorded["sequence_cap"] == 4096 and recorded["train_n"] == 2
+    assert recorded["validation_rows"] == 0 and recorded["eval_rows"] == 256
+    # A colliding key would have raised inside the ladder: keep them disjoint.
+    assert not set(wall) & set(view.identity())
+    assert not set(wall) & set(instruct._plan_identity(_plan()))
+    assert metas == [{
+        "planned_steps": 165,
+        "measured_step_s": 5.8429,
+        "budget_s": 1413.3,
+        "plan_reason": "wall_budget_cap",
+        "wall_plan": wall,
+    }]
+
+
+def test_step_cap_reaches_the_real_trainer_and_probe_stays_single_step():
+    factory = inspect.getsource(instruct._make_trainer)
+    assert 'kwargs["max_steps"] = 1' in factory
+    assert 'kwargs["max_steps"] = int(max_steps)' in factory
+    assert factory.index("if probe:") < factory.index('kwargs["max_steps"] = int(max_steps)')
+    assert "eval_steps=_eval_every(len(train_ex), eff)" in factory
+    run = inspect.getsource(instruct.run)
+    assert "plan_steps=plan_steps" in run
+    assert "_admitted_step_s(admission, admitted)" in run
+    assert 'timing["probe_per_step"] = probe_per_step' in run
+    assert "budget_s=deadline.remaining()" in run
+    assert "admitted_predicted_steady_state_fraction=" in run
+    ladder = inspect.getsource(instruct._train_ladder)
+    assert ladder.index("current = rebuild(candidate)") < ladder.index(
+        "plan_steps(candidate, view, epochs)"
+    ) < ladder.index("max_steps=step_cap")
