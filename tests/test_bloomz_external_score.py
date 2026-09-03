@@ -150,7 +150,14 @@ def _lora_config() -> dict:
         "arrow_config": None,
         "ensure_weight_tying": False,
         "base_model_name_or_path": "/cache/models/bigscience--bloomz-560m",
-        "target_modules": sorted(score.EXPECTED_LORA_TARGETS),
+        # PEFT 0.19.1 serializes all-linear BLOOM targets as these four
+        # suffixes; the adapter tensor keys carry the 24 layer prefixes.
+        "target_modules": [
+            "dense",
+            "dense_4h_to_h",
+            "dense_h_to_4h",
+            "query_key_value",
+        ],
     }
 
 

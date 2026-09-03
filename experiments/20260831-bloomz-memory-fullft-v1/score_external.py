@@ -65,14 +65,12 @@ MAX_TIMEOUT_SECONDS = 540
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ADAPTER_BASE_PREFIX = PurePosixPath("/cache/models")
 EXPECTED_LORA_TARGETS = frozenset(
-    name
-    for layer in range(24)
-    for name in (
-        f"transformer.h.{layer}.self_attention.query_key_value",
-        f"transformer.h.{layer}.self_attention.dense",
-        f"transformer.h.{layer}.mlp.dense_h_to_4h",
-        f"transformer.h.{layer}.mlp.dense_4h_to_h",
-    )
+    {
+        "query_key_value",
+        "dense",
+        "dense_h_to_4h",
+        "dense_4h_to_h",
+    }
 )
 
 class ScoreError(RuntimeError):
