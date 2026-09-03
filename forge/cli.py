@@ -27,9 +27,18 @@ import time
 # (granite 0.629 -> 0.948 of host memory sustained; early transients to
 # 0.92-0.97 on bloomz/gemma/lfm; Qwen3.5 steps 5x slower while the allocator
 # freed and retried) -- torch's own OOM message recommends expandable segments
-# for exactly this.  An operator's value is never overridden, and non-Linux or
+# for exactly this.  The 646d0b70 smoke (VM 1022601, torch 2.9.1+cu128) then
+# logged "AllocatorConfig.cpp:28 Warning: PYTORCH_CUDA_ALLOC_CONF is
+# deprecated, use PYTORCH_ALLOC_CONF instead" and reproduced the failure on
+# qwen3.5-9b (admitted worst 0.414, host reservation 0.987 with only 0.40
+# allocated, steps 1.8 s -> 7-16 s, deadline stop at 77/168): torch 2.9 still
+# honours the legacy name (it parses it first, with that warning) and
+# PYTORCH_ALLOC_CONF is the canonical name, so both are set together.  If the
+# operator set either name, both are preserved exactly as found; non-Linux or
 # GPU-less processes are left untouched.
-_CUDA_ALLOC_CONF_KEY = "PYTORCH_CUDA_ALLOC_CONF"
+_ALLOC_CONF_KEY = "PYTORCH_ALLOC_CONF"  # canonical since torch 2.9
+_CUDA_ALLOC_CONF_KEY = "PYTORCH_CUDA_ALLOC_CONF"  # legacy alias, still parsed
+_ALLOC_CONF_KEYS = (_ALLOC_CONF_KEY, _CUDA_ALLOC_CONF_KEY)
 _CUDA_ALLOC_CONF_DEFAULT = "expandable_segments:True"
 _CUDA_DEVICE_NODES = ("/dev/nvidiactl", "/dev/nvidia0")
 
@@ -42,24 +51,35 @@ def _cuda_device_visible() -> bool:
 def _configure_cuda_allocator(
     environ, *, system: str, cuda_visible: bool, torch_preloaded: bool
 ) -> dict:
-    """Set the allocator default when appropriate and report the decision."""
+    """Set both allocator names when appropriate and report the decision.
+
+    Both names receive the default only when the operator set neither; if
+    either name is present (even empty) both are left exactly as found and
+    ``preset_keys`` records which ones the operator set.
+    """
+    preset = [key for key in _ALLOC_CONF_KEYS if key in environ]
     state = {
-        "key": _CUDA_ALLOC_CONF_KEY,
-        "value": environ.get(_CUDA_ALLOC_CONF_KEY),
+        "new_key": _ALLOC_CONF_KEY,
+        "legacy_key": _CUDA_ALLOC_CONF_KEY,
+        "alloc_conf_new": environ.get(_ALLOC_CONF_KEY),
+        "alloc_conf_legacy": environ.get(_CUDA_ALLOC_CONF_KEY),
+        "preset_keys": preset,
         "system": system,
         "cuda_device_visible": bool(cuda_visible),
         "torch_preloaded": bool(torch_preloaded),
     }
-    if _CUDA_ALLOC_CONF_KEY in environ:
+    if preset:
         state.update(source="environment", reason="preset_by_operator")
     elif system != "Linux":
         state.update(source="unset", reason="not_linux")
     elif not cuda_visible:
         state.update(source="unset", reason="no_cuda_device")
     else:
-        environ[_CUDA_ALLOC_CONF_KEY] = _CUDA_ALLOC_CONF_DEFAULT
+        for key in _ALLOC_CONF_KEYS:
+            environ[key] = _CUDA_ALLOC_CONF_DEFAULT
         state.update(
-            value=_CUDA_ALLOC_CONF_DEFAULT,
+            alloc_conf_new=_CUDA_ALLOC_CONF_DEFAULT,
+            alloc_conf_legacy=_CUDA_ALLOC_CONF_DEFAULT,
             source="forge_default",
             reason="linux_cuda_device",
         )
@@ -75,7 +95,7 @@ _CUDA_ALLOC_CONF_STATE = _configure_cuda_allocator(
 
 
 def cuda_alloc_conf_state() -> dict:
-    """What this process decided about PYTORCH_CUDA_ALLOC_CONF at import time."""
+    """What this process decided about PYTORCH_ALLOC_CONF / PYTORCH_CUDA_ALLOC_CONF."""
     return dict(_CUDA_ALLOC_CONF_STATE)
 
 
@@ -223,9 +243,12 @@ def _record_cuda_alloc_conf() -> None:
     """Flight-record the import-time allocator decision in the artifact."""
     state = cuda_alloc_conf_state()
     telemetry.set_meta(
-        cuda_alloc_conf=state["value"],
+        cuda_alloc_conf=state["alloc_conf_legacy"],
+        alloc_conf_new=state["alloc_conf_new"],
+        alloc_conf_legacy=state["alloc_conf_legacy"],
         cuda_alloc_conf_source=state["source"],
         cuda_alloc_conf_reason=state["reason"],
+        cuda_alloc_conf_preset_keys=state["preset_keys"],
     )
     telemetry.event("cuda_alloc_conf", **state)
 
