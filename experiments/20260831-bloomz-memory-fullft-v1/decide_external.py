@@ -65,10 +65,10 @@ def authority(value: Any) -> dict[str, str]:
     need(isinstance(result["training_image_id"], str) and IMAGE_ID.fullmatch(result["training_image_id"]), "invalid training image ID")
     for key in ("provider_start_epoch", "science_start_deadline_epoch", "science_started_epoch", "decision_deadline_epoch", "provider_deadline_epoch"):
         need(isinstance(result[key], int) and not isinstance(result[key], bool), f"invalid {key}")
-    need(result["science_start_deadline_epoch"] - result["provider_start_epoch"] == 1_200, "science-start deadline drift")
+    need(result["science_start_deadline_epoch"] - result["provider_start_epoch"] == 2_700, "science-start deadline drift")
     need(result["provider_start_epoch"] <= result["science_started_epoch"] <= result["science_start_deadline_epoch"], "science start exceeds allowance")
     need(result["decision_deadline_epoch"] - result["science_started_epoch"] == 24_000, "decision deadline drift")
-    need(result["provider_deadline_epoch"] - result["provider_start_epoch"] == 30_600, "provider deadline drift")
+    need(result["provider_deadline_epoch"] - result["provider_start_epoch"] == 32_100, "provider deadline drift")
     need(result["decision_deadline_epoch"] + 5_400 <= result["provider_deadline_epoch"], "CEO custody/close reserve drift")
     return result
 def gpu_admission(value: Any, strategy: str, expected_authority: Mapping[str, str]) -> dict[str, Any]:

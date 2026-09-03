@@ -25,10 +25,10 @@ AUTHORITY = {
     "training_image_id": "sha256:" + "8" * 64,
     "experiment_config_sha256": "9" * 64,
     "provider_start_epoch": 4_102_444_800,
-    "science_start_deadline_epoch": 4_102_446_000,
+    "science_start_deadline_epoch": 4_102_447_500,
     "science_started_epoch": 4_102_445_400,
     "decision_deadline_epoch": 4_102_469_400,
-    "provider_deadline_epoch": 4_102_475_400,
+    "provider_deadline_epoch": 4_102_476_900,
     "lease_budget_sha256": "b" * 64,
 }
 BASE = "a" * 64
