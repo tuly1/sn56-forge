@@ -5,6 +5,7 @@ from dataclasses import replace
 import importlib.util
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -51,6 +52,119 @@ def _authority(runtime_sha: str) -> dict[str, str]:
     }
 
 
+def _git(repository: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["/usr/bin/git", "-C", str(repository), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _score_only_repositories(
+    tmp_path: Path, monkeypatch
+) -> tuple[Path, Path, dict[str, str]]:
+    science = tmp_path / "science"
+    science.mkdir(parents=True)
+    _git(science, "init", "-q")
+    _git(science, "config", "user.email", "science@example.invalid")
+    _git(science, "config", "user.name", "Science Test")
+    for relative in (*score.SCORE_ONLY_CHANGED_PATHS, "unrelated.txt"):
+        path = science / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"science:{relative}\n", encoding="utf-8")
+    _git(science, "add", ".")
+    _git(science, "commit", "-qm", "science")
+    scorer = tmp_path / "scorer"
+    subprocess.run(["/usr/bin/git", "clone", "-q", str(science), str(scorer)], check=True)
+    _git(scorer, "config", "user.email", "score@example.invalid")
+    _git(scorer, "config", "user.name", "Score Test")
+    for relative in score.SCORE_ONLY_CHANGED_PATHS:
+        (scorer / relative).write_text(f"suffix-fix:{relative}\n", encoding="utf-8")
+    _git(scorer, "add", ".")
+    _git(scorer, "commit", "-qm", "suffix fix")
+    intermediate = _git(scorer, "rev-parse", "HEAD")
+    intermediate_tree = _git(scorer, "rev-parse", "HEAD^{tree}")
+    for relative in score.SCORE_ONLY_CHANGED_PATHS:
+        (scorer / relative).write_text(f"authority-bridge:{relative}\n", encoding="utf-8")
+    _git(scorer, "add", ".")
+    _git(scorer, "commit", "-qm", "authority bridge")
+    science_commit = _git(science, "rev-parse", "HEAD")
+    science_tree = _git(science, "rev-parse", "HEAD^{tree}")
+    monkeypatch.setattr(score, "REPO_ROOT", scorer)
+    monkeypatch.setattr(score, "SCIENCE_SOURCE_COMMIT", science_commit)
+    monkeypatch.setattr(score, "TARGET_SERIALIZATION_FIX_COMMIT", intermediate)
+    monkeypatch.setattr(score, "TARGET_SERIALIZATION_FIX_TREE", intermediate_tree)
+    binding = _authority("a" * 64)
+    binding["source_commit"] = science_commit
+    binding["source_tree"] = science_tree
+    return science, scorer, binding
+
+
+def _bound_inventory(
+    tmp_path: Path, role: str, binding: dict[str, str]
+) -> tuple[Path, list[str]]:
+    trees = [f"{index:x}" * 64 for index in range(1 if role == "control" else 5, 5 if role == "control" else 9)]
+    value = {
+        "status": "EXTERNAL_SCORE_READY",
+        "strategy": "lora" if role == "control" else "full",
+        "phase": role,
+        "schedule_completed": True,
+        "planned_steps": 256,
+        "final_step": 256,
+        "authority": binding,
+        "checkpoints": [{"tree_sha256": tree} for tree in trees],
+    }
+    path = tmp_path / f"{role}-inventory.json"
+    path.write_bytes(score.canonical_bytes(value, newline=True))
+    return path, trees
+
+
+def _score_only_authority(
+    tmp_path: Path,
+    science: Path,
+    binding: dict[str, str],
+) -> tuple[Path, dict, list[str], list[str]]:
+    control_path, control_trees = _bound_inventory(tmp_path, "control", binding)
+    candidate_path, candidate_trees = _bound_inventory(tmp_path, "candidate", binding)
+    document = {
+        "schema_version": score.SCORE_ONLY_SCHEMA,
+        "kind": "bloomz_score_only_successor_authority",
+        "status": "AUTHORIZED",
+        "scope": score.SCORE_ONLY_SCOPE,
+        "science_authority": binding,
+        "scorer": score.inspect_score_only_successor(science, binding),
+        "inventories": {
+            "control": {
+                "path": str(control_path.resolve()),
+                "sha256": score.file_sha256(control_path),
+                "checkpoint_trees": control_trees,
+            },
+            "candidate": {
+                "path": str(candidate_path.resolve()),
+                "sha256": score.file_sha256(candidate_path),
+                "checkpoint_trees": candidate_trees,
+            },
+        },
+        "evaluation": {
+            "evaluator_image": score.IMAGE,
+            "score_driver_sha256": score.DRIVER_SHA256,
+            "base": score.BASE,
+            "selection_fixture_sha256": score.FIXTURES["selection"]["sha256"],
+            "confirmation_fixture_sha256": score.FIXTURES["confirmation"]["sha256"],
+            "decision_deadline_epoch": binding["decision_deadline_epoch"],
+        },
+        "approvals": {
+            "owner_review_sha256": "a" * 64,
+            "independent_audit_sha256": "b" * 64,
+        },
+    }
+    path = tmp_path / "score-only-authority.json"
+    path.write_bytes(score.canonical_bytes(document, newline=True))
+    return path, document, control_trees, candidate_trees
+
+
 def _inputs(tmp_path: Path) -> object:
     tmp_path.mkdir(parents=True, exist_ok=True)
     artifact = tmp_path / "artifact"
@@ -86,7 +200,11 @@ def _inputs(tmp_path: Path) -> object:
         },
         driver=DRIVER,
         runtime_authority=runtime,
+        science_source_root=score.REPO_ROOT,
         authority_binding=_authority(runtime_sha),
+        score_only_authority=None,
+        score_only_authority_sha256=None,
+        score_only_binding=None,
         expected_fingerprint=None,
         fingerprint_anchor=True,
         authorization=None,
@@ -97,6 +215,86 @@ def _inputs(tmp_path: Path) -> object:
         docker="/usr/bin/docker",
         timeout=123,
     )
+
+
+def test_score_only_authority_binds_science_scorer_and_all_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    science, _, binding = _score_only_repositories(tmp_path, monkeypatch)
+    path, document, control_trees, candidate_trees = _score_only_authority(
+        tmp_path, science, binding
+    )
+    resolved, digest, projected = score.load_score_only_authority(
+        path,
+        score.file_sha256(path),
+        science,
+        binding,
+        role="control",
+        artifact_tree=control_trees[0],
+        transport="peft_adapter",
+    )
+    assert resolved == path.resolve()
+    assert digest == score.file_sha256(path)
+    assert projected["authority"] == document
+    assert projected["authority"]["science_authority"] == binding
+    assert projected["authority"]["scorer"]["scorer_parent_commit"] == score.TARGET_SERIALIZATION_FIX_COMMIT
+    score.load_score_only_authority(
+        path,
+        digest,
+        science,
+        binding,
+        role="candidate",
+        artifact_tree=candidate_trees[-1],
+        transport="full_model",
+    )
+    with pytest.raises(score.ScoreError, match="checkpoint set"):
+        score.load_score_only_authority(
+            path,
+            digest,
+            science,
+            binding,
+            role="control",
+            artifact_tree="f" * 64,
+            transport="peft_adapter",
+        )
+    with pytest.raises(score.ScoreError, match="file SHA"):
+        score.load_score_only_authority(
+            path,
+            "0" * 64,
+            science,
+            binding,
+            role="control",
+            artifact_tree=control_trees[0],
+            transport="peft_adapter",
+        )
+
+
+@pytest.mark.parametrize("mutation", ["delete", "add", "mode", "dirty", "third_commit"])
+def test_score_only_chain_rejects_nonminimal_or_mutable_source(
+    tmp_path: Path, monkeypatch, mutation: str
+) -> None:
+    science, scorer, binding = _score_only_repositories(tmp_path, monkeypatch)
+    if mutation == "delete":
+        (scorer / "unrelated.txt").unlink()
+        _git(scorer, "add", "-A")
+        _git(scorer, "commit", "--amend", "--no-edit", "-q")
+    elif mutation == "add":
+        (scorer / "extra.txt").write_text("extra\n", encoding="utf-8")
+        _git(scorer, "add", ".")
+        _git(scorer, "commit", "--amend", "--no-edit", "-q")
+    elif mutation == "mode":
+        changed = scorer / score.SCORE_ONLY_CHANGED_PATHS[0]
+        os.chmod(changed, 0o755)
+        _git(scorer, "add", str(changed))
+        _git(scorer, "commit", "--amend", "--no-edit", "-q")
+    elif mutation == "dirty":
+        (scorer / score.SCORE_ONLY_CHANGED_PATHS[0]).write_text("dirty\n", encoding="utf-8")
+    else:
+        (scorer / score.SCORE_ONLY_CHANGED_PATHS[0]).write_text("third\n", encoding="utf-8")
+        _git(scorer, "add", ".")
+        _git(scorer, "commit", "-qm", "third scorer commit")
+    with pytest.raises(score.ScoreError):
+        score.inspect_score_only_successor(science, binding)
 
 
 def _raw(**updates) -> dict:
@@ -206,7 +404,7 @@ def _stable_runtime(monkeypatch, inputs) -> None:
     monkeypatch.setattr(
         score,
         "load_runtime",
-        lambda path: (path, inputs.authority_binding),
+        lambda path, **_: (path, inputs.authority_binding),
     )
 
 
@@ -396,7 +594,7 @@ def test_confirmation_without_authorization_fails_before_fixture_open(
     monkeypatch.setattr(
         score,
         "load_runtime",
-        lambda _: (inputs.runtime_authority, inputs.authority_binding),
+        lambda _, **__: (inputs.runtime_authority, inputs.authority_binding),
     )
     monkeypatch.setattr(
         score, "verify_base", lambda _: (inputs.base, inputs.base_files, inputs.base_tree)
@@ -475,6 +673,43 @@ def test_success_receipt_keeps_ordered_raw_vector_logs_and_authority(
     assert (output / "raw-result.json").is_file()
     assert (output / "stdout.log").read_text() == "evaluator stdout"
     assert (output / "stderr.log").read_text() == "evaluator stderr"
+
+
+def test_success_receipt_projects_science_authority_and_binds_scorer_authority(
+    tmp_path: Path, monkeypatch
+) -> None:
+    inputs = _inputs(tmp_path / "inputs")
+    authority_path = tmp_path / "score-only-authority.json"
+    authority_path.write_text("{}\n", encoding="utf-8")
+    binding = {
+        "path": str(authority_path.resolve()),
+        "sha256": score.file_sha256(authority_path),
+        "authority": {"scorer": "exact-successor", "science": "unchanged"},
+    }
+    inputs = replace(
+        inputs,
+        score_only_authority=authority_path,
+        score_only_authority_sha256=binding["sha256"],
+        score_only_binding=binding,
+    )
+    _stable_runtime(monkeypatch, inputs)
+    monkeypatch.setattr(
+        score,
+        "load_score_only_authority",
+        lambda *_, **__: (authority_path.resolve(), binding["sha256"], binding),
+    )
+
+    def runner(argv, **_):
+        mounts = [argv[index + 1] for index, value in enumerate(argv) if value == "--mount"]
+        output_mount = next(value for value in mounts if "dst=/output" in value)
+        host = Path(next(part[4:] for part in output_mount.split(",") if part.startswith("src=")))
+        (host / "raw-result.json").write_text(json.dumps(_raw()), encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    output, _ = score.run_score(inputs, runner=runner)
+    receipt = json.loads((output / "receipt.json").read_text(encoding="utf-8"))
+    assert receipt["authority"] == inputs.authority_binding
+    assert receipt["score_only_authority"] == binding
 
 
 def test_post_run_mutation_and_timeout_fail_without_publishing(
