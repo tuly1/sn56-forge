@@ -105,10 +105,10 @@ b = bloomz.lease_budget()
 assert b["stage_seconds"] == 23_460
 assert b["decision_reserve_seconds"] == 540
 assert b["stage_seconds"] + b["decision_reserve_seconds"] == 24_000
-assert b["bootstrap_start_allowance_seconds"] == 1_200
+assert b["bootstrap_start_allowance_seconds"] == 2_700
 assert b["ceo_custody_close_reserve_seconds"] == 5_400
-assert 1_200 + 24_000 + 5_400 == b["total_seconds"] == 30_600
-assert Decimal(b["hourly_rate_usd"]) * Decimal("8.5") == Decimal(b["maximum_cost_usd"])
+assert 2_700 + 24_000 + 5_400 == b["total_seconds"] == 32_100
+assert Decimal(b["hourly_rate_usd"]) * Decimal(32_100) / Decimal(3_600) == Decimal(b["maximum_cost_usd"])
 print(b)
 PY
 ```
@@ -120,12 +120,12 @@ The maxima are: admissions `2×600`, training `2×7200`, dev scoring `8×570`,
 validation `8×270`, and optional confirmation scoring `2×570` seconds. These
 total 23,460 seconds, leaving 540 seconds for scientific decisions. Runtime
 inspection must finish and bind the actual science start no later than provider
-start +1,200 seconds. The immutable decision deadline is actual science start
+start +2,700 seconds. The immutable decision deadline is actual science start
 +24,000 seconds.
 The CEO-owned trusted path exclusively owns at least the final 5,400 seconds for
 runtime-zero enforcement, byte-verified off-host custody, and provider closure,
-including absolute provider deletion by start +30,600 seconds (8.5 hours), or
-`$17.057123655` at `$2.006720430/hour`.
+including absolute provider deletion by start +32,100 seconds (8 hours 55
+minutes), or `$17.8932571675` at `$2.006720430/hour`.
 
 ```bash
 EVIDENCE=/absolute/outside/repo/bloomz-evidence
@@ -159,11 +159,11 @@ run_stage() {
   read -r provider_start science_start_deadline science_started decision_deadline provider_deadline budget_sha authority_sha < <(authority_stage_fields)
   local now remaining required
   now=$(date +%s)
-  test "$science_start_deadline" -eq $((provider_start + 1200))
+  test "$science_start_deadline" -eq $((provider_start + 2700))
   test "$science_started" -ge "$provider_start"
   test "$science_started" -le "$science_start_deadline"
   test "$decision_deadline" -eq $((science_started + 24000))
-  test "$provider_deadline" -eq $((provider_start + 30600))
+  test "$provider_deadline" -eq $((provider_start + 32100))
   test $((decision_deadline + 5400)) -le "$provider_deadline"
   test "${#budget_sha}" -eq 64
   test "${#authority_sha}" -eq 64

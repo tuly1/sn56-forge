@@ -396,25 +396,28 @@ def test_total_lease_cap_arithmetic_is_exact() -> None:
     assert budget["decision_reserve_seconds"] == 540
     assert stage_seconds + budget["decision_reserve_seconds"] == 24_000
     assert budget["science_window_seconds"] == 24_000
-    assert budget["bootstrap_start_allowance_seconds"] == 1_200
+    assert budget["bootstrap_start_allowance_seconds"] == 2_700
     assert budget["ceo_custody_close_reserve_seconds"] == 5_400
     assert (
         budget["bootstrap_start_allowance_seconds"]
         + budget["science_window_seconds"]
         + budget["ceo_custody_close_reserve_seconds"]
         == budget["total_seconds"]
-        == 30_600
+        == 32_100
     )
-    assert Decimal(budget["hourly_rate_usd"]) * Decimal("8.5") == Decimal(
-        budget["maximum_cost_usd"]
+    assert (
+        Decimal(budget["hourly_rate_usd"])
+        * Decimal(budget["total_seconds"])
+        / Decimal(3_600)
+        == Decimal(budget["maximum_cost_usd"])
     )
-    authority = bloomz.lease_authority(10_000, 11_200)
-    assert authority["science_start_deadline_epoch"] == 11_200
-    assert authority["science_started_epoch"] == 11_200
-    assert authority["decision_deadline_epoch"] == 35_200
-    assert authority["provider_deadline_epoch"] == 40_600
+    authority = bloomz.lease_authority(10_000, 12_700)
+    assert authority["science_start_deadline_epoch"] == 12_700
+    assert authority["science_started_epoch"] == 12_700
+    assert authority["decision_deadline_epoch"] == 36_700
+    assert authority["provider_deadline_epoch"] == 42_100
     with pytest.raises(bloomz.BloomzExperimentError, match="bootstrap allowance"):
-        bloomz.lease_authority(10_000, 11_201)
+        bloomz.lease_authority(10_000, 12_701)
 
 
 def test_network_classifier_accepts_exact_timed_out_ipv4_default_deny() -> None:
