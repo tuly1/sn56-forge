@@ -68,6 +68,8 @@ ADAPTER_BASE_PREFIX = PurePosixPath("/cache/models")
 SCIENCE_SOURCE_COMMIT = "38360185b944074e95bb1872a838680c2ec7fea4"
 TARGET_SERIALIZATION_FIX_COMMIT = "0460a50be6a4adfc93c3547bfb57a482d9bccc50"
 TARGET_SERIALIZATION_FIX_TREE = "732651876071f4d4259bd3914465815b2093926b"
+AUTHORITY_BRIDGE_COMMIT = "5733f3683dabc740e7c798c171a78e8ded2831fd"
+AUTHORITY_BRIDGE_TREE = "45ea48ec08c54a628f87612f5b962c6efd2aa7c1"
 SCORE_ONLY_CHANGED_PATHS = (
     "experiments/20260831-bloomz-memory-fullft-v1/score_external.py",
     "tests/test_bloomz_external_score.py",
@@ -128,7 +130,7 @@ def inspect_score_only_successor(
     science_root: Path,
     authority_binding: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Bind the two scorer-only commits while projecting immutable science authority."""
+    """Bind the three scorer-only commits while projecting immutable science authority."""
     expanded = science_root.expanduser()
     require(not expanded.is_symlink(), "science source root is a symlink")
     science = expanded.resolve(strict=True)
@@ -157,19 +159,30 @@ def inspect_score_only_successor(
     scorer_tree = git_value(scorer, "rev-parse", "HEAD^{tree}")
     scorer_parent = git_value(scorer, "rev-parse", "HEAD^")
     scorer_grandparent = git_value(scorer, "rev-parse", "HEAD^^")
+    scorer_great_grandparent = git_value(scorer, "rev-parse", "HEAD^^^")
     require(science_commit == SCIENCE_SOURCE_COMMIT, "science source commit drift")
     require(science_commit == authority_binding["source_commit"], "science authority commit drift")
     require(science_tree == authority_binding["source_tree"], "science authority tree drift")
-    require(scorer_parent == TARGET_SERIALIZATION_FIX_COMMIT, "score-only parent commit drift")
-    require(scorer_grandparent == science_commit, "score-only ancestry drift")
+    require(scorer_parent == AUTHORITY_BRIDGE_COMMIT, "score-only parent commit drift")
+    require(
+        scorer_grandparent == TARGET_SERIALIZATION_FIX_COMMIT,
+        "target-serialization ancestry drift",
+    )
+    require(scorer_great_grandparent == science_commit, "score-only ancestry drift")
     require(
         git_value(scorer, "rev-parse", f"{TARGET_SERIALIZATION_FIX_COMMIT}^{{tree}}")
         == TARGET_SERIALIZATION_FIX_TREE,
         "target-serialization fix tree drift",
     )
+    require(
+        git_value(scorer, "rev-parse", f"{AUTHORITY_BRIDGE_COMMIT}^{{tree}}")
+        == AUTHORITY_BRIDGE_TREE,
+        "authority bridge tree drift",
+    )
     for left, right, label in (
         (science_commit, TARGET_SERIALIZATION_FIX_COMMIT, "target-serialization fix"),
-        (TARGET_SERIALIZATION_FIX_COMMIT, scorer_commit, "authority bridge"),
+        (TARGET_SERIALIZATION_FIX_COMMIT, AUTHORITY_BRIDGE_COMMIT, "authority bridge"),
+        (AUTHORITY_BRIDGE_COMMIT, scorer_commit, "mandatory authority bridge"),
         (science_commit, scorer_commit, "cumulative score-only"),
     ):
         rows = tuple(
@@ -204,12 +217,14 @@ def inspect_score_only_successor(
             "sha256": file_sha256(path),
         })
     return {
-        "mode": "score_only_two_commit_chain",
+        "mode": "score_only_three_commit_chain",
         "science_authority_projected_unchanged": True,
         "science_source_commit": science_commit,
         "science_source_tree": science_tree,
         "target_serialization_fix_commit": TARGET_SERIALIZATION_FIX_COMMIT,
         "target_serialization_fix_tree": TARGET_SERIALIZATION_FIX_TREE,
+        "authority_bridge_commit": AUTHORITY_BRIDGE_COMMIT,
+        "authority_bridge_tree": AUTHORITY_BRIDGE_TREE,
         "scorer_commit": scorer_commit,
         "scorer_tree": scorer_tree,
         "scorer_parent_commit": scorer_parent,
@@ -648,11 +663,10 @@ def prepare(args: argparse.Namespace) -> Inputs:
         score_only_authority_sha_arg,
     )
     require(
-        all(value is None for value in score_only_values)
-        or all(value is not None for value in score_only_values),
-        "science source, score-only authority, and authority SHA must be supplied together",
+        all(value is not None for value in score_only_values),
+        "score-only science source, authority, and authority SHA are required",
     )
-    science_source_root = REPO_ROOT if science_root_arg is None else science_root_arg
+    science_source_root = science_root_arg
     runtime_path, authority_binding = load_runtime(
         args.runtime_authority, source_root=science_source_root
     )
@@ -663,21 +677,17 @@ def prepare(args: argparse.Namespace) -> Inputs:
     driver = args.score_driver.expanduser().resolve(strict=True)
     require(not args.score_driver.expanduser().is_symlink(), "score driver is a symlink")
     require(driver.is_file() and file_sha256(driver) == DRIVER_SHA256, "score driver drift")
-    score_only_authority = None
-    score_only_authority_sha = None
-    score_only_binding = None
-    if science_root_arg is not None:
-        score_only_authority, score_only_authority_sha, score_only_binding = (
-            load_score_only_authority(
-                score_only_authority_arg,
-                score_only_authority_sha_arg,
-                science_root_arg,
-                authority_binding,
-                role=args.artifact_role,
-                artifact_tree=artifact_tree,
-                transport=args.expected_transport,
-            )
+    score_only_authority, score_only_authority_sha, score_only_binding = (
+        load_score_only_authority(
+            score_only_authority_arg,
+            score_only_authority_sha_arg,
+            science_source_root,
+            authority_binding,
+            role=args.artifact_role,
+            artifact_tree=artifact_tree,
+            transport=args.expected_transport,
         )
+    )
     expected = args.expected_fingerprint
     if expected is not None:
         require(FINGERPRINT_RE.fullmatch(expected), "expected fingerprint must be 32 lowercase hex")
@@ -861,6 +871,12 @@ def validate_result(raw: Any, inputs: Inputs) -> dict[str, Any]:
     }
 
 def unchanged(inputs: Inputs) -> None:
+    require(
+        inputs.score_only_authority is not None
+        and inputs.score_only_authority_sha256 is not None
+        and inputs.score_only_binding is not None,
+        "score-only authority is required",
+    )
     _, files, tree = inventory(inputs.artifact, "artifact")
     require(files == inputs.artifact_files and tree == inputs.artifact_tree, "artifact changed during score")
     _, files, tree = inventory(inputs.base, "pinned base")
@@ -871,22 +887,16 @@ def unchanged(inputs: Inputs) -> None:
         inputs.runtime_authority, source_root=inputs.science_source_root
     )
     require(authority_binding == inputs.authority_binding, "runtime authority changed during score")
-    if inputs.score_only_binding is not None:
-        require(
-            inputs.score_only_authority is not None
-            and inputs.score_only_authority_sha256 is not None,
-            "score-only authority state is incomplete",
-        )
-        _, _, binding = load_score_only_authority(
-            inputs.score_only_authority,
-            inputs.score_only_authority_sha256,
-            inputs.science_source_root,
-            inputs.authority_binding,
-            role=inputs.role,
-            artifact_tree=inputs.artifact_tree,
-            transport=inputs.transport,
-        )
-        require(binding == inputs.score_only_binding, "score-only authority changed during score")
+    _, _, binding = load_score_only_authority(
+        inputs.score_only_authority,
+        inputs.score_only_authority_sha256,
+        inputs.science_source_root,
+        inputs.authority_binding,
+        role=inputs.role,
+        artifact_tree=inputs.artifact_tree,
+        transport=inputs.transport,
+    )
+    require(binding == inputs.score_only_binding, "score-only authority changed during score")
     if inputs.authorization is not None:
         require(file_sha256(inputs.authorization) == inputs.authorization_sha256, "authorization changed during score")
 
@@ -902,6 +912,12 @@ def run_score(
     *,
     runner: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
 ) -> tuple[Path, str]:
+    require(
+        inputs.score_only_authority is not None
+        and inputs.score_only_authority_sha256 is not None
+        and inputs.score_only_binding is not None,
+        "score-only authority is required",
+    )
     inputs.output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{inputs.output.name}.score.", dir=inputs.output.parent))
     try:
@@ -983,8 +999,7 @@ def run_score(
                 "vector_order": "evaluator_emission_order",
             },
         }
-        if inputs.score_only_binding is not None:
-            receipt["score_only_authority"] = inputs.score_only_binding
+        receipt["score_only_authority"] = inputs.score_only_binding
         if inputs.authorization_facts is not None:
             receipt["authorization"] = inputs.authorization_facts
         receipt_payload = canonical_bytes(receipt, newline=True)

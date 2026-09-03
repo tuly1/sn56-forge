@@ -90,12 +90,20 @@ def _score_only_repositories(
         (scorer / relative).write_text(f"authority-bridge:{relative}\n", encoding="utf-8")
     _git(scorer, "add", ".")
     _git(scorer, "commit", "-qm", "authority bridge")
+    authority_bridge = _git(scorer, "rev-parse", "HEAD")
+    authority_bridge_tree = _git(scorer, "rev-parse", "HEAD^{tree}")
+    for relative in score.SCORE_ONLY_CHANGED_PATHS:
+        (scorer / relative).write_text(f"mandatory-authority:{relative}\n", encoding="utf-8")
+    _git(scorer, "add", ".")
+    _git(scorer, "commit", "-qm", "mandatory authority bridge")
     science_commit = _git(science, "rev-parse", "HEAD")
     science_tree = _git(science, "rev-parse", "HEAD^{tree}")
     monkeypatch.setattr(score, "REPO_ROOT", scorer)
     monkeypatch.setattr(score, "SCIENCE_SOURCE_COMMIT", science_commit)
     monkeypatch.setattr(score, "TARGET_SERIALIZATION_FIX_COMMIT", intermediate)
     monkeypatch.setattr(score, "TARGET_SERIALIZATION_FIX_TREE", intermediate_tree)
+    monkeypatch.setattr(score, "AUTHORITY_BRIDGE_COMMIT", authority_bridge)
+    monkeypatch.setattr(score, "AUTHORITY_BRIDGE_TREE", authority_bridge_tree)
     binding = _authority("a" * 64)
     binding["source_commit"] = science_commit
     binding["source_tree"] = science_tree
@@ -237,7 +245,7 @@ def test_score_only_authority_binds_science_scorer_and_all_artifacts(
     assert digest == score.file_sha256(path)
     assert projected["authority"] == document
     assert projected["authority"]["science_authority"] == binding
-    assert projected["authority"]["scorer"]["scorer_parent_commit"] == score.TARGET_SERIALIZATION_FIX_COMMIT
+    assert projected["authority"]["scorer"]["scorer_parent_commit"] == score.AUTHORITY_BRIDGE_COMMIT
     score.load_score_only_authority(
         path,
         digest,
@@ -406,6 +414,28 @@ def _stable_runtime(monkeypatch, inputs) -> None:
         "load_runtime",
         lambda path, **_: (path, inputs.authority_binding),
     )
+
+
+def _bind_score_only_for_run(tmp_path: Path, monkeypatch, inputs):
+    authority_path = tmp_path / "score-only-authority.json"
+    authority_path.write_text("{}\n", encoding="utf-8")
+    binding = {
+        "path": str(authority_path.resolve()),
+        "sha256": score.file_sha256(authority_path),
+        "authority": {"scorer": "exact-successor", "science": "unchanged"},
+    }
+    bound = replace(
+        inputs,
+        score_only_authority=authority_path,
+        score_only_authority_sha256=binding["sha256"],
+        score_only_binding=binding,
+    )
+    monkeypatch.setattr(
+        score,
+        "load_score_only_authority",
+        lambda *_, **__: (authority_path.resolve(), binding["sha256"], binding),
+    )
+    return bound, binding
 
 
 def test_argv_is_digest_pinned_and_adapter_gets_readonly_base_alias(tmp_path: Path) -> None:
@@ -591,6 +621,12 @@ def test_confirmation_without_authorization_fails_before_fixture_open(
     tmp_path: Path, monkeypatch
 ) -> None:
     inputs = _inputs(tmp_path)
+    score_only_authority = tmp_path / "score-only-authority.json"
+    score_only_authority.write_text("{}\n", encoding="utf-8")
+    score_only_binding = {
+        "path": str(score_only_authority.resolve()),
+        "sha256": score.file_sha256(score_only_authority),
+    }
     monkeypatch.setattr(
         score,
         "load_runtime",
@@ -610,6 +646,15 @@ def test_confirmation_without_authorization_fails_before_fixture_open(
             inputs.artifact_metadata,
         ),
     )
+    monkeypatch.setattr(
+        score,
+        "load_score_only_authority",
+        lambda *_, **__: (
+            score_only_authority.resolve(),
+            score_only_binding["sha256"],
+            score_only_binding,
+        ),
+    )
     opened = False
 
     def fixture_spy(*_):
@@ -624,6 +669,9 @@ def test_confirmation_without_authorization_fails_before_fixture_open(
         timeout_seconds=60,
         docker="/usr/bin/docker",
         runtime_authority=inputs.runtime_authority,
+        science_source_root=inputs.science_source_root,
+        score_only_authority=score_only_authority,
+        score_only_authority_sha256=score_only_binding["sha256"],
         base=inputs.base,
         artifact=inputs.artifact,
         expected_transport="full_model",
@@ -642,10 +690,38 @@ def test_confirmation_without_authorization_fails_before_fixture_open(
     assert opened is False
 
 
+def test_prepare_requires_score_only_authority_triple(tmp_path: Path) -> None:
+    args = argparse.Namespace(
+        output_dir=tmp_path / "new-output",
+        gpu="0",
+        timeout_seconds=60,
+        docker="/usr/bin/docker",
+        science_source_root=None,
+        score_only_authority=None,
+        score_only_authority_sha256=None,
+    )
+    with pytest.raises(score.ScoreError, match="score-only science source"):
+        score.prepare(args)
+
+
+def test_run_score_rejects_missing_score_only_authority_before_execution(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+
+    def forbidden_runner(*_, **__):
+        raise AssertionError("runner must not execute")
+
+    with pytest.raises(score.ScoreError, match="score-only authority is required"):
+        score.run_score(inputs, runner=forbidden_runner)
+    assert not inputs.output.exists()
+
+
 def test_success_receipt_keeps_ordered_raw_vector_logs_and_authority(
     tmp_path: Path, monkeypatch
 ) -> None:
     inputs = _inputs(tmp_path)
+    inputs, binding = _bind_score_only_for_run(tmp_path, monkeypatch, inputs)
     _stable_runtime(monkeypatch, inputs)
     observed_timeout = None
 
@@ -664,6 +740,7 @@ def test_success_receipt_keeps_ordered_raw_vector_logs_and_authority(
     assert observed_timeout == 123
     assert receipt_sha == score.file_sha256(output / "receipt.json")
     assert receipt["authority"] == inputs.authority_binding
+    assert receipt["score_only_authority"] == binding
     assert receipt["result"]["vector_count"] == 2
     assert receipt["result"]["vector_sha256"] == score.canonical_sha256([1.0, 1.5])
     assert receipt["result"]["vector_order"] == "evaluator_emission_order"
@@ -716,6 +793,7 @@ def test_post_run_mutation_and_timeout_fail_without_publishing(
     tmp_path: Path, monkeypatch
 ) -> None:
     inputs = _inputs(tmp_path)
+    inputs, _ = _bind_score_only_for_run(tmp_path, monkeypatch, inputs)
     _stable_runtime(monkeypatch, inputs)
 
     def mutating_runner(argv, **_):
@@ -727,6 +805,7 @@ def test_post_run_mutation_and_timeout_fail_without_publishing(
     assert not inputs.output.exists()
 
     fresh = _inputs(tmp_path / "fresh")
+    fresh, _ = _bind_score_only_for_run(tmp_path / "fresh", monkeypatch, fresh)
     _stable_runtime(monkeypatch, fresh)
 
     def timeout_runner(argv, **_):
