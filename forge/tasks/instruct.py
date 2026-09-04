@@ -60,6 +60,16 @@ from forge.tasks.common import (
     workdir,
 )
 from forge.tuning.callbacks import DeadlineCallback
+from forge.tuning.overrides import (
+    RecipeOverrides,
+    apply_plan_overrides,
+    apply_training_kwargs_overrides,
+    cap_epochs,
+    load_recipe_overrides,
+    long_rows_policy,
+    plan_override_diff,
+)
+from forge.tuning.overrides import neftune_alpha as recipe_neftune_alpha
 from forge.tuning.plan import TrainPlan, make_sft_plan
 from forge.tuning.qwen35_soup import (
     apply_qwen35_soup_override,
@@ -192,6 +202,13 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     if not rows:
         raise RuntimeError("empty dataset")
 
+    # Study-only recipe overrides (FORGE_RECIPE_OVERRIDES_JSON): read exactly
+    # once here; inert and silent when the variable is unset.
+    recipe = load_recipe_overrides()
+    if recipe.present:
+        telemetry.event("recipe_overrides", **recipe.record())
+        telemetry.set_meta(recipe_overrides=recipe.record())
+
     loaded = load_base(spec.cached_model_dir, for_generation=False)
     tokenizer = loaded.tokenizer
     telemetry.collect_env()
@@ -253,6 +270,16 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             batch=plan.per_device_batch_size,
             grad_accum=plan.grad_accum_steps,
             reason="remote_gradient_checkpointing_is_noop",
+        )
+    plan_before_recipe = plan
+    plan = apply_plan_overrides(plan, recipe)
+    if recipe.present:
+        telemetry.event(
+            "recipe_plan_applied",
+            applied=recipe.active,
+            changes=plan_override_diff(plan_before_recipe, plan),
+            neftune_alpha=recipe_neftune_alpha(is_kl, recipe),
+            long_rows=long_rows_policy(recipe),
         )
     telemetry.event(
         "strategy_chosen",
@@ -337,7 +364,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
 
             def tokenize_one(source_index: int, candidate: int) -> list:
                 return tokenize.tokenize_instruct(
-                    [source_items[source_index]], tokenizer, candidate
+                    [source_items[source_index]], tokenizer, candidate,
+                    on_overflow=long_rows_policy(recipe),
                 )
 
     initial_view = None
@@ -412,7 +440,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             probe_rows if probe_rows is not None else view.train,
             [] if probe_rows is not None else view.validation,
             collator, is_kl, strategy, n_gpus,
-            probe=probe_rows is not None, epochs=epochs, max_steps=max_steps)
+            probe=probe_rows is not None, epochs=epochs, max_steps=max_steps,
+            recipe=recipe)
 
     holder = [model]
     del model
@@ -451,7 +480,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         eff_batch=eff_batch,
         gradient_checkpointing=plan.gradient_checkpointing,
         epochs=plan.num_epochs,
-        neftune=not is_kl,
+        neftune=recipe_neftune_alpha(is_kl, recipe) is not None,
         tokens_per_step_cap=eff_batch * plan.max_seq_len,
         geometry_admission=admission,
         geometry_admitted=admitted,
@@ -476,8 +505,12 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     timing: dict[str, float | None] = {}
 
     def measure_epochs(candidate: TrainPlan, view: _DataView) -> float | None:
-        kwargs = build_training_kwargs(
-            spec, candidate, neftune_alpha=None if is_kl else 5.0
+        kwargs = apply_training_kwargs_overrides(
+            build_training_kwargs(
+                spec, candidate,
+                neftune_alpha=recipe_neftune_alpha(is_kl, recipe),
+            ),
+            recipe,
         )
         timing["probe_per_step"] = None
         timing["warm_step_s"] = None
@@ -506,6 +539,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             holder = [timing_model]
             timing_model = None
             _discard(holder.pop())
+        candidate_epochs = cap_epochs(candidate_epochs, recipe)
         if candidate_epochs is not None:
             timing["probe_per_step"] = probe_per_step
             telemetry.event(
@@ -920,11 +954,18 @@ def _make_trainer(
     probe: bool = False,
     epochs: float | None = None,
     max_steps: int | None = None,
+    recipe: RecipeOverrides | None = None,
 ):
     from datasets import Dataset
     from transformers import Trainer, TrainingArguments
 
-    kwargs = build_training_kwargs(spec, plan, neftune_alpha=None if is_kl else 5.0)
+    recipe = recipe if recipe is not None else RecipeOverrides()
+    kwargs = apply_training_kwargs_overrides(
+        build_training_kwargs(
+            spec, plan, neftune_alpha=recipe_neftune_alpha(is_kl, recipe)
+        ),
+        recipe,
+    )
     if probe:
         kwargs["max_steps"] = 1
     else:
