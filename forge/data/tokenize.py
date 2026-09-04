@@ -25,8 +25,18 @@ from forge import telemetry
 
 
 def tokenize_instruct(
-    examples: list[dict[str, str]], tokenizer: Any, max_len: int
+    examples: list[dict[str, str]],
+    tokenizer: Any,
+    max_len: int,
+    *,
+    on_overflow: str = "drop",
 ) -> list[dict[str, list[int]]]:
+    """``on_overflow`` decides rows longer than ``max_len``: ``"drop"`` (the
+    production default, mirroring the evaluator's excess_length_strategy) or
+    ``"truncate"`` (keep the whole prompt, cut the completion tail; a row whose
+    prompt alone fills the cap is still dropped).  Study-only knob."""
+    if on_overflow not in ("drop", "truncate"):
+        raise ValueError(f"unknown on_overflow policy {on_overflow!r}")
     eos = tokenizer.eos_token_id
     out: list[dict[str, list[int]]] = []
     for ex in examples:
@@ -47,7 +57,14 @@ def tokenize_instruct(
         # Axolotl's evaluator uses excess_length_strategy=drop. Partial rows are
         # not scored and must not count as a surviving row in the retry ladder.
         if len(input_ids) > max_len:
-            continue
+            if on_overflow == "drop":
+                continue
+            keep = max_len - len(prompt_ids)
+            if keep <= 0:
+                continue
+            completion_ids = completion_ids[:keep]
+            input_ids = prompt_ids + completion_ids
+            labels = [-100] * len(prompt_ids) + completion_ids
         if not any(label != -100 for label in labels):
             continue  # nothing left to supervise
 
