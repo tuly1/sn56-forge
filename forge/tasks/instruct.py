@@ -17,7 +17,10 @@ import json
 import math
 import os
 import random
+import shutil
+import stat
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, Callable
 
 from forge import telemetry
@@ -51,6 +54,7 @@ from forge.tasks.common import (
     _make_periodic_save_callback,
     build_training_kwargs,
     compatible_dataclass_kwargs,
+    safe_train,
     save_adapter,
     should_final_save,
     time_aware_epochs,
@@ -71,6 +75,321 @@ _EVAL_VAL_ROWS = 256
 _EVAL_MIN_DATASET = 1000
 _BATCHES = (4, 2, 1)
 _CAP_QUANTUM = 256
+
+# Promotion of the externally scored BloomZ candidate is deliberately bound to
+# the immutable base files, not just the caller-controlled model name. All
+# other model revisions continue through the survival path below unchanged.
+_BLOOMZ_REPO = "bigscience/bloomz-560m"
+_BLOOMZ_REVISION = "a2845d7e13dd12efae154a9f1c63fcc2e0cc4b05"
+_BLOOMZ_CONFIG_SHA256 = (
+    "ee4ce2e30325d9b0e2969748bc9945081be52e68a10f2aa66ce9bb33759c70bb"
+)
+_BLOOMZ_WEIGHTS_SHA256 = (
+    "365b2c5e9bd1057eb1e3f1a4fc3f89ae6584d20f24b682d2406bc7e90178ec13"
+)
+_BLOOMZ_TOKENIZER_SHA256 = (
+    "3fa39cd4b1500feb205bcce3b9703a4373414cafe4970e0657b413f7ddd2a9d3"
+)
+_BLOOMZ_TOKENIZER_CONFIG_SHA256 = (
+    "ae85f7ec32efe4ba09f3914743b0187528eab0322fe90c4e077a9229d1de64a9"
+)
+_BLOOMZ_SPECIAL_TOKENS_SHA256 = (
+    "bb7068de1150661a10b55f9e4b12a0e77af8bf91f5e45e1b58afaf1d0e17f675"
+)
+_BLOOMZ_PARAMS_B = 0.559214592
+_BLOOMZ_MAX_STEPS = 256
+_BLOOMZ_SEQ_LEN = 2048
+_BLOOMZ_SAVE_STEPS = frozenset({64, 128, 192, 256})
+_BLOOMZ_REQUIRED_METADATA = frozenset(
+    {
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+    }
+)
+_BLOOMZ_METADATA_FILES = frozenset(
+    {
+        "config.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "chat_template.jinja",
+        "tokenizer.model",
+        "spiece.model",
+        "vocab.json",
+        "merges.txt",
+    }
+)
+
+
+class _BloomzPromotionError(RuntimeError):
+    """The pinned production candidate cannot be exported safely."""
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _has_exact_bloomz_revision(model: Any, model_dir: str) -> bool:
+    """Verify the immutable BloomZ revision from local bytes, without network."""
+    root = Path(model_dir).resolve()
+    required = (
+        ("config.json", _BLOOMZ_CONFIG_SHA256, None),
+        ("tokenizer.json", _BLOOMZ_TOKENIZER_SHA256, None),
+        ("tokenizer_config.json", _BLOOMZ_TOKENIZER_CONFIG_SHA256, 222),
+        ("special_tokens_map.json", _BLOOMZ_SPECIAL_TOKENS_SHA256, 85),
+        ("model.safetensors", _BLOOMZ_WEIGHTS_SHA256, None),
+    )
+    try:
+        for name, expected_sha, expected_size in required:
+            path = root / name
+            if not path.is_file():
+                return False
+            if expected_size is not None and path.stat().st_size != expected_size:
+                return False
+            if _sha256(path) != expected_sha:
+                return False
+        if any(
+            (root / name).exists()
+            for name in ("added_tokens.json", "chat_template.jinja")
+        ):
+            return False
+        raw = json.loads((root / "config.json").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+    expected_config = {
+        "architectures": ["BloomForCausalLM"],
+        "model_type": "bloom",
+        "n_embed": 1024,
+        "n_layer": 24,
+        "num_attention_heads": 16,
+        "seq_length": 2048,
+        "vocab_size": 250880,
+        "unk_token_id": 0,
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "pad_token_id": 3,
+        "use_cache": True,
+    }
+    config = getattr(model, "config", None)
+    return (
+        isinstance(raw, dict)
+        and all(raw.get(key) == value for key, value in expected_config.items())
+        and "max_position_embeddings" not in raw
+        and getattr(config, "model_type", None) == "bloom"
+        and tuple(getattr(config, "architectures", ()) or ())
+        == ("BloomForCausalLM",)
+        and getattr(config, "vocab_size", None) == 250880
+    )
+
+
+def _is_bloomz_promotion(spec: TaskSpec, loaded: Any, params_b: float) -> bool:
+    """Fail closed unless the request and loaded base match the winning route."""
+    return (
+        spec.task_type == "InstructTextTask"
+        and spec.instruct is not None
+        and spec.instruct.output is not None
+        and not spec.use_kl
+        and spec.model == _BLOOMZ_REPO
+        and abs(params_b - _BLOOMZ_PARAMS_B) <= 1e-9
+        and _has_exact_bloomz_revision(loaded.model, loaded.model_dir)
+    )
+
+
+def _bloomz_plan(plan: TrainPlan) -> TrainPlan:
+    """Apply the exact promotion-grade full-FT geometry."""
+    return replace(
+        plan,
+        strategy="full",
+        lora_r=0,
+        lora_alpha=0,
+        lora_dropout=0.0,
+        learning_rate=1.0e-4,
+        per_device_batch_size=1,
+        grad_accum_steps=16,
+        max_seq_len=_BLOOMZ_SEQ_LEN,
+        warmup_ratio=0.03,
+        weight_decay=0.0,
+        optimizer="adamw_torch_fused",
+        lr_scheduler="cosine_with_min_lr",
+        gradient_checkpointing=True,
+        bf16=True,
+        fp16=False,
+    )
+
+
+def _prepare_bloomz_full_finetune(model: Any) -> Any:
+    """Require the full-FT master parameters proven by the winning run."""
+    import torch
+
+    model = prepare_full_finetune(model, gradient_checkpointing=True)
+    parameters = list(model.parameters())
+    if not parameters or any(
+        not parameter.requires_grad or parameter.dtype != torch.float32
+        for parameter in parameters
+    ):
+        raise _BloomzPromotionError(
+            "BloomZ full fine-tune requires every parameter trainable in fp32"
+        )
+    return model
+
+
+def _validate_bloomz_staging(staged: Path, source: Path) -> None:
+    """Validate metadata, serialization kind, and native offline loading."""
+
+    def validate_tree() -> None:
+        pending = [(staged, ())]
+        while pending:
+            directory, parent_parts = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    parts = (*parent_parts, entry.name)
+                    if any("adapter" in part.casefold() for part in parts):
+                        raise _BloomzPromotionError(
+                            "full export contains an adapter artifact"
+                        )
+                    if entry.is_symlink():
+                        raise _BloomzPromotionError("full export contains a symlink")
+                    mode = entry.stat(follow_symlinks=False).st_mode
+                    if stat.S_ISDIR(mode):
+                        pending.append((Path(entry.path), parts))
+                    elif not stat.S_ISREG(mode):
+                        raise _BloomzPromotionError(
+                            "full export contains a non-regular node"
+                        )
+
+    def unlink_metadata_destination(path: Path) -> None:
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
+            raise _BloomzPromotionError(
+                f"unsafe staged metadata destination: {path.name}"
+            )
+        path.unlink()
+
+    validate_tree()
+    for name in _BLOOMZ_REQUIRED_METADATA:
+        if not (source / name).is_file():
+            raise _BloomzPromotionError(f"pinned base lacks required {name}")
+    for name in _BLOOMZ_METADATA_FILES:
+        source_path = source / name
+        staged_path = staged / name
+        if source_path.is_file():
+            unlink_metadata_destination(staged_path)
+            shutil.copyfile(source_path, staged_path)
+            if staged_path.read_bytes() != source_path.read_bytes():
+                raise _BloomzPromotionError(f"staged {name} differs from pinned base")
+        elif staged_path.exists() or staged_path.is_symlink():
+            unlink_metadata_destination(staged_path)
+    validate_tree()
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    reloaded_tokenizer = AutoTokenizer.from_pretrained(
+        staged, local_files_only=True
+    )
+    reloaded_model = AutoModelForCausalLM.from_pretrained(
+        staged, local_files_only=True
+    )
+    del reloaded_tokenizer, reloaded_model
+
+
+def _save_bloomz_full_model(
+    model: Any,
+    tokenizer: Any,
+    output_dir: str,
+    metadata_source_dir: str,
+    *,
+    artifact_truth: str | None = None,
+    optimizer_step: int = 0,
+    truth_reason: str = "unspecified",
+) -> None:
+    """Atomically save full weights while restoring native base metadata."""
+    if getattr(model, "peft_config", None):
+        raise _BloomzPromotionError("full export unexpectedly contains an adapter")
+    source = Path(metadata_source_dir).resolve()
+    if not (source / "config.json").is_file():
+        raise _BloomzPromotionError("full export metadata source lacks config.json")
+
+    class _ModelProxy:
+        def save_pretrained(self, path: str, **kwargs: Any) -> Any:
+            return model.save_pretrained(path, **kwargs)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(model, name)
+
+    class _TokenizerProxy:
+        def save_pretrained(self, path: str, **kwargs: Any) -> Any:
+            result = tokenizer.save_pretrained(path, **kwargs)
+            _validate_bloomz_staging(Path(path), source)
+            return result
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(tokenizer, name)
+
+    save_adapter(
+        _ModelProxy(),
+        _TokenizerProxy(),
+        output_dir,
+        artifact_truth=artifact_truth,
+        optimizer_step=optimizer_step,
+        truth_reason=truth_reason,
+    )
+
+
+def _make_bloomz_save_callback(
+    spec: TaskSpec, tokenizer: Any, metadata_source_dir: str
+) -> Any:
+    """Publish only native-validated full models at the science cadence."""
+    from transformers import TrainerCallback
+
+    class BloomzSaveCallback(TrainerCallback):
+        last_saved_step = 0
+
+        def on_step_end(self, args, state, control, **kwargs):  # noqa: ANN001
+            step = int(getattr(state, "global_step", 0) or 0)
+            model = kwargs.get("model")
+            if (
+                step not in _BLOOMZ_SAVE_STEPS
+                or step == self.last_saved_step
+                or model is None
+            ):
+                return control
+            try:
+                truth = (
+                    ARTIFACT_COMPLETE_BEST
+                    if step == _BLOOMZ_MAX_STEPS
+                    else ARTIFACT_PARTIAL_TRAINED_BEST
+                )
+                _save_bloomz_full_model(
+                    model,
+                    tokenizer,
+                    spec.output_dir,
+                    metadata_source_dir,
+                    artifact_truth=truth,
+                    optimizer_step=step,
+                    truth_reason="bloomz_science_cadence",
+                )
+                self.last_saved_step = step
+            except Exception as exc:
+                telemetry.event(
+                    "bloomz_checkpoint_export_failed",
+                    step=step,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            return control
+
+    return BloomzSaveCallback()
 
 
 @dataclass(frozen=True)
@@ -109,6 +428,139 @@ class _DataView:
         }
 
 
+def _run_bloomz_promotion(
+    spec: TaskSpec,
+    deadline: Deadline,
+    rows: list,
+    loaded: Any,
+    tokenizer: Any,
+    *,
+    params_b: float,
+    n_gpus: int,
+    per_gpu_gb: float,
+) -> None:
+    """Run the exact externally promoted BloomZ recipe and export cadence."""
+    from datasets import Dataset
+    from transformers import Trainer, TrainingArguments
+
+    plan = _bloomz_plan(
+        make_sft_plan(
+            use_kl=False,
+            strategy="full",
+            params_b=params_b,
+            weight_rms=None,
+            n_gpus=n_gpus,
+            per_gpu_gb=per_gpu_gb,
+        )
+    )
+    telemetry.event(
+        "bloomz_full_ft_promoted",
+        revision=_BLOOMZ_REVISION,
+        max_steps=_BLOOMZ_MAX_STEPS,
+    )
+    telemetry.event(
+        "strategy_chosen",
+        strategy="full",
+        params_b=round(params_b, 3),
+        n_gpus=n_gpus,
+        per_gpu_gb=per_gpu_gb,
+    )
+
+    model = _prepare_bloomz_full_finetune(loaded.model)
+    loaded.model = None
+    telemetry.event("model_loaded", rows=len(rows))
+
+    from forge.tasks.fallback import emit_untrained_copy
+
+    telemetry.event("full_ft_floor")
+    emit_untrained_copy(spec)
+    write_artifact_truth(
+        spec.output_dir,
+        ARTIFACT_FLOOR,
+        optimizer_step=0,
+        reason="pretraining_floor",
+    )
+
+    assert spec.instruct is not None
+    examples = prompts.build_instruct_examples(rows, spec.instruct)
+    tokenized = tokenize.tokenize_instruct(
+        examples, tokenizer, _BLOOMZ_SEQ_LEN
+    )
+    if not tokenized:
+        raise RuntimeError("no trainable examples after tokenization")
+
+    eff_batch = plan.per_device_batch_size * plan.grad_accum_steps
+    telemetry.set_meta(
+        handler="instruct",
+        strategy="full",
+        params_b=round(params_b, 3),
+        n_gpus=n_gpus,
+        gpu_gb=per_gpu_gb,
+        seq_len=_BLOOMZ_SEQ_LEN,
+        seq_len_candidates=[_BLOOMZ_SEQ_LEN],
+        baseline_seq_policy="pinned_bloomz_promotion",
+        tokenized=len(tokenized),
+        train_n=len(tokenized),
+        val_n=0,
+        lora_r=plan.lora_r,
+        lr=plan.learning_rate,
+        batch=plan.per_device_batch_size,
+        grad_accum=plan.grad_accum_steps,
+        eff_batch=eff_batch,
+        gradient_checkpointing=plan.gradient_checkpointing,
+        epochs=plan.num_epochs,
+        neftune=True,
+        tokens_per_step_cap=eff_batch * _BLOOMZ_SEQ_LEN,
+    )
+
+    kwargs = build_training_kwargs(spec, plan, neftune_alpha=5.0)
+    kwargs.pop("num_train_epochs", None)
+    kwargs["max_steps"] = _BLOOMZ_MAX_STEPS
+    args = TrainingArguments(
+        **compatible_dataclass_kwargs(
+            TrainingArguments,
+            kwargs,
+            allow_removed={"overwrite_output_dir"},
+        )
+    )
+    collator = tokenize.PadCollator(tokenizer.pad_token_id)
+    saver = _make_bloomz_save_callback(spec, tokenizer, loaded.model_dir)
+    trainer = Trainer(
+        model=model,
+        args=args,
+        train_dataset=Dataset.from_list(tokenized),
+        eval_dataset=None,
+        data_collator=collator,
+        callbacks=[
+            DeadlineCallback(deadline),
+            saver,
+            telemetry.make_trainer_callback(spec.output_dir),
+        ],
+    )
+
+    safe_train(trainer)
+    final_step = int(getattr(trainer.state, "global_step", 0) or 0)
+    if final_step == _BLOOMZ_MAX_STEPS:
+        if saver.last_saved_step != final_step:
+            _save_bloomz_full_model(
+                model,
+                tokenizer,
+                spec.output_dir,
+                loaded.model_dir,
+                artifact_truth=ARTIFACT_COMPLETE_BEST,
+                optimizer_step=final_step,
+                truth_reason="bloomz_fixed_schedule_complete",
+            )
+    else:
+        # Keep the latest validated cadence generation (or the eager LoRA floor
+        # before step 64); never replace either with an arbitrary partial step.
+        telemetry.event(
+            "bloomz_schedule_incomplete",
+            final_step=final_step,
+            required_step=_BLOOMZ_MAX_STEPS,
+        )
+
+
 def run(spec: TaskSpec, deadline: Deadline) -> None:
     from datasets import Dataset
     from transformers import Trainer, TrainingArguments
@@ -140,6 +592,18 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     is_kl = spec.use_kl and spec.kl_coef > 0
     params_b = model_param_billions(loaded.model)
     n_gpus, per_gpu_gb = gpu_topology()
+    if _is_bloomz_promotion(spec, loaded, params_b):
+        _run_bloomz_promotion(
+            spec,
+            deadline,
+            rows,
+            loaded,
+            tokenizer,
+            params_b=params_b,
+            n_gpus=n_gpus,
+            per_gpu_gb=per_gpu_gb,
+        )
+        return
     use_full = decide_full_finetune(
         use_kl=is_kl, params_b=params_b, n_gpus=n_gpus, per_gpu_gb=per_gpu_gb
     )
