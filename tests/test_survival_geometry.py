@@ -1101,6 +1101,7 @@ def test_wall_plan_leaves_completed_cells_uncapped():
 
 
 def test_wall_plan_caps_qwen35_from_the_admission_probe_when_timing_probe_is_cut():
+    # Raw planner pin (superseded in run() by `_plan_cold_only`, tested below):
     # qwen3.5-9b: the timing probe was cut at 180 s (per-step 4.4-20 s) and
     # returned nothing, so the default two epochs (168 steps) were scheduled
     # and the deadline stopped training at 118.  The admitted rung's worst-
@@ -1239,3 +1240,286 @@ def test_step_cap_reaches_the_real_trainer_and_probe_stays_single_step():
     assert ladder.index("current = rebuild(candidate)") < ladder.index(
         "plan_steps(candidate, view, epochs)"
     ) < ladder.index("max_steps=step_cap")
+
+
+# ---------------------------------------------------------------------------
+# Cold-only planning: warm probe, discount and floor, calibrated against the
+# 646d0b70 smoke (VM 1022601, torch 2.9.1; Mac mirror lease
+# 20260903T214700Z-sep7-smoke-v6-clean5-5p5h).  Numbers are the wall_budget_plan
+# events, admission step_wall_s values and train_curve timings recorded there.
+# ---------------------------------------------------------------------------
+
+_QWEN_GEOMETRY = dict(
+    train_rows=1337, val_rows=256, per_device_batch=1, grad_accum=16, epochs=2,
+)
+
+
+def test_cold_only_planning_constants():
+    assert instruct._COLD_PROBE_DISCOUNT == 3.0
+    assert instruct._MIN_REAL_STEPS == 50
+    assert instruct._FLOOR_SCHEDULE_FRACTION == 0.30
+    assert instruct._WARM_PROBE_STEPS == 3
+    assert instruct._WARM_PROBE_BUDGET_FRACTION == 0.05
+    assert instruct._step_floor(168) == 51      # max(50, ceil(0.3 * 168))
+    assert instruct._step_floor(40) == 40       # never above the schedule
+    assert instruct._step_floor(1000) == 300
+    assert instruct._step_floor(0) == 1
+    assert instruct._finite_positive("x") is None
+    assert instruct._finite_positive(float("nan")) is None
+    assert instruct._finite_positive(0) is None
+    assert instruct._finite_positive("2.5") == 2.5
+
+
+def test_qwen35_4b_plans_at_least_fifty_steps_from_the_cold_probe():
+    # qwen3.5-4b (0.4 h): admitted b1/ga16, worst-batch admission timing
+    # 21.259 s, plan at budget 990.4 s -> the raw planner allowed 29 of 168 and
+    # the cell trained exactly 29 steps (COMPLETE at 1004 s, host 0.65).
+    budget, cold = 990.4, 21.259
+    decision = instruct._warm_probe_decision(budget_s=budget, cold_step_s=cold, **_QWEN_GEOMETRY)
+    assert decision["needed"] is True and decision["cold_planned_steps"] == 29
+    assert decision["cost_estimate_s"] == 63.8 and decision["allowance_s"] == 49.5
+    assert decision["affordable"] is False and decision["run"] is False
+
+    plan = instruct._plan_cold_only(budget_s=budget, cold_step_s=cold, warm_step_s=None, **_QWEN_GEOMETRY)
+    assert plan["step_source"] == "admission_worst_batch_discounted"
+    assert plan["measured_step_s"] == round(cold / 3, 4)
+    assert plan["cold_step_s"] == cold and plan["cold_planned_steps"] == 29
+    assert plan["floor_steps"] == 51
+    assert plan["reason"] == "wall_budget_cap" and plan["cap_applied"] is True
+    assert plan["planned_steps"] == 94
+    assert 50 <= plan["planned_steps"] <= plan["schedule_steps"] == 168
+    assert plan["estimated_wall_s"] <= instruct._usable_budget_s(budget)
+
+    # Had a warm probe measured steps 2-3 still inside the warm-up (17 s), the
+    # measured plan (39) would be lifted to the floor because the discounted
+    # estimate affords it.
+    warm = instruct._plan_cold_only(budget_s=budget, cold_step_s=cold, warm_step_s=17.0, **_QWEN_GEOMETRY)
+    assert warm["step_source"] == "warm_probe" and warm["measured_step_s"] == 17.0
+    assert warm["affordable_steps"] == 39
+    assert warm["planned_steps"] == 51 and warm["reason"] == "wall_budget_cap_floor"
+    assert warm["discounted_affordable_steps"] == 94
+    assert warm["estimated_wall_s"] <= instruct._usable_budget_s(budget)
+
+
+def test_qwen35_9b_warm_probe_runs_even_though_the_micro_batch_timing_fits():
+    # qwen3.5-9b (0.5 h): admitted b1/ga16/gc after the no-gc rung was
+    # rejected (worst 0.857 -> 0.977); its worst-batch admission timing was a
+    # warm 1.786 s micro-batch, so the raw planner said the 168-step schedule
+    # fits (affordable 499) while real steps ran 7.5-23 s and the deadline
+    # stopped training at 77.  The warm probe must therefore run whenever it
+    # is affordable, not only when the cold plan caps.
+    budget, cold = 1288.4, 1.786
+    decision = instruct._warm_probe_decision(budget_s=budget, cold_step_s=cold, **_QWEN_GEOMETRY)
+    assert decision["needed"] is False and decision["cold_planned_steps"] == 168
+    assert decision["cost_estimate_s"] == 5.4 and decision["allowance_s"] == 64.4
+    assert decision["run"] is True and decision["stop_after_s"] == 64.4
+
+    # ~45 s later the probe reports a 12 s warm step: a real cap, above 50.
+    plan = instruct._plan_cold_only(budget_s=budget - 45.0, cold_step_s=cold, warm_step_s=12.0, **_QWEN_GEOMETRY)
+    assert plan["step_source"] == "warm_probe"
+    assert plan["reason"] == "wall_budget_cap" and plan["planned_steps"] == 69
+    assert plan["cold_planned_steps"] == 168 and plan["floor_steps"] == 51
+    assert plan["estimated_wall_s"] <= instruct._usable_budget_s(budget - 45.0)
+
+    # Steps 2-3 measured deep in the warm-up (23 s): floor 51 applies.
+    early = instruct._plan_cold_only(budget_s=budget - 45.0, cold_step_s=cold, warm_step_s=23.0, **_QWEN_GEOMETRY)
+    assert early["affordable_steps"] == 36
+    assert early["planned_steps"] == 51 and early["reason"] == "wall_budget_cap_floor"
+
+    # Without any warm measurement the fitting cold plan is kept as it was.
+    untouched = instruct._plan_cold_only(budget_s=budget, cold_step_s=cold, warm_step_s=None, **_QWEN_GEOMETRY)
+    assert untouched["step_source"] == "admission_worst_batch"
+    assert untouched["reason"] == "schedule_fits" and untouched["planned_steps"] == 168
+    assert untouched["floor_steps"] is None
+
+
+def test_cold_only_plan_keeps_fitting_schedules_untouched():
+    # falcon-candidate (mirror): admission worst 0.707 s at budget 526.9 s ->
+    # affordable 431, schedule 110 fits; bloomz / minicpm (0.3 h, timing probe
+    # declines below 900 s): worst 2.51 s / 1.697 s, 168-step schedules fit.
+    for cold, budget, rows, batch, accum, schedule in (
+        (0.707, 526.9, 875, 4, 4, 110),
+        (2.51, 878.1, 1339, 4, 4, 168),
+        (1.697, 877.3, 1338, 4, 4, 168),
+    ):
+        plan = instruct._plan_cold_only(
+            budget_s=budget, cold_step_s=cold, warm_step_s=None, train_rows=rows,
+            val_rows=256, per_device_batch=batch, grad_accum=accum, epochs=2,
+        )
+        assert plan["schedule_steps"] == schedule
+        assert plan["step_source"] == "admission_worst_batch"
+        assert plan["reason"] == "schedule_fits" and plan["cap_applied"] is False
+        assert plan["planned_steps"] == schedule and plan["floor_steps"] is None
+        decision = instruct._warm_probe_decision(
+            budget_s=budget, cold_step_s=cold, train_rows=rows, val_rows=256,
+            per_device_batch=batch, grad_accum=accum, epochs=2,
+        )
+        assert decision["needed"] is False and decision["run"] is True
+    # Falcon with its warm measurement (0.72 s real step): still 110, no cap.
+    falcon = instruct._plan_cold_only(
+        budget_s=526.9, cold_step_s=0.707, warm_step_s=0.72, train_rows=875,
+        val_rows=256, per_device_batch=4, grad_accum=4, epochs=2,
+    )
+    assert falcon["step_source"] == "warm_probe"
+    assert falcon["reason"] == "schedule_fits" and falcon["planned_steps"] == 110
+    assert falcon["cap_applied"] is False
+
+
+def test_floor_never_exceeds_schedule_and_needs_discounted_affordability():
+    # A 40-step schedule (small dataset) that the warm step would cap at 27:
+    # the floor is the schedule itself and the discounted estimate (10 s ->
+    # 41 steps in the 414 s usable budget) affords it.
+    small = instruct._plan_cold_only(
+        budget_s=520.0, cold_step_s=30.0, warm_step_s=15.0, train_rows=320,
+        val_rows=0, per_device_batch=4, grad_accum=4, epochs=2,
+    )
+    assert small["schedule_steps"] == 40 and small["floor_steps"] == 40
+    assert small["affordable_steps"] == 27
+    assert small["discounted_affordable_steps"] == 41
+    assert small["planned_steps"] == 40 and small["cap_applied"] is False
+    assert small["reason"] == "schedule_fits_by_floor"
+    # With less budget the discounted estimate affords only 30 < 40: no bump.
+    short = instruct._plan_cold_only(
+        budget_s=400.0, cold_step_s=30.0, warm_step_s=15.0, train_rows=320,
+        val_rows=0, per_device_batch=4, grad_accum=4, epochs=2,
+    )
+    assert short["discounted_affordable_steps"] == 30
+    assert short["planned_steps"] == short["affordable_steps"] == 20
+    assert short["reason"] == "wall_budget_cap"
+    # When even the discounted estimate cannot afford the floor, the measured
+    # cap stands (the deadline callback remains the backstop).
+    tight = instruct._plan_cold_only(
+        budget_s=200.0, cold_step_s=30.0, warm_step_s=15.0, train_rows=1337,
+        val_rows=0, per_device_batch=1, grad_accum=16, epochs=2,
+    )
+    assert tight["floor_steps"] == 51 and tight["discounted_affordable_steps"] < 51
+    assert tight["planned_steps"] == tight["affordable_steps"] == 8
+    assert tight["reason"] == "wall_budget_cap"
+    # Cold-only with an unusable warm value behaves as if unmeasured warm.
+    for bad in ("n/a", float("inf"), 0.0, -3.0):
+        plan = instruct._plan_cold_only(
+            budget_s=990.4, cold_step_s=21.259, warm_step_s=bad, **_QWEN_GEOMETRY
+        )
+        assert plan["step_source"] == "admission_worst_batch_discounted"
+        assert plan["planned_steps"] == 94
+
+
+def test_warm_probe_median_uses_steps_two_and_three():
+    assert instruct._warm_probe_median([20.9, 8.0, 6.0]) == 7.0
+    assert instruct._warm_probe_median([20.9, 8.0]) == 8.0
+    assert instruct._warm_probe_median([20.9]) is None
+    assert instruct._warm_probe_median([]) is None
+    assert instruct._warm_probe_median([20.9, float("nan"), 6.0]) == 6.0
+    assert instruct._warm_probe_median([20.9, 8.0, 6.0, 1.0]) == 7.0  # a 4th step is ignored
+
+
+class _FakeClock:
+    def __init__(self, ticks):
+        self.ticks = list(ticks)
+        self.now = 0.0
+
+    def monotonic(self):
+        if self.ticks:
+            self.now = self.ticks.pop(0)
+        return self.now
+
+
+def test_warm_probe_times_real_steps_and_discards_state(monkeypatch, tmp_path):
+    from transformers import TrainerControl, TrainerState
+
+    built, discarded = [], []
+
+    class Trainer:
+        def __init__(self, *, model, args, train_dataset, data_collator, callbacks, **extra):
+            built.append((model, args, len(train_dataset), data_collator, callbacks, extra))
+            self.args, self.callbacks = args, callbacks
+            self.accelerator = SimpleNamespace(free_memory=lambda: None)
+            self.model = model
+
+        def train(self):
+            # Mirrors the Trainer loop: a stop raised on a sub-step ends the
+            # window before its optimizer step (no on_step_end for it).
+            state, control = TrainerState(), TrainerControl()
+            for _step in range(10):
+                for callback in self.callbacks:
+                    callback.on_step_begin(self.args, state, control)
+                for callback in self.callbacks:
+                    callback.on_substep_end(self.args, state, control)
+                if control.should_training_stop:
+                    break
+                for callback in self.callbacks:
+                    callback.on_step_end(self.args, state, control)
+                if control.should_training_stop:
+                    break
+
+    # opened, then (begin, substep, end) per step: durations 21.0, 8.0, 6.0.
+    clock = _FakeClock([0.0, 1.0, 5.0, 22.0, 23.0, 25.0, 31.0, 32.0, 34.0, 38.0, 40.0])
+    monkeypatch.setattr(instruct, "time", SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(
+        instruct, "_discard",
+        lambda value, trainer=False: discarded.append((type(value).__name__, trainer)),
+    )
+    kwargs = dict(
+        output_dir=str(tmp_path), per_device_train_batch_size=1,
+        gradient_accumulation_steps=16, learning_rate=1.5e-4,
+        neftune_noise_alpha=5.0, eval_strategy="steps", eval_steps=20,
+        per_device_eval_batch_size=1, report_to=[], disable_tqdm=True,
+        save_strategy="no", logging_steps=10,
+    )
+    rows = [{"input_ids": [1, 2, 3], "labels": [1, 2, 3]}] * 4
+    result = instruct._warm_probe_step_s(
+        trainer_cls=Trainer, model="warm-model", kwargs=kwargs, train_ex=rows,
+        collator="collator", trainer_extra={"kl_coef": 0.1}, stop_after_s=64.4,
+    )
+    assert result["source"] == "warm_probe" and result["probe_steps"] == 3
+    assert result["steps_completed"] == 3
+    assert result["step_durations_s"] == [21.0, 8.0, 6.0]
+    assert result["step_s"] == 7.0
+    assert result["stop_after_s"] == 64.4 and result["elapsed_s"] == 40.0
+    assert "error" not in result
+    model, args, n_rows, collator, callbacks, extra = built[0]
+    assert model == "warm-model" and n_rows == 4 and collator == "collator"
+    assert extra == {"kl_coef": 0.1} and len(callbacks) == 1
+    assert args.max_steps == 3 and args.learning_rate == 0.0
+    assert args.neftune_noise_alpha is None
+    assert str(args.eval_strategy) in ("no", "IntervalStrategy.NO")
+    assert discarded == [("Trainer", True)]
+
+    # Self-limit: the allowance expires during the second step, so only one
+    # full step was timed and no estimate is produced.
+    clock = _FakeClock([0.0, 1.0, 5.0, 22.0, 23.0, 70.0, 75.0])
+    monkeypatch.setattr(instruct, "time", SimpleNamespace(monotonic=clock.monotonic))
+    result = instruct._warm_probe_step_s(
+        trainer_cls=Trainer, model="warm-model", kwargs=kwargs, train_ex=rows,
+        collator="collator", stop_after_s=49.5,
+    )
+    assert result["steps_completed"] == 1 and result["step_s"] is None
+    assert result["step_durations_s"] == [21.0]
+
+    # A failing trainer is recorded, never raised.
+    class Broken:
+        def __init__(self, **_kwargs):
+            raise RuntimeError("CUDA out of memory")
+
+    freed = []
+    monkeypatch.setattr(instruct, "_free_cuda", lambda: freed.append(True))
+    monkeypatch.setattr(instruct, "time", SimpleNamespace(monotonic=_FakeClock([0.0, 1.0]).monotonic))
+    result = instruct._warm_probe_step_s(
+        trainer_cls=Broken, model="m", kwargs=kwargs, train_ex=rows, collator=None,
+    )
+    assert result["step_s"] is None and "RuntimeError: CUDA out of memory" in result["error"]
+    assert freed == [True]
+
+
+def test_run_wires_the_warm_probe_and_cold_only_planning():
+    run = inspect.getsource(instruct.run)
+    assert 'timing["warm_step_s"] = warm_probe(' in run
+    assert run.index("candidate_epochs, probe_per_step = time_aware_epochs(") < run.index(
+        'timing["warm_step_s"] = warm_probe('
+    ) < run.index("_discard(holder.pop())")
+    assert "if candidate_epochs is None:" in run
+    assert "_warm_probe_decision(" in run and "_warm_probe_step_s(" in run
+    assert 'stop_after_s=decision["stop_after_s"]' in run
+    assert "_plan_cold_only(" in run
+    assert run.index('step_source="timing_probe"') < run.index("_plan_cold_only(")
+    assert 'warm_step_s=timing.get("warm_step_s")' in run

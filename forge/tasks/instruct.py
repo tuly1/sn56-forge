@@ -17,6 +17,7 @@ import json
 import math
 import os
 import random
+import statistics
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable
@@ -118,6 +119,31 @@ _STEADY_STATE_HEADROOM = 0.12
 _WALL_PLAN_MARGIN = 0.90
 _WALL_PLAN_EVAL_ROW_FACTOR = 0.30
 _WALL_PLAN_SETUP_S = 60.0
+
+# --- Cold-only planning (no zero-LR timing probe) ---------------------------
+# 646d0b70 smoke (VM 1022601, torch 2.9.1; Mac mirror lease
+# 20260903T214700Z).  On Qwen3.5 the zero-LR probe is cut by its own 12 %
+# budget cap (10-25 s per step), leaving only the admitted rung's worst-batch
+# admission timing -- which is ONE micro-batch of the longest rows plus any
+# cold start, not an optimizer step, and misled in both directions:
+#   qwen3.5-4b  b1/ga16     cold 21.26 s -> planned 29 of 168; real steps
+#               13-25 s (train_curve 596.6 s @10, 802.7 s @20); 29 steps
+#               COMPLETE at 1004 s of a 1260 s soft budget with the host at
+#               0.65 -- below the 50-step certification floor.
+#   qwen3.5-9b  b1/ga16/gc  warm micro-batch 1.786 s -> "schedule fits" 168;
+#               real steps 7.5-23 s -> deadline_stop at 77 (per_step 7.56 s).
+# So whenever the zero-LR probe declined or was cut: time three real optimizer
+# steps on the still-alive timing model if three cold-priced steps fit in 5 %
+# of the remaining budget (median of steps 2-3, self-limited to that
+# allowance); otherwise plan with cold / 3 when the cold step would cap the
+# run; and never plan below max(50, 30 % of the schedule) while the discounted
+# estimate affords it.  The deadline callback stays the backstop, so an
+# optimistic plan degrades to an honest PARTIAL_TRAINED_BEST, never a floor.
+_COLD_PROBE_DISCOUNT = 3.0
+_MIN_REAL_STEPS = 50
+_FLOOR_SCHEDULE_FRACTION = 0.30
+_WARM_PROBE_STEPS = 3
+_WARM_PROBE_BUDGET_FRACTION = 0.05
 
 
 @dataclass(frozen=True)
@@ -454,6 +480,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             spec, candidate, neftune_alpha=None if is_kl else 5.0
         )
         timing["probe_per_step"] = None
+        timing["warm_step_s"] = None
         timing_model = rebuild(candidate)
         try:
             candidate_epochs, probe_per_step = time_aware_epochs(
@@ -468,6 +495,13 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 strategy=strategy,
                 trainer_extra=probe_extra,
             )
+            if candidate_epochs is None:
+                # The zero-LR probe declined or was cut by its own budget cap.
+                # While the timing model is still alive, measure a few warm
+                # real steps when the cold admission step would cap the run.
+                timing["warm_step_s"] = warm_probe(
+                    candidate, view, timing_model, kwargs
+                )
         finally:
             holder = [timing_model]
             timing_model = None
@@ -484,21 +518,50 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             )
         return candidate_epochs
 
+    def is_admitted_geometry(candidate: TrainPlan) -> bool:
+        return admitted_step_s is not None and (
+            _plan_identity(candidate) == _plan_identity(admitted_plan)
+        )
+
+    def warm_probe(candidate: TrainPlan, view: _DataView, model: Any,
+                   kwargs: dict[str, Any]) -> float | None:
+        if not is_admitted_geometry(candidate):
+            return None
+        decision = _warm_probe_decision(
+            budget_s=deadline.remaining(),
+            cold_step_s=admitted_step_s,
+            train_rows=len(view.train),
+            val_rows=len(view.validation),
+            per_device_batch=candidate.per_device_batch_size,
+            grad_accum=candidate.grad_accum_steps,
+            epochs=candidate.num_epochs,
+            n_gpus=n_gpus,
+        )
+        telemetry.event(
+            "warm_probe_decision", **{**_plan_identity(candidate), **decision}
+        )
+        if not decision["run"]:
+            return None
+        measured = _warm_probe_step_s(
+            trainer_cls=probe_cls, model=model, kwargs=kwargs,
+            train_ex=view.train, collator=collator, trainer_extra=probe_extra,
+            stop_after_s=decision["stop_after_s"],
+        )
+        telemetry.event(
+            "warm_probe",
+            **{**view.identity(), **_plan_identity(candidate), **measured},
+        )
+        return measured["step_s"]
+
     def plan_steps(candidate: TrainPlan, view: _DataView,
                    epochs: float | None) -> int | None:
         # Measured seconds per optimizer step, best instrument first: the
-        # zero-LR timing probe (steps 10->30 of the exact geometry), else the
-        # admitted rung's worst-batch admission probe (one cold step on the
-        # longest rows: an upper bound).  Without either, the schedule is left
-        # to the deadline callback exactly as before.
-        step_s, source = timing.get("probe_per_step"), "timing_probe"
-        if step_s is None and admitted_step_s is not None and (
-                _plan_identity(candidate) == _plan_identity(admitted_plan)):
-            step_s, source = admitted_step_s, "admission_worst_batch"
-        wall = _plan_wall_steps(
-            budget_s=deadline.remaining(),
-            step_s=step_s,
-            step_source=source if step_s is not None else "none",
+        # zero-LR timing probe (steps 10->30 of the exact geometry) plans
+        # exactly as before; otherwise the admitted rung's cold worst-batch
+        # probe plans through `_plan_cold_only` (warm probe, discount, floor).
+        # Without any measurement the schedule is left to the deadline
+        # callback exactly as before.
+        geometry = dict(
             train_rows=len(view.train),
             val_rows=len(view.validation),
             per_device_batch=candidate.per_device_batch_size,
@@ -506,6 +569,22 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             epochs=candidate.num_epochs if epochs is None else epochs,
             n_gpus=n_gpus,
         )
+        probe_step = timing.get("probe_per_step")
+        if probe_step is not None:
+            wall = _plan_wall_steps(
+                budget_s=deadline.remaining(), step_s=probe_step,
+                step_source="timing_probe", **geometry,
+            )
+        elif is_admitted_geometry(candidate):
+            wall = _plan_cold_only(
+                budget_s=deadline.remaining(), cold_step_s=admitted_step_s,
+                warm_step_s=timing.get("warm_step_s"), **geometry,
+            )
+        else:
+            wall = _plan_wall_steps(
+                budget_s=deadline.remaining(), step_s=None,
+                step_source="none", **geometry,
+            )
         _record_wall_plan(wall, candidate, view)
         return int(wall["planned_steps"]) if wall["cap_applied"] else None
 
@@ -1330,12 +1409,10 @@ def _plan_wall_steps(
         if int(val_rows) > 0 else 0.0
     )
     plan["estimated_eval_s"] = round(eval_s, 2)
-    usable = max(0.0, float(budget_s) - _WALL_PLAN_SETUP_S) * _WALL_PLAN_MARGIN
+    usable = _usable_budget_s(budget_s)
 
     def cost(steps: int) -> float:
-        # Every `every` steps evaluates, and the Trainer evaluates once more at
-        # the final step unless that step is already an evaluation step.
-        return steps * step + math.ceil(steps / every) * eval_s
+        return _wall_cost(steps, step_s=step, eval_s=eval_s, eval_every=every)
 
     if usable < cost(1):
         plan["affordable_steps"] = 0
@@ -1358,6 +1435,267 @@ def _plan_wall_steps(
         reason="wall_budget_cap",
     )
     return plan
+
+
+def _usable_budget_s(budget_s: float) -> float:
+    return max(0.0, float(budget_s) - _WALL_PLAN_SETUP_S) * _WALL_PLAN_MARGIN
+
+
+def _wall_cost(steps: int, *, step_s: float, eval_s: float, eval_every: int) -> float:
+    # Every `eval_every` steps evaluates, and the Trainer evaluates once more
+    # at the final step unless that step is already an evaluation step.
+    return steps * step_s + math.ceil(steps / max(1, eval_every)) * eval_s
+
+
+def _finite_positive(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _step_floor(schedule_steps: int) -> int:
+    """Never plan fewer real steps than this while the estimate affords them."""
+    schedule = max(1, int(schedule_steps))
+    return min(
+        schedule,
+        max(_MIN_REAL_STEPS, math.ceil(_FLOOR_SCHEDULE_FRACTION * schedule)),
+    )
+
+
+def _plan_cold_only(
+    *,
+    budget_s: float,
+    cold_step_s: float,
+    warm_step_s: float | None,
+    train_rows: int,
+    val_rows: int,
+    per_device_batch: int,
+    grad_accum: int,
+    epochs: float,
+    n_gpus: int = 1,
+) -> dict[str, Any]:
+    """Plan when the admission probe's cold worst-batch step is all we have.
+
+    The admission timing is one micro-batch of the longest rows plus any cold
+    start, so it is trusted only when no warmer measurement exists and the
+    schedule fits under it anyway.  A warm-probe measurement always wins; when
+    the cold step would cap the run without one, it is discounted; either way
+    a capped plan never drops below the certification floor while the
+    discounted estimate affords it.
+    """
+    geometry = dict(
+        train_rows=train_rows, val_rows=val_rows,
+        per_device_batch=per_device_batch, grad_accum=grad_accum,
+        epochs=epochs, n_gpus=n_gpus,
+    )
+    cold = _plan_wall_steps(
+        budget_s=budget_s, step_s=cold_step_s,
+        step_source="admission_worst_batch", **geometry,
+    )
+    cold_fields = {
+        "cold_step_s": round(float(cold_step_s), 4),
+        "cold_planned_steps": cold["planned_steps"],
+        "cold_reason": cold["reason"],
+        "warm_step_s": (
+            None if _finite_positive(warm_step_s) is None
+            else round(_finite_positive(warm_step_s), 4)
+        ),
+        "floor_steps": None,
+        "discounted_step_s": None,
+        "discounted_affordable_steps": None,
+    }
+    warm = _finite_positive(warm_step_s)
+    if warm is None and not cold["cap_applied"]:
+        cold.update(cold_fields)
+        return cold
+    discounted_step = float(cold_step_s) / _COLD_PROBE_DISCOUNT
+    discounted = _plan_wall_steps(
+        budget_s=budget_s, step_s=discounted_step,
+        step_source="admission_worst_batch_discounted", **geometry,
+    )
+    if warm is not None:
+        # A measured optimizer step beats the admission micro-batch in either
+        # direction (qwen3.5-9b: 1.786 s micro-batch, 7.5-23 s real steps).
+        plan = _plan_wall_steps(
+            budget_s=budget_s, step_s=warm, step_source="warm_probe", **geometry,
+        )
+    else:
+        plan = discounted
+    floor = _step_floor(plan["schedule_steps"])
+    plan.update(
+        cold_fields,
+        floor_steps=floor,
+        discounted_step_s=round(discounted_step, 4),
+        discounted_affordable_steps=discounted["affordable_steps"],
+    )
+    affordable = discounted["affordable_steps"] or 0
+    if plan["cap_applied"] and plan["planned_steps"] < floor and affordable >= floor:
+        every = plan["eval_every"]
+        plan["estimated_wall_s"] = round(_wall_cost(
+            floor, step_s=discounted_step,
+            eval_s=discounted["estimated_eval_s"] or 0.0, eval_every=every,
+        ), 1)
+        if floor >= plan["schedule_steps"]:
+            plan.update(
+                planned_steps=plan["schedule_steps"], cap_applied=False,
+                reason="schedule_fits_by_floor",
+            )
+        else:
+            plan.update(planned_steps=floor, reason="wall_budget_cap_floor")
+    return plan
+
+
+def _warm_probe_decision(
+    *,
+    budget_s: float,
+    cold_step_s: float,
+    train_rows: int,
+    val_rows: int,
+    per_device_batch: int,
+    grad_accum: int,
+    epochs: float,
+    n_gpus: int = 1,
+) -> dict[str, Any]:
+    """Run the warm probe whenever a few cold-priced steps fit inside a small
+    slice of the remaining budget; ``needed`` only records whether the cold
+    step alone would have capped the run (it under-read 4-13x on qwen3.5-9b,
+    so a fitting cold plan is not a reason to skip the measurement)."""
+    cold = _plan_wall_steps(
+        budget_s=budget_s, step_s=cold_step_s,
+        step_source="admission_worst_batch", train_rows=train_rows,
+        val_rows=val_rows, per_device_batch=per_device_batch,
+        grad_accum=grad_accum, epochs=epochs, n_gpus=n_gpus,
+    )
+    needed = bool(cold["cap_applied"])
+    cold_step = _finite_positive(cold_step_s) or 0.0
+    cost_estimate = _WARM_PROBE_STEPS * cold_step
+    allowance = _WARM_PROBE_BUDGET_FRACTION * max(0.0, float(budget_s))
+    affordable = cold_step > 0 and cost_estimate <= allowance
+    return {
+        "run": bool(affordable),
+        "needed": needed,
+        "affordable": affordable,
+        "probe_steps": _WARM_PROBE_STEPS,
+        "cost_estimate_s": round(cost_estimate, 1),
+        "allowance_s": round(allowance, 1),
+        "stop_after_s": round(allowance, 1),
+        "budget_s": round(float(budget_s), 1),
+        "cold_step_s": round(float(cold_step_s), 4),
+        "cold_planned_steps": cold["planned_steps"],
+        "cold_reason": cold["reason"],
+    }
+
+
+def _warm_probe_median(durations: list[float]) -> float | None:
+    """Median of the second and third steps; the first carries the warm-up."""
+    warm = [
+        float(d) for d in list(durations)[1:_WARM_PROBE_STEPS]
+        if isinstance(d, (int, float)) and math.isfinite(float(d)) and float(d) > 0
+    ]
+    if not warm:
+        return None
+    return round(statistics.median(warm), 4)
+
+
+def _warm_probe_step_s(
+    *,
+    trainer_cls: Any,
+    model: Any,
+    kwargs: dict[str, Any],
+    train_ex: list,
+    collator: Any,
+    trainer_extra: dict[str, Any] | None = None,
+    stop_after_s: float | None = None,
+) -> dict[str, Any]:
+    """Time a few real optimizer steps on an already-built model, then discard.
+
+    Same construction as the zero-LR timing probe (exact production arguments,
+    LR 0 and no NEFTune so nothing moves, no evaluation, no callbacks that
+    write artifacts), stopped after ``_WARM_PROBE_STEPS`` optimizer steps or
+    once ``stop_after_s`` of wall time has elapsed.  The caller releases the
+    model afterwards; nothing here is reused.
+    """
+    result: dict[str, Any] = {
+        "source": "warm_probe",
+        "probe_steps": _WARM_PROBE_STEPS,
+        "stop_after_s": None if stop_after_s is None else round(float(stop_after_s), 1),
+        "steps_completed": 0,
+        "step_durations_s": [],
+        "elapsed_s": None,
+        "step_s": None,
+    }
+    try:
+        from datasets import Dataset
+        from transformers import TrainerCallback, TrainingArguments
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+    durations: list[float] = []
+    opened = time.monotonic()
+
+    def expired(now: float) -> bool:
+        return stop_after_s is not None and now - opened >= float(stop_after_s)
+
+    class _StepTimer(TrainerCallback):
+        started: float | None = None
+
+        def on_step_begin(self, args, state, control, **kw):  # noqa: ANN001
+            self.started = time.monotonic()
+            return control
+
+        def on_step_end(self, args, state, control, **kw):  # noqa: ANN001
+            now = time.monotonic()
+            if self.started is not None:
+                durations.append(now - self.started)
+                self.started = None
+            if len(durations) >= _WARM_PROBE_STEPS or expired(now):
+                control.should_training_stop = True
+            return control
+
+        def on_substep_end(self, args, state, control, **kw):  # noqa: ANN001
+            if expired(time.monotonic()):
+                control.should_training_stop = True
+            return control
+
+    probe_kwargs = dict(kwargs)
+    probe_kwargs.update(
+        max_steps=_WARM_PROBE_STEPS, learning_rate=0.0, neftune_noise_alpha=None
+    )
+    for key in ("eval_strategy", "eval_steps", "per_device_eval_batch_size"):
+        probe_kwargs.pop(key, None)
+    probe = None
+    try:
+        probe = trainer_cls(
+            model=model,
+            args=TrainingArguments(
+                **compatible_dataclass_kwargs(
+                    TrainingArguments, probe_kwargs,
+                    allow_removed={"overwrite_output_dir"},
+                )
+            ),
+            train_dataset=Dataset.from_list(train_ex),
+            data_collator=collator,
+            callbacks=[_StepTimer()],
+            **(trainer_extra or {}),
+        )
+        probe.train()
+    except Exception as exc:  # noqa: BLE001
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        if probe is not None:
+            holder = [probe]
+            probe = None
+            _discard(holder.pop(), trainer=True)
+        else:
+            _free_cuda()
+    result["elapsed_s"] = round(time.monotonic() - opened, 3)
+    result["steps_completed"] = len(durations)
+    result["step_durations_s"] = [round(d, 3) for d in durations]
+    result["step_s"] = _warm_probe_median(durations)
+    return result
 
 
 def _record_wall_plan(wall: dict[str, Any], plan: TrainPlan, view: _DataView) -> None:
