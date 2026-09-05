@@ -63,6 +63,7 @@ from forge.tasks.common import (
 )
 from forge.tuning.callbacks import DeadlineCallback
 from forge.tuning.lfm25_epoch_cap import cap_lfm25_production_epochs
+from forge.tuning.granite41_epoch_cap import cap_granite41_production_epochs
 from forge.tuning.plan import TrainPlan, make_sft_plan
 from forge.tuning.qwen35_soup import (
     apply_qwen35_soup_override,
@@ -1241,6 +1242,21 @@ def _make_trainer(
             kwargs["num_train_epochs"] = capped_epochs
             telemetry.event(
                 "lfm25_production_epoch_cap",
+                observed_time_aware_epochs=float(epochs),
+                applied_epochs=capped_epochs,
+                override_applied=capped_epochs < float(epochs),
+            )
+        capped_epochs = cap_granite41_production_epochs(
+            spec,
+            model,
+            strategy=strategy,
+            n_gpus=n_gpus,
+            native_epochs=epochs,
+        )
+        if capped_epochs is not None:
+            kwargs["num_train_epochs"] = capped_epochs
+            telemetry.event(
+                "granite41_production_epoch_cap",
                 observed_time_aware_epochs=float(epochs),
                 applied_epochs=capped_epochs,
                 override_applied=capped_epochs < float(epochs),
