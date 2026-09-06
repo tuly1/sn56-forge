@@ -66,6 +66,15 @@ from forge.tuning.callbacks import DeadlineCallback
 from forge.tuning.lfm25_epoch_cap import cap_lfm25_production_epochs
 from forge.tuning.granite41_epoch_cap import cap_granite41_production_epochs
 from forge.tuning.plan import TrainPlan, make_sft_plan
+from forge.tuning.qwen35_fixed_average import (
+    adapter_factor_sha256 as qwen35_fixed_average_factor_sha256,
+    build_fixed_midpoint as build_qwen35_fixed_midpoint,
+    cap1_admitted as qwen35_fixed_average_cap1_admitted,
+    eligible_route as eligible_qwen35_fixed_average,
+    promote_artifact as promote_qwen35_fixed_average_artifact,
+    restore_artifact as restore_qwen35_fixed_average_artifact,
+    snapshot_artifact as snapshot_qwen35_fixed_average_artifact,
+)
 from forge.tuning.qwen35_soup import (
     apply_qwen35_soup_override,
     eligible_qwen35_soup_route,
@@ -649,6 +658,9 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             reason="h100_proven_pretrainer_geometry",
         )
     plan, quasar_geometry_changed = conservative_quasar_plan(loaded.model, plan)
+    fixed_average_route = eligible_qwen35_fixed_average(
+        spec, loaded.model, strategy=strategy, n_gpus=n_gpus
+    )
     checkpointing_supported = not is_quasar_model(loaded.model)
     if quasar_geometry_changed:
         # The mandatory Quasar remote code advertises gradient checkpointing,
@@ -863,6 +875,12 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         geometry_admission=admission,
         geometry_admitted=admitted,
     )
+    if fixed_average_route is not None and not admitted_view.validation:
+        telemetry.event(
+            "qwen35_fixed_average_native_only",
+            reason="no_internal_validation_split",
+        )
+        fixed_average_route = None
     admitted_view = None
 
     if is_kl:
@@ -906,9 +924,22 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             )
         return candidate_epochs
 
+    native_initial_factor = None
+
+    def capture_native_initial(candidate_model: Any) -> None:
+        nonlocal native_initial_factor
+        if fixed_average_route is None:
+            return
+        native_initial_factor = qwen35_fixed_average_factor_sha256(candidate_model)
+        telemetry.event(
+            "qwen35_fixed_average_initial_factors",
+            factor_sha256=native_initial_factor,
+            complete_ab_pairs=248,
+        )
+
     trainer, tracker, soup_route, plan, training_view, training_outcome = _train_ladder(
         plans[admitted_index:], data_for, rebuild, make, measure_epochs,
-        spec, tokenizer,
+        spec, tokenizer, before_train=capture_native_initial,
     )
     _record_training_selection(plan, training_view, training_outcome)
     if training_outcome == "progressed_oom_preserved":
@@ -961,6 +992,103 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                                tokenizer=tokenizer)
     write_artifact_truth(spec.output_dir, truth, optimizer_step=selected_step,
                          reason="selected_export")
+
+    if fixed_average_route is not None:
+        native_snapshot = os.path.join(workdir(spec), "qwen35-fixed-average-native")
+        cap1_spec = replace(
+            spec,
+            expected_repo_name=f".{spec.expected_repo_name}-qwen35-fixed-average-cap1",
+        )
+        midpoint_path = os.path.join(workdir(spec), "qwen35-fixed-average-midpoint")
+        shutil.rmtree(cap1_spec.output_dir, ignore_errors=True)
+        shutil.rmtree(midpoint_path, ignore_errors=True)
+        snapshot_qwen35_fixed_average_artifact(spec.output_dir, native_snapshot)
+        telemetry.event(
+            "qwen35_fixed_average_native_preserved",
+            internal_validation_loss=tracker.persisted_best,
+            initial_factor_sha256=native_initial_factor,
+            selected_step=selected_step,
+            soft_seconds_remaining=round(deadline.remaining(), 3),
+        )
+        if not qwen35_fixed_average_cap1_admitted(
+            fixed_average_route, deadline.remaining()
+        ):
+            restore_qwen35_fixed_average_artifact(native_snapshot, spec.output_dir)
+            telemetry.event(
+                "qwen35_fixed_average_native_fallback",
+                reason="insufficient_shared_deadline",
+            )
+            telemetry.write_into(spec.output_dir)
+            return
+        native_trainer = trainer
+        trainer = None
+        model = None
+        _discard(native_trainer, trainer=True)
+        cap1_trainer = None
+        cap1_model = None
+        try:
+            cap1_model = rebuild(plan)
+            cap1_factor = qwen35_fixed_average_factor_sha256(cap1_model)
+            if cap1_factor != native_initial_factor:
+                raise RuntimeError("Qwen fixed-average initial factor mismatch")
+            cap1_trainer, cap1_tracker, _unused_route = _make_trainer(
+                cap1_spec, deadline, plan, cap1_model, tokenizer,
+                training_view.train, training_view.validation, collator,
+                is_kl, strategy, n_gpus, probe=False,
+                epochs=fixed_average_route.cap1_epochs,
+            )
+            cap1_model = None
+            cap1_trainer.train()
+            cap1_step = int(cap1_trainer.state.global_step or 0)
+            cap1_max = int(cap1_trainer.state.max_steps or 0)
+            if cap1_step <= 0 or cap1_step < cap1_max:
+                raise RuntimeError("Qwen fixed-average cap1 trajectory incomplete")
+            cap1_truth = _truth(cap1_step, cap1_max)
+            cap1_selected_step = cap1_step
+            if should_final_save(cap1_tracker, final_step=cap1_step):
+                save_adapter(
+                    cap1_trainer.model, tokenizer, cap1_spec.output_dir,
+                    artifact_truth=cap1_truth, optimizer_step=cap1_step,
+                    truth_reason="fixed_average_cap1_schedule_return",
+                )
+            else:
+                cap1_selected_step = int(cap1_tracker.best_step or 0)
+                write_artifact_truth(
+                    cap1_spec.output_dir, cap1_truth,
+                    optimizer_step=cap1_selected_step,
+                    reason="fixed_average_cap1_retained_best",
+                )
+            midpoint_receipt = build_qwen35_fixed_midpoint(
+                native_snapshot, cap1_spec.output_dir, midpoint_path
+            )
+            promote_qwen35_fixed_average_artifact(midpoint_path, spec.output_dir)
+            shutil.rmtree(midpoint_path, ignore_errors=True)
+            telemetry.event(
+                "qwen35_fixed_average_materialized",
+                native_internal_validation_loss=tracker.persisted_best,
+                cap1_internal_validation_loss=cap1_tracker.persisted_best,
+                native_selected_step=selected_step,
+                cap1_selected_step=cap1_selected_step,
+                initial_factor_sha256=cap1_factor,
+                output_adapter_sha256=midpoint_receipt["output_adapter_sha256"],
+                fixed_native_weight=0.5,
+                fixed_cap1_weight=0.5,
+            )
+            telemetry.write_into(spec.output_dir)
+        except Exception as exc:
+            restore_qwen35_fixed_average_artifact(native_snapshot, spec.output_dir)
+            telemetry.event(
+                "qwen35_fixed_average_native_fallback",
+                reason="cap1_or_midpoint_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            telemetry.write_into(spec.output_dir)
+        finally:
+            if cap1_trainer is not None:
+                _discard(cap1_trainer, trainer=True)
+            elif cap1_model is not None:
+                _discard(cap1_model)
+        return
 
 
 def _torch_rng() -> tuple[Any, Any]:
@@ -1315,6 +1443,25 @@ def _make_trainer(
         trainer = KLSFTTrainer(kl_coef=spec.kl_coef, **fields)
     else:
         trainer = Trainer(**fields)
+    fixed_endpoint = eligible_qwen35_fixed_average(
+        spec, model, strategy=strategy, n_gpus=n_gpus
+    )
+    if fixed_endpoint is not None and not probe:
+        batches = len(trainer.get_train_dataloader())
+        accumulation = int(args.gradient_accumulation_steps)
+        telemetry.event(
+            "qwen35_fixed_average_trainer_geometry",
+            endpoint_mode=fixed_endpoint.endpoint_mode,
+            visible_gpus=n_gpus,
+            training_args_n_gpu=int(args.n_gpu),
+            per_device_train_batch_size=int(args.per_device_train_batch_size),
+            training_args_train_batch_size=int(args.train_batch_size),
+            gradient_accumulation_steps=accumulation,
+            dataloader_batches=batches,
+            updates_per_epoch=math.ceil(batches / accumulation),
+            eval_steps=int(args.eval_steps or 0),
+            model_parallel=bool(getattr(trainer, "is_model_parallel", False)),
+        )
     return trainer, tracker, route
 
 
@@ -1516,6 +1663,7 @@ def _train_ladder(
     measure_epochs: Callable[[TrainPlan, _DataView], float | None],
     spec: TaskSpec,
     tokenizer: Any,
+    before_train: Callable[[Any], None] | None = None,
 ):
     last_plan = None
     view = None
@@ -1552,6 +1700,8 @@ def _train_ladder(
             current = rebuild(candidate)
             trainer, tracker, route = make(candidate, current, view, None, epochs)
             current = None
+            if before_train is not None:
+                before_train(trainer.model)
             trainer.train()
             telemetry.event(
                 "training_geometry_attempt",
