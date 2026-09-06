@@ -10,10 +10,18 @@ from forge.data.schema import InstructColumns
 from forge.tuning import granite41_epoch_cap as policy
 
 
-def _spec(*, model: str = policy.EXACT_MODEL_ID, use_kl: bool = False):
+def _spec(
+    *,
+    model: str = policy.EXACT_MODEL_ID,
+    use_kl: bool = False,
+    baseline_stats_path: str | None = None,
+    cached_model_dir: str | None = None,
+):
     return SimpleNamespace(
         model=model,
-        cached_model_dir=f"/cache/models/{model.replace('/', '--')}",
+        cached_model_dir=cached_model_dir
+        or f"/cache/models/{model.replace('/', '--')}",
+        baseline_stats_path=baseline_stats_path,
         task_type="InstructTextTask",
         instruct=InstructColumns("instruction", "output", "input"),
         use_kl=use_kl,
@@ -21,7 +29,13 @@ def _spec(*, model: str = policy.EXACT_MODEL_ID, use_kl: bool = False):
 
 
 class _Model:
-    def __init__(self, *, hidden_size: int = 2560, rank: int = 32):
+    def __init__(
+        self,
+        *,
+        hidden_size: int = 2560,
+        rank: int = 32,
+        base_model_name_or_path: str = policy.EXACT_BASE_MODEL,
+    ):
         self._base = SimpleNamespace(
             config=SimpleNamespace(
                 model_type="granite",
@@ -38,7 +52,7 @@ class _Model:
                 r=rank,
                 lora_alpha=64,
                 lora_dropout=0.05,
-                base_model_name_or_path=policy.EXACT_BASE_MODEL,
+                base_model_name_or_path=base_model_name_or_path,
                 target_modules=set(policy.EXACT_TARGET_MODULES),
                 use_rslora=False,
                 use_dora=False,
@@ -64,6 +78,42 @@ def test_exact_route_caps_only_native_epochs_above_one() -> None:
     assert policy.cap_granite41_production_epochs(
         spec, model, strategy="lora", n_gpus=1, native_epochs=1.0
     ) == 1.0
+
+
+def test_official_anonymous_route_preserves_exact_cap() -> None:
+    alias = "5e54c9ada1e3ee68"
+    cached = f"/cache/models/{alias}"
+    spec = _spec(
+        model=alias,
+        cached_model_dir=cached,
+        baseline_stats_path="/cache/baseline_stats_task.json",
+    )
+    model = _Model(base_model_name_or_path=cached)
+    assert policy.cap_granite41_production_epochs(
+        spec, model, strategy="lora", n_gpus=1, native_epochs=3.76
+    ) == 1.0
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        _spec(model="5e54c9ada1e3ee68"),
+        _spec(
+            model="5E54C9ADA1E3EE68",
+            baseline_stats_path="/cache/baseline_stats_task.json",
+        ),
+        _spec(
+            model="5e54c9ada1e3ee68",
+            baseline_stats_path="/cache/baseline_stats_task.json",
+            cached_model_dir="/cache/models/ibm-granite--granite-4.1-3b",
+        ),
+    ],
+)
+def test_anonymous_route_fails_closed_on_contract_drift(spec) -> None:
+    model = _Model(base_model_name_or_path=str(spec.cached_model_dir))
+    assert policy.cap_granite41_production_epochs(
+        spec, model, strategy="lora", n_gpus=1, native_epochs=3.76
+    ) is None
 
 
 @pytest.mark.parametrize("native", [0.0, -1.0, math.inf, math.nan])

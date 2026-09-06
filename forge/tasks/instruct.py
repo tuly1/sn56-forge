@@ -17,6 +17,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import stat
 from dataclasses import dataclass, replace
@@ -200,9 +201,23 @@ def _is_bloomz_promotion(spec: TaskSpec, loaded: Any, params_b: float) -> bool:
         and spec.instruct is not None
         and spec.instruct.output is not None
         and not spec.use_kl
-        and spec.model == _BLOOMZ_REPO
+        and _supported_bloomz_request(spec)
         and abs(params_b - _BLOOMZ_PARAMS_B) <= 1e-9
         and _has_exact_bloomz_revision(loaded.model, loaded.model_dir)
+    )
+
+
+def _supported_bloomz_request(spec: TaskSpec) -> bool:
+    """Recognize named BloomZ and the validator's anonymous cache contract."""
+    cached_model_dir = str(spec.cached_model_dir)
+    if spec.model == _BLOOMZ_REPO:
+        return cached_model_dir == f"/cache/models/{_BLOOMZ_REPO.replace('/', '--')}"
+    return bool(
+        isinstance(spec.model, str)
+        and re.fullmatch(r"[0-9a-f]{16}", spec.model) is not None
+        and isinstance(spec.baseline_stats_path, str)
+        and spec.baseline_stats_path
+        and cached_model_dir == f"/cache/models/{spec.model}"
     )
 
 

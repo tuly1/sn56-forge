@@ -9,6 +9,7 @@ the admitted route, receives the production policy ``min(native, 1.0)``.
 from __future__ import annotations
 
 import math
+import re
 from typing import Any, Mapping
 
 from forge.data.schema import TaskSpec
@@ -22,6 +23,20 @@ EXACT_SOURCE_DROPOUT = 0.05
 EXACT_TARGET_MODULES = tuple(
     sorted({"in_proj", "out_proj", "q_proj", "k_proj", "v_proj", "w1", "w2", "w3"})
 )
+
+
+def _supported_model_route(spec: TaskSpec) -> bool:
+    """Accept the named model or the validator's exact anonymous cache form."""
+    cached_model_dir = str(spec.cached_model_dir)
+    if spec.model == EXACT_MODEL_ID:
+        return cached_model_dir == EXACT_BASE_MODEL
+    return bool(
+        isinstance(spec.model, str)
+        and re.fullmatch(r"[0-9a-f]{16}", spec.model) is not None
+        and isinstance(spec.baseline_stats_path, str)
+        and spec.baseline_stats_path
+        and cached_model_dir == f"/cache/models/{spec.model}"
+    )
 
 
 def _value(config: Any, name: str, default: Any = None) -> Any:
@@ -64,8 +79,7 @@ def eligible_lfm25_production_epoch_cap(
     if (
         strategy != "lora"
         or n_gpus != 1
-        or spec.model != EXACT_MODEL_ID
-        or str(spec.cached_model_dir) != EXACT_BASE_MODEL
+        or not _supported_model_route(spec)
         or spec.task_type != "InstructTextTask"
         or spec.instruct is None
         or spec.instruct.output is None

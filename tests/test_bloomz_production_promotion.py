@@ -130,6 +130,39 @@ def test_exact_task_and_revision_identity_is_the_only_promoted_route(
     )
 
 
+def test_official_anonymous_request_keeps_byte_pinned_bloom_route(
+    tmp_path: Path, monkeypatch
+) -> None:
+    loaded = _identity_fixture(tmp_path, monkeypatch)
+    alias = "0123456789abcdef"
+    anonymous = _spec(
+        model=alias,
+        baseline_stats_path="/cache/baseline_stats_bloom.json",
+    )
+    assert anonymous.cached_model_dir == f"/cache/models/{alias}"
+    assert instruct._is_bloomz_promotion(
+        anonymous, loaded, instruct._BLOOMZ_PARAMS_B
+    )
+
+    negatives = [
+        _spec(model=alias),
+        _spec(
+            model="0123456789ABCDEf",
+            baseline_stats_path="/cache/baseline_stats_bloom.json",
+        ),
+        SimpleNamespace(
+            **{
+                **anonymous.__dict__,
+                "cached_model_dir": "/cache/models/bigscience--bloomz-560m",
+            }
+        ),
+    ]
+    for spec in negatives:
+        assert not instruct._is_bloomz_promotion(
+            spec, loaded, instruct._BLOOMZ_PARAMS_B
+        )
+
+
 def test_bloomz_recipe_is_exact(tmp_path: Path, monkeypatch) -> None:
     from forge.tasks import common
 
