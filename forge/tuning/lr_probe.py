@@ -87,14 +87,19 @@ def run_trial(
     warmup_steps: int = 0,
     data_offset: int = 0,
     out_step_losses: list[float] | None = None,
+    timing: dict[str, float] | None = None,
 ) -> float:
     """Train `opt_steps` optimizer steps at `lr`; return tail-median step loss.
 
     Prunes a diverging trial (rolling loss > 1.75x its best) early by returning inf.
+    When `timing` is given, accumulates steady-state wall time (excluding the
+    first optimizer step, which carries kernel compilation / cache warm-up)
+    into timing["secs"] / timing["steps"].
     """
     import torch
 
     model.train()
+    t_prev = None
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = optimizer_factory(params, lr)
     device = next(model.parameters()).device
@@ -121,6 +126,14 @@ def run_trial(
                 torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
+            if timing is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                now = time.perf_counter()
+                if t_prev is not None and opt_idx >= 2:
+                    timing["secs"] = timing.get("secs", 0.0) + (now - t_prev)
+                    timing["steps"] = timing.get("steps", 0) + 1
+                t_prev = now
             step_loss = micro_acc / max(1, micro_n)
             micro_acc, micro_n = 0.0, 0
             if opt_idx <= warm:
@@ -175,15 +188,18 @@ def lr_search(
     initial = _save_state(model)
     try:
         warm_losses: list[float] = []
+        timing: dict[str, float] = {"secs": 0.0, "steps": 0}
         t0 = time.perf_counter()
         run_trial(
             model, batches, lr=center_lr, opt_steps=WARMUP_STEPS, grad_accum=grad_accum,
             optimizer_factory=optimizer_factory, max_grad_norm=max_grad_norm,
-            autocast_bf16=autocast_bf16, warmup_steps=0, out_step_losses=warm_losses,
+            autocast_bf16=autocast_bf16, warmup_steps=0, out_step_losses=warm_losses, timing=timing,
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        t_per_step = (time.perf_counter() - t0) / WARMUP_STEPS
+        wall_per_step = (time.perf_counter() - t0) / WARMUP_STEPS
+        t_per_step = timing["secs"] / timing["steps"] if timing.get("steps", 0) >= 3 else wall_per_step
+        diag.update(t_per_step_wall=round(wall_per_step, 4))
         _restore_state(model, initial)
         factor, cdiag = curvature_factor(warm_losses)
         center = center_lr * factor
@@ -207,19 +223,20 @@ def lr_search(
                 break
             lg = center_log + off
             ts = time.perf_counter()
+            trial_timing: dict[str, float] = {"secs": 0.0, "steps": 0}
             loss = run_trial(
                 model, batches, lr=10**lg, opt_steps=steps, grad_accum=grad_accum,
                 optimizer_factory=optimizer_factory, max_grad_norm=max_grad_norm,
-                autocast_bf16=autocast_bf16, warmup_steps=PROBE_WARMUP,
+                autocast_bf16=autocast_bf16, warmup_steps=PROBE_WARMUP, timing=trial_timing,
             )
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             dt = time.perf_counter() - ts
             _restore_state(model, initial)
             scores[lg] = loss
-            if math.isfinite(loss):
-                timed_steps += steps
-                timed_secs += dt
+            if trial_timing.get("steps", 0) >= 3:
+                timed_steps += int(trial_timing["steps"])
+                timed_secs += float(trial_timing["secs"])
             log("lr_probe_trial", {"lr": 10**lg, "loss": loss, "steps": steps, "secs": round(dt, 1)})
             if off == +HALF_RANGE / 2 and not math.isfinite(loss):
                 break  # climbing diverged; no point going higher
