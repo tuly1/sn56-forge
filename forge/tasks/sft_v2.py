@@ -115,7 +115,11 @@ def choose_geometry(*, params_b: float, max_len: int, vocab: int, per_gpu_gb: fl
     if params_b > 3.5:
         tok_budget //= 2
     micro = max(1, min(64, tok_budget // max_len))
-    accum = max(1, math.ceil(EFF_BATCH_TARGET / micro))
+    try:
+        eff_target = int(os.environ.get("FORGE_V2_EFF_BATCH", str(EFF_BATCH_TARGET)))
+    except ValueError:
+        eff_target = EFF_BATCH_TARGET
+    accum = max(1, math.ceil(max(1, eff_target) / micro))
     gc_on = params_b >= 1.2
     if fp32_master:
         optim = "adamw_torch_fused"
