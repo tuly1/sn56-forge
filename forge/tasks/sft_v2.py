@@ -336,7 +336,8 @@ def run(
     pool = selection.SnapshotPool(k=8)
     stop_at = _StopAt(deadline, finish_reserve)
     state = {"best": float("inf"), "best_step": 0, "last_eval_at": time.monotonic(), "eval_every": eval_every,
-             "overfit": 0, "persisted_best": float("inf"), "persisted_step": 0, "eval_count": 0, "governed": False}
+             "overfit": 0, "persisted_best": float("inf"), "persisted_step": 0, "eval_count": 0, "governed": False,
+             "last_persist_at": 0.0}
     eval_bs = max(1, min(16, (16384 // max(1, max_len))))
     dev_rows_for_selection = dev_ex
 
@@ -379,10 +380,14 @@ def run(
             else:
                 state["overfit"] = 0
             admitted = pool.consider(m, loss, step)
-            if improved:
+            since_persist = time.monotonic() - state["last_persist_at"]
+            # Persist the new minimum unless we persisted very recently and the
+            # gain is tiny; the final save always lands the best weights anyway.
+            if improved and (since_persist > 120.0 or loss < state["persisted_best"] * 0.995 or state["persisted_best"] == float("inf")):
                 snap = pool.best()["state"] if (admitted and pool.best() and pool.best()["step"] == step) else selection.snapshot_trainable(m)
                 if persist(m, snap, step, ARTIFACT_PARTIAL_TRAINED_BEST, "dev_minimum"):
                     state["persisted_best"], state["persisted_step"] = loss, step
+                    state["last_persist_at"] = time.monotonic()
             telemetry.event("sft_v2_eval", step=step, dev_loss=round(loss, 6), best=round(state["best"], 6), eval_s=round(dt, 1),
                             pool=len(pool.items), improved=improved)
             # eval-time governor: keep evaluation under ~10% of the remaining window
