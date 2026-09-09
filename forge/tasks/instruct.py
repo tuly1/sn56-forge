@@ -630,6 +630,38 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             per_gpu_gb=per_gpu_gb,
         )
         return
+    from forge.tasks import sft_v2
+
+    if sft_v2.eligible(
+        spec, is_kl=is_kl, params_b=params_b, n_gpus=n_gpus, model=loaded.model
+    ):
+        try:
+            sft_v2.run(
+                spec,
+                deadline,
+                rows,
+                loaded,
+                tokenizer,
+                baseline_summary=baseline_summary,
+                params_b=params_b,
+                per_gpu_gb=per_gpu_gb,
+            )
+            return
+        except BaseException as exc:  # noqa: BLE001
+            telemetry.event(
+                "sft_v2_failed",
+                error=f"{type(exc).__name__}: {exc}",
+                remaining_s=round(deadline.remaining(), 1),
+            )
+            if sft_v2.trained_artifact_present(spec) or deadline.remaining() < 900:
+                # Keep whatever v2 already persisted (best dev checkpoint or
+                # the floor); there is no time for a second full recipe.
+                telemetry.write_into(spec.output_dir)
+                return
+            # Fresh model for the validated LoRA path.
+            loaded = load_base(spec.cached_model_dir, for_generation=False)
+            tokenizer = loaded.tokenizer
+            telemetry.event("sft_v2_fallback_to_lora")
     use_full = decide_full_finetune(
         use_kl=is_kl, params_b=params_b, n_gpus=n_gpus, per_gpu_gb=per_gpu_gb
     )

@@ -523,7 +523,7 @@ def _partial_truth(enabled: bool, step: int, reason: str) -> dict[str, Any]:
 def save_adapter(
     model: Any, tokenizer: Any, output_dir: str, *,
     artifact_truth: str | None = None, optimizer_step: int = 0,
-    truth_reason: str = "unspecified",
+    truth_reason: str = "unspecified", state_dict: Mapping[str, Any] | None = None,
 ) -> None:
     """Stage, validate, durably flush and promote a complete model artifact.
 
@@ -547,6 +547,10 @@ def save_adapter(
             # first child directory containing weights, which can upload `/ref`
             # instead of the trained root adapter. Export only the policy.
             save_kwargs["selected_adapters"] = ["default"]
+        if state_dict is not None:
+            # Full-weight export of a CPU snapshot (best checkpoint or soup)
+            # while the live model keeps training; tensors are already bf16.
+            save_kwargs["state_dict"] = dict(state_dict)
         model.save_pretrained(tmp, **save_kwargs)
         tokenizer.save_pretrained(tmp)
         _restore_base_architectures(tmp, model)
