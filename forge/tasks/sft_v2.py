@@ -56,7 +56,25 @@ MIN_TASK_SECONDS_FOR_V2 = 20 * 60
 
 
 def _log(name: str, payload: dict[str, Any] | None = None, **kw: Any) -> None:
-    telemetry.event(name, **(payload or {}), **kw)
+    _event_and_print(name, **(payload or {}), **kw)
+
+
+_orig_event = telemetry.event
+
+
+def _event_and_print(name: str, **kv: Any) -> None:
+    """Record the telemetry event and mirror v2 events to stderr so container
+    logs show the recipe's decisions (the JSON flight recorder is only visible
+    after the artifact is copied out)."""
+    _orig_event(name, **kv)
+    if name.startswith(("sft_v2", "lr_probe", "soup", "liger")):
+        try:
+            import sys
+
+            compact = {k: (round(v, 6) if isinstance(v, float) else v) for k, v in kv.items()}
+            print(f"[sft_v2] {name} {compact}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
 
 def eligible(spec: TaskSpec, *, is_kl: bool, params_b: float, n_gpus: int, model: Any) -> bool:
@@ -180,7 +198,7 @@ def run(
     t_start = time.monotonic()
     model = loaded.model
     loaded.model = None
-    telemetry.event("sft_v2_selected", params_b=round(params_b, 3), hours_remaining=round(deadline.remaining_hard() / 3600, 3))
+    _event_and_print("sft_v2_selected", params_b=round(params_b, 3), hours_remaining=round(deadline.remaining_hard() / 3600, 3))
 
     # ---- floor first: a valid untrained adapter at the output path ----
     emit_untrained_copy(spec)
@@ -206,7 +224,7 @@ def run(
     train_ex, dev_ex = stratified_split(tokenized, dev_n, seed=7)
     train_ex = [smart_truncate(ex, max_len) for ex in train_ex]
     dev_ex = [smart_truncate(ex, max_len) for ex in dev_ex]
-    telemetry.event(
+    _event_and_print(
         "sft_v2_data", rows=len(rows), tokenized=n_raw, deduped=len(tokenized), train_n=len(train_ex), dev_n=len(dev_ex),
         max_len=max_len, p50=sorted(lengths)[len(lengths) // 2], p99=sorted(lengths)[min(len(lengths) - 1, int(0.99 * len(lengths)))],
     )
@@ -230,7 +248,7 @@ def run(
 
             _apply_liger_kernel_to_instance(model=model)
         except Exception as exc:  # fused kernels are an optimisation, never a requirement
-            telemetry.event("liger_apply_failed", error=f"{type(exc).__name__}: {exc}")
+            _event_and_print("liger_apply_failed", error=f"{type(exc).__name__}: {exc}")
             use_liger = False
     autocast = geo.fp32_master and torch.cuda.is_available()
     if not torch.cuda.is_available():
@@ -288,11 +306,11 @@ def run(
                 batches.append({k: (v.detach().cpu() if hasattr(v, "detach") else v) for k, v in b.items() if k != "length"})
             lr, t_per_step, diag = lr_probe.lr_search(
                 model, batches, center_lr=prior_lr, budget_s=probe_budget, grad_accum=geo.grad_accum,
-                optimizer_factory=optimizer_factory, autocast_bf16=autocast, log=lambda n, d: telemetry.event(n, **_flat(d)),
+                optimizer_factory=optimizer_factory, autocast_bf16=autocast, log=lambda n, d: _event_and_print(n, **_flat(d)),
             )
         except Exception as exc:
             if _is_oom(exc):
-                telemetry.event("lr_probe_oom", micro=geo.micro_batch)
+                _event_and_print("lr_probe_oom", micro=geo.micro_batch)
                 _free_cuda()
                 geo = Geometry(max(1, geo.micro_batch // 2), geo.grad_accum * 2, geo.max_len, True, geo.fp32_master, geo.optim)
                 if hasattr(model, "gradient_checkpointing_enable"):
@@ -301,7 +319,7 @@ def run(
                         model.enable_input_require_grads()
                 lr, t_per_step = prior_lr, None
             else:
-                telemetry.event("lr_probe_failed", error=f"{type(exc).__name__}: {exc}")
+                _event_and_print("lr_probe_failed", error=f"{type(exc).__name__}: {exc}")
                 lr, t_per_step = prior_lr, None
     del probe_trainer, batches
     gc.collect()
@@ -321,7 +339,7 @@ def run(
                 train_ex = random_subsample(train_ex, target, seed=7)
                 train_ds = with_lengths(train_ex)
                 steps_per_epoch = max(1, len(train_ex) // geo.eff_batch)
-                telemetry.event("sft_v2_subsample", coverage=round(coverage, 3), kept=len(train_ex))
+                _event_and_print("sft_v2_subsample", coverage=round(coverage, 3), kept=len(train_ex))
                 achievable = train_window * 0.85 / t_per_step
         max_epochs = 4.0 if len(train_ex) < 10000 else 3.0
         epochs = round(max(1.0, min(max_epochs, 1.25 * achievable / steps_per_epoch)), 2)
@@ -330,7 +348,7 @@ def run(
     total_steps = int(steps_per_epoch * epochs)
     warmup = min(200, max(10, int(0.03 * total_steps)))
     eval_every = max(20, steps_per_epoch // 8)
-    telemetry.event(
+    _event_and_print(
         "sft_v2_plan", lr=lr, prior_lr=prior_lr, t_per_step=t_per_step, epochs=epochs, steps_per_epoch=steps_per_epoch,
         total_steps=total_steps, warmup=warmup, eval_every=eval_every, train_window_s=round(train_window, 1),
         finish_reserve_s=round(finish_reserve, 1), **_flat({"probe": diag}),
@@ -355,7 +373,7 @@ def run(
                          state_dict=cpu_state)
             return True
         except Exception as exc:
-            telemetry.event("sft_v2_persist_failed", step=step, error=f"{type(exc).__name__}: {exc}")
+            _event_and_print("sft_v2_persist_failed", step=step, error=f"{type(exc).__name__}: {exc}")
             return False
 
     class SelectCallback(TrainerCallback):
@@ -379,7 +397,7 @@ def run(
             elif loss > state["best"] * 1.05:
                 state["overfit"] += 1
                 if state["overfit"] >= 3:
-                    telemetry.event("sft_v2_early_stop", step=step, best=state["best"], best_step=state["best_step"])
+                    _event_and_print("sft_v2_early_stop", step=step, best=state["best"], best_step=state["best_step"])
                     control.should_training_stop = True
             else:
                 state["overfit"] = 0
@@ -392,7 +410,7 @@ def run(
                 if persist(m, snap, step, ARTIFACT_PARTIAL_TRAINED_BEST, "dev_minimum"):
                     state["persisted_best"], state["persisted_step"] = loss, step
                     state["last_persist_at"] = time.monotonic()
-            telemetry.event("sft_v2_eval", step=step, dev_loss=round(loss, 6), best=round(state["best"], 6), eval_s=round(dt, 1),
+            _event_and_print("sft_v2_eval", step=step, dev_loss=round(loss, 6), best=round(state["best"], 6), eval_s=round(dt, 1),
                             pool=len(pool.items), improved=improved)
             # eval-time governor: keep evaluation under ~10% of the remaining window
             if not state["governed"]:
@@ -402,7 +420,7 @@ def run(
                 remaining_steps = max(1, total_steps - step)
                 widened = max(state["eval_every"], remaining_steps // max_evals)
                 if widened > state["eval_every"]:
-                    telemetry.event("sft_v2_eval_governor", eval_every=widened, eval_s=round(dt, 1))
+                    _event_and_print("sft_v2_eval_governor", eval_every=widened, eval_s=round(dt, 1))
                     state["eval_every"] = widened
             return control
 
@@ -410,14 +428,14 @@ def run(
         model=model, args=make_args(epochs, lr, warmup, geo.micro_batch, geo.grad_accum), train_dataset=train_ds,
         data_collator=collator, callbacks=[SelectCallback(), telemetry.make_trainer_callback(spec.output_dir)],
     )
-    telemetry.event("sft_v2_train_start", elapsed_s=round(time.monotonic() - t_start, 1))
+    _event_and_print("sft_v2_train_start", elapsed_s=round(time.monotonic() - t_start, 1))
     try:
         trainer.train()
     except Exception as exc:
         if not _is_oom(exc):
             raise
         step = int(getattr(trainer.state, "global_step", 0) or 0)
-        telemetry.event("sft_v2_train_oom", step=step, micro=geo.micro_batch)
+        _event_and_print("sft_v2_train_oom", step=step, micro=geo.micro_batch)
         if step == 0 and geo.micro_batch > 1:
             _free_cuda()
             geo = Geometry(max(1, geo.micro_batch // 2), geo.grad_accum * 2, geo.max_len, True, geo.fp32_master, geo.optim)
@@ -431,7 +449,7 @@ def run(
         elif step == 0:
             raise
     final_step = int(getattr(trainer.state, "global_step", 0) or 0)
-    telemetry.event("sft_v2_train_end", step=final_step, best=state["best"], best_step=state["best_step"],
+    _event_and_print("sft_v2_train_end", step=final_step, best=state["best"], best_step=state["best_step"],
                     remaining_s=round(deadline.remaining_hard(), 1))
     if final_step <= 0:
         return
@@ -452,7 +470,7 @@ def run(
     if pool.items and dev_rows_for_selection:
         try:
             soup_loss, soup_state, members = selection.greedy_soup(
-                model, pool, eval_dev, time_budget_s=soup_budget, log=lambda n, d: telemetry.event(n, **_flat(d))
+                model, pool, eval_dev, time_budget_s=soup_budget, log=lambda n, d: _event_and_print(n, **_flat(d))
             )
             if soup_state is not None and soup_loss <= chosen_loss + 1e-9:
                 chosen_state, chosen_loss, chosen_step = soup_state, soup_loss, final_step if members > 1 else pool.best()["step"]
@@ -461,7 +479,7 @@ def run(
                 selection.load_state(model, chosen_state)
                 chosen_loss, chosen_step = pool.best()["loss"], pool.best()["step"]
         except Exception as exc:
-            telemetry.event("sft_v2_soup_failed", error=f"{type(exc).__name__}: {exc}")
+            _event_and_print("sft_v2_soup_failed", error=f"{type(exc).__name__}: {exc}")
             if pool.best() is not None:
                 chosen_state = pool.best()["state"]
                 selection.load_state(model, chosen_state)
@@ -475,9 +493,9 @@ def run(
         try:
             _dev_pass(model, dev_ex, collator, lr=lr * 0.25, geo=geo, autocast=autocast, optimizer_factory=optimizer_factory)
             chosen_state = None  # weights in the model are now the final ones
-            telemetry.event("sft_v2_dev_pass_done", rows=len(dev_ex), lr=lr * 0.25)
+            _event_and_print("sft_v2_dev_pass_done", rows=len(dev_ex), lr=lr * 0.25)
         except Exception as exc:
-            telemetry.event("sft_v2_dev_pass_failed", error=f"{type(exc).__name__}: {exc}")
+            _event_and_print("sft_v2_dev_pass_failed", error=f"{type(exc).__name__}: {exc}")
             if pool.best() is not None:
                 chosen_state = pool.best()["state"]
                 selection.load_state(model, chosen_state)
@@ -486,7 +504,7 @@ def run(
     truth = ARTIFACT_COMPLETE_BEST if final_step >= int(getattr(trainer.state, "max_steps", 0) or 0) else ARTIFACT_PARTIAL_TRAINED_BEST
     final_state = chosen_state if chosen_state is not None else selection.snapshot_trainable(model)
     ok = persist(model, final_state, chosen_step or final_step, truth, "sft_v2_final")
-    telemetry.event("sft_v2_final", saved=ok, chosen_loss=chosen_loss, chosen_step=chosen_step, truth=truth,
+    _event_and_print("sft_v2_final", saved=ok, chosen_loss=chosen_loss, chosen_step=chosen_step, truth=truth,
                     remaining_s=round(deadline.remaining_hard(), 1))
     telemetry.write_into(spec.output_dir)
 
