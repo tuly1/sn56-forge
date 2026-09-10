@@ -35,6 +35,7 @@ from forge.data.schema import TaskSpec
 from forge.model import (
     attach_lora,
     conservative_qwen35_plan,
+    is_qwen35_model,
     conservative_quasar_plan,
     decide_full_finetune,
     effective_sft_seq_len,
@@ -632,7 +633,20 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         return
     from forge.tasks import sft_v2
 
-    if sft_v2.eligible(
+    # Production-pinned routes keep their models unless v2 has beaten them on the harness:
+    # Qwen3.5 (conservative geometry + fixed-average endpoint) and Granite 4.1 (one-epoch cap)
+    # stay on production; LFM2.5 is released to v2 once its batch-16 adapter arm wins.
+    from forge.tuning import granite41_epoch_cap as _g41
+    from forge.tuning import lfm25_epoch_cap as _lfm25
+
+    pinned_route = (
+        is_qwen35_model(loaded.model)
+        or _g41._supported_model_route(spec)
+        or (_lfm25._supported_model_route(spec) and not sft_v2.V2_TAKES_LFM25)
+    )
+    if pinned_route:
+        telemetry.event("sft_v2_pinned_route_skip", model=spec.model)
+    if not pinned_route and sft_v2.eligible(
         spec, is_kl=is_kl, params_b=params_b, n_gpus=n_gpus, model=loaded.model
     ):
         try:

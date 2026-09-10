@@ -59,6 +59,9 @@ DEFAULT_MAX_PARAMS_B = 0.6
 # Gemma-2-2B clean (-3.3%), pruned (-6.4%) and noise-damaged (-2.6%) bases against
 # production at effective batch 16; LFM/Qwen confirmations pending at commit time.
 DEFAULT_LORA_MAX_PARAMS_B = 5.0
+# LFM2.5-2.6B has a production one-epoch-cap route (2nd live on Sept 7); v2 takes it only
+# once the batch-16 adapter arm beats that route on the harness.
+V2_TAKES_LFM25 = False
 
 
 def _gates() -> tuple[float, float]:
