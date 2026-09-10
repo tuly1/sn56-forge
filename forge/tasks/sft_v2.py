@@ -133,32 +133,34 @@ def estimate_train_gb(*, params_b: float, tokens: int, layers: int, hidden: int,
 
 def choose_geometry(*, params_b: float, max_len: int, vocab: int, per_gpu_gb: float, bnb_ok: bool,
                     layers: int = 32, hidden: int = 2048, liger: bool = False) -> Geometry:
+    """Geometry from measured behaviour (H100, Gemma-2-2B, 2026-09-10 benchmark):
+    checkpointing with a large micro-batch (8 x 3136 tokens) ran at 5.7 samples/s
+    while no-checkpointing at micro 2 crawled at 1.9 samples/s from memory
+    pressure. So: models >= 0.8B train with checkpointing and a token budget per
+    micro-batch of ~24k (fp32 master) / ~48k (bf16 + 8-bit Adam); tiny models skip
+    checkpointing. The memory-shape probe below still shrinks anything that does
+    not fit."""
     fp32_master = params_b <= FP32_MASTER_MAX_B
-    if vocab >= 200_000:
-        tok_budget = 6144 if fp32_master else 8192
-    elif vocab >= 100_000:
-        tok_budget = 12288
+    gc_on = params_b >= 0.8
+    if gc_on:
+        tok_budget = 24576 if fp32_master else 49152
+        if vocab >= 200_000 and not liger:
+            tok_budget //= 3
+        elif vocab >= 200_000:
+            tok_budget = int(tok_budget * 0.75)
     else:
-        tok_budget = 16384
-    if params_b > 3.5:
-        tok_budget //= 2
+        tok_budget = 16384 if vocab < 100_000 else 8192
+    if params_b > 4.0:
+        tok_budget = int(tok_budget * 0.75)
     micro = max(1, min(64, tok_budget // max_len))
     try:
         eff_target = int(os.environ.get("FORGE_V2_EFF_BATCH", str(EFF_BATCH_TARGET)))
     except ValueError:
         eff_target = EFF_BATCH_TARGET
-    budget = 0.82 * (per_gpu_gb if per_gpu_gb > 0 else 80.0)
-    # Prefer no checkpointing (30% faster) when the estimate fits; shrink the
-    # micro-batch before giving in to checkpointing.
-    gc_on = True
-    for cand in (micro, max(1, micro // 2)):
-        est = estimate_train_gb(params_b=params_b, tokens=cand * max_len, layers=layers, hidden=hidden, vocab=vocab,
-                                fp32_master=fp32_master, gradient_checkpointing=False, liger=liger)
-        if est <= budget:
-            micro, gc_on = cand, False
-            break
     if os.environ.get("FORGE_V2_GC") == "1":
         gc_on = True
+    elif os.environ.get("FORGE_V2_GC") == "0":
+        gc_on = False
     accum = max(1, math.ceil(max(1, eff_target) / micro))
     if fp32_master:
         optim = "adamw_torch_fused"
