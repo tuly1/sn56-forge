@@ -55,6 +55,35 @@ MAX_PARAMS_B = 5.0  # hard ceiling of the handler (memory / throughput)
 # 2-3B model tried. Larger models stay on the production adapter path unless the
 # operator widens the gate with FORGE_V2_MAX_PARAMS_B.
 DEFAULT_MAX_PARAMS_B = 0.6
+# Adapter (LoRA) strategy inside v2 for larger models: off by default until the
+# batch-16 LoRA arms beat production (2026-09-10 evening decision).
+DEFAULT_LORA_MAX_PARAMS_B = 0.0
+
+
+def _gates() -> tuple[float, float]:
+    try:
+        full_b = float(os.environ.get("FORGE_V2_MAX_PARAMS_B", str(DEFAULT_MAX_PARAMS_B)))
+    except ValueError:
+        full_b = DEFAULT_MAX_PARAMS_B
+    try:
+        lora_b = float(os.environ.get("FORGE_V2_LORA_MAX_PARAMS_B", str(DEFAULT_LORA_MAX_PARAMS_B)))
+    except ValueError:
+        lora_b = DEFAULT_LORA_MAX_PARAMS_B
+    return min(full_b, MAX_PARAMS_B), min(lora_b, MAX_PARAMS_B)
+
+
+def strategy_for(params_b: float) -> str:
+    """'full' inside the full-weight gate, 'lora' inside the adapter gate, else ''.
+    FORGE_V2_STRATEGY=full|lora forces a strategy (harness use)."""
+    forced = os.environ.get("FORGE_V2_STRATEGY", "auto").strip().lower()
+    if forced in ("full", "lora"):
+        return forced
+    full_b, lora_b = _gates()
+    if 0 < params_b <= full_b:
+        return "full"
+    if 0 < params_b <= lora_b:
+        return "lora"
+    return ""
 FP32_MASTER_MAX_B = 3.3
 EXPORT_RESERVE_S = 150.0
 MIN_TASK_SECONDS_FOR_V2 = 20 * 60
@@ -88,13 +117,8 @@ def eligible(spec: TaskSpec, *, is_kl: bool, params_b: float, n_gpus: int, model
     if spec.task_type != "InstructTextTask" or spec.instruct is None or is_kl:
         return False
     allow_cpu = os.environ.get("FORGE_SFT_V2_ALLOW_CPU") == "1"
-    try:
-        max_b = float(os.environ.get("FORGE_V2_MAX_PARAMS_B", str(DEFAULT_MAX_PARAMS_B)))
-    except ValueError:
-        max_b = DEFAULT_MAX_PARAMS_B
-    max_b = min(max_b, MAX_PARAMS_B)
-    if params_b <= 0 or params_b > max_b:
-        telemetry.event("sft_v2_size_gated", params_b=round(params_b, 3), max_params_b=max_b)
+    if params_b <= 0 or params_b > MAX_PARAMS_B or not strategy_for(params_b):
+        telemetry.event("sft_v2_size_gated", params_b=round(params_b, 3), gates=_gates())
         return False
     if n_gpus != 1 and not (allow_cpu and n_gpus == 0):
         return False
@@ -322,9 +346,7 @@ def run(
         except Exception as exc:  # fused kernels are an optimisation, never a requirement
             _event_and_print("liger_apply_failed", error=f"{type(exc).__name__}: {exc}")
             use_liger = False
-    strategy = os.environ.get("FORGE_V2_STRATEGY", "full").strip().lower()
-    if strategy not in ("full", "lora"):
-        strategy = "full"
+    strategy = strategy_for(params_b) or "full"
     geo = choose_geometry(params_b=params_b, max_len=max_len, vocab=vocab, per_gpu_gb=per_gpu_gb, bnb_ok=_bnb_available(),
                           layers=layers, hidden=hidden, liger=use_liger)
     if strategy == "lora":
