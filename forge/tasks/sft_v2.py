@@ -55,9 +55,10 @@ MAX_PARAMS_B = 5.0  # hard ceiling of the handler (memory / throughput)
 # 2-3B model tried. Larger models stay on the production adapter path unless the
 # operator widens the gate with FORGE_V2_MAX_PARAMS_B.
 DEFAULT_MAX_PARAMS_B = 0.6
-# Adapter (LoRA) strategy inside v2 for larger models: off by default until the
-# batch-16 LoRA arms beat production (2026-09-10 evening decision).
-DEFAULT_LORA_MAX_PARAMS_B = 0.0
+# Adapter (LoRA) strategy inside v2 for larger models, validated 2026-09-10 on
+# Gemma-2-2B clean (-3.3%), pruned (-6.4%) and noise-damaged (-2.6%) bases against
+# production at effective batch 16; LFM/Qwen confirmations pending at commit time.
+DEFAULT_LORA_MAX_PARAMS_B = 5.0
 
 
 def _gates() -> tuple[float, float]:
