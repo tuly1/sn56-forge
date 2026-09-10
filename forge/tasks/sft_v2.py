@@ -50,7 +50,7 @@ from forge.tuning import lr_probe, selection
 EVAL_CAP = 4096
 EFF_BATCH_TARGET = 64
 MAX_PARAMS_B = 5.0
-FP32_MASTER_MAX_B = 2.6
+FP32_MASTER_MAX_B = 3.3
 EXPORT_RESERVE_S = 150.0
 MIN_TASK_SECONDS_FOR_V2 = 20 * 60
 
