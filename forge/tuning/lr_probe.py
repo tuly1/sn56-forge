@@ -171,6 +171,43 @@ def run_trial(
     return tail[n // 2] if n % 2 else 0.5 * (tail[n // 2 - 1] + tail[n // 2])
 
 
+def measure_step_time(
+    model: Any, batches: list[dict[str, Any]], *, lr: float, grad_accum: int, optimizer_factory: Callable[[list, float], Any],
+    autocast_bf16: bool, max_grad_norm: float = 1.0, steps: int = 3,
+) -> tuple[float | None, list[float]]:
+    """Seconds per optimizer step at steady state (fastest of the timed
+    intervals; the first step carries kernel warm-up) and the step losses.
+    Weights are restored afterwards."""
+    import torch
+
+    if not batches:
+        return None, []
+    initial = _save_state(model)
+    losses: list[float] = []
+    timing: dict[str, Any] = {"secs": 0.0, "steps": 0}
+    try:
+        run_trial(
+            model, batches, lr=lr, opt_steps=steps, grad_accum=grad_accum, optimizer_factory=optimizer_factory,
+            max_grad_norm=max_grad_norm, autocast_bf16=autocast_bf16, warmup_steps=0, out_step_losses=losses, timing=timing,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        iv = timing.get("intervals") or []
+        return (min(iv) if iv else None), losses
+    finally:
+        try:
+            _restore_state(model, initial)
+        except Exception:
+            pass
+        del initial
+        try:
+            model.zero_grad(set_to_none=True)
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def select_edge(scores: dict[float, float], tolerance: float = EDGE_TOLERANCE) -> tuple[float, float]:
     finite = {k: v for k, v in scores.items() if math.isfinite(v)}
     if not finite:
@@ -192,9 +229,12 @@ def lr_search(
     autocast_bf16: bool,
     log: Callable[[str, dict], None],
     max_grad_norm: float = 1.0,
+    known_t_per_step: float | None = None,
 ) -> tuple[float, float | None, dict[str, Any]]:
     """Return (lr, seconds_per_optimizer_step, diagnostics). Never raises on OOM
-    of the probes themselves; the caller decides what to do with the estimate."""
+    of the probes themselves; the caller decides what to do with the estimate.
+    With `known_t_per_step` (from measure_step_time at the final geometry) the
+    sweep is sized directly and no extra timing steps are spent."""
     import torch
 
     diag: dict[str, Any] = {"center_lr_prior": center_lr, "budget_s": round(budget_s, 1)}
@@ -205,6 +245,44 @@ def lr_search(
         warm_losses: list[float] = []
         timing: dict[str, float] = {"secs": 0.0, "steps": 0}
         t0 = time.perf_counter()
+        if known_t_per_step:
+            t_per_step = known_t_per_step
+            n_probes = 4 if budget_s >= 4 * 25 * t_per_step else 3
+            steps = max(15, min(100, int(budget_s / (n_probes * t_per_step))))
+            if n_probes * 15 * t_per_step > budget_s:
+                diag.update(mode="skip_no_budget", t_per_step=round(t_per_step, 4), steps=steps)
+                log("lr_probe", diag)
+                return center_lr, t_per_step, diag
+            center = center_lr
+            offsets = [0.0, -HALF_RANGE, +HALF_RANGE] if n_probes == 3 else [0.0, -HALF_RANGE, +HALF_RANGE / 2, +HALF_RANGE]
+            center_log = math.log10(center)
+            scores: dict[float, float] = {}
+            for off in offsets:
+                if (time.perf_counter() - t0) + steps * t_per_step > budget_s and scores:
+                    break
+                lg = center_log + off
+                ts = time.perf_counter()
+                loss = run_trial(
+                    model, batches, lr=10**lg, opt_steps=steps, grad_accum=grad_accum,
+                    optimizer_factory=optimizer_factory, max_grad_norm=max_grad_norm,
+                    autocast_bf16=autocast_bf16, warmup_steps=PROBE_WARMUP,
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _restore_state(model, initial)
+                scores[lg] = loss
+                log("lr_probe_trial", {"lr": 10**lg, "loss": loss, "steps": steps, "secs": round(time.perf_counter() - ts, 1)})
+                if off == +HALF_RANGE / 2 and not math.isfinite(loss):
+                    break
+            try:
+                lr, best = select_edge(scores)
+                diag.update(mode="sweep", steps=steps, scores={f"{10**k:.3e}": v for k, v in scores.items()},
+                            selected_lr=lr, selected_loss=best, t_per_step=round(t_per_step, 4))
+            except ValueError:
+                lr = center
+                diag.update(mode="sweep_all_diverged", selected_lr=lr)
+            log("lr_probe", diag)
+            return lr, t_per_step, diag
         # Two cheap steps first: if a step is slow, a long warmup would eat the
         # budget the sweep needs, so scale the warmup length to the budget.
         run_trial(

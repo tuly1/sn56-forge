@@ -418,6 +418,9 @@ def run(
     else:
         prior_lr = lr_probe.analytic_lr(weight_rms=_layer_weight_rms(model) or median_weight_rms(model), params_b=params_b,
                                         eff_batch=geo.eff_batch, gradient_noise_scale=gns)
+        # the analytic law under-shoots the field by ~7x on Gemma-2-2B (2e-5 vs
+        # the champion's 7.5e-5 bucket); anchor the prior to the bucket, the sweep decides
+        prior_lr = max(prior_lr, 0.5 * lr_probe.size_cap_lr(params_b))
 
     try:
         _lr_override = float(os.environ.get("FORGE_V2_LR", "") or 0.0)
@@ -468,10 +471,18 @@ def run(
             import random as _random
 
             _random.Random(11).shuffle(batches)  # the sampler front-loads the longest rows; timing needs a representative mix
-            lr, t_per_step, diag = lr_probe.lr_search(
-                model, batches, center_lr=prior_lr, budget_s=probe_budget, grad_accum=geo.grad_accum,
-                optimizer_factory=optimizer_factory, autocast_bf16=autocast, log=lambda n, d: _event_and_print(n, **_flat(d)),
+            # 1) timing at the initial geometry (3 steps), guarding against a blow-up
+            t_micro, warm = lr_probe.measure_step_time(
+                model, batches, lr=prior_lr, grad_accum=geo.grad_accum, optimizer_factory=optimizer_factory, autocast_bf16=autocast,
             )
+            if len(warm) >= 2 and all(math.isfinite(x) for x in warm[:2]) and warm[1] > 1.5 * warm[0]:
+                _event_and_print("lr_probe_blowup", losses=[round(x, 4) for x in warm[:3]], prior_lr=prior_lr)
+                prior_lr *= 0.3
+                lr = prior_lr
+            t_per_step = t_micro
+            _event_and_print("sft_v2_timing", t_per_step=round(t_per_step, 4) if t_per_step else None, eff_batch=geo.eff_batch,
+                             losses=[round(x, 4) for x in warm[:3]])
+            # 2) batch adaptation (below) needs the timing; 3) the sweep runs after it at the final geometry
         except Exception as exc:
             if _is_oom(exc):
                 _event_and_print("lr_probe_oom", micro=geo.micro_batch)
@@ -485,7 +496,7 @@ def run(
             else:
                 _event_and_print("lr_probe_failed", error=f"{type(exc).__name__}: {exc}")
                 lr, t_per_step = prior_lr, None
-    del probe_trainer, batches
+    del probe_trainer
     gc.collect()
     _free_cuda()
 
@@ -495,10 +506,14 @@ def run(
         window0 = deadline.remaining_hard() - (EXPORT_RESERVE_S + 2.0 * _estimate_eval_seconds(len(dev_ex), t_per_step, geo)
                                                 + _dev_pass_estimate(len(dev_ex), t_per_step, geo))
         affordable = max(0.0, window0) * 0.85 * samples_per_s
+        # update budget by strategy: production's adapter takes ~575 updates at batch
+        # 16 on a 45-min task; the champion's full fine-tune takes ~300 at batch 64
+        # (watcher archive, Sept 7 uploads) — full weights want the larger batch
+        default_updates = 500 if strategy == "lora" else 200
         try:
-            min_updates = int(os.environ.get("FORGE_V2_MIN_UPDATES", "500"))
+            min_updates = int(os.environ.get("FORGE_V2_MIN_UPDATES", str(default_updates)))
         except ValueError:
-            min_updates = 500
+            min_updates = default_updates
         eff_new = int(affordable / max(1, min_updates))
         eff_new = max(16, min(geo.eff_batch, eff_new))
         eff_new = max(geo.micro_batch, (eff_new // geo.micro_batch) * geo.micro_batch)
@@ -509,6 +524,25 @@ def run(
             t_per_step = t_per_step * eff_new / geo.eff_batch
             lr = lr * scale
             geo = Geometry(geo.micro_batch, eff_new // geo.micro_batch, geo.max_len, geo.gradient_checkpointing, geo.fp32_master, geo.optim)
+
+    # ---- learning-rate sweep at the final geometry ----
+    if batches and t_per_step and _lr_override <= 0 and deadline.remaining_hard() > MIN_TASK_SECONDS_FOR_V2:
+        try:
+            sweep_budget = min(0.15 * deadline.remaining_hard(), 480.0)
+            lr, t_sw, diag = lr_probe.lr_search(
+                model, batches, center_lr=lr, budget_s=sweep_budget, grad_accum=geo.grad_accum,
+                optimizer_factory=optimizer_factory, autocast_bf16=autocast, log=lambda n, d: _event_and_print(n, **_flat(d)),
+                known_t_per_step=t_per_step,
+            )
+        except Exception as exc:
+            if _is_oom(exc):
+                _event_and_print("lr_sweep_oom", micro=geo.micro_batch)
+                _free_cuda()
+            else:
+                _event_and_print("lr_sweep_failed", error=f"{type(exc).__name__}: {exc}")
+    del batches
+    gc.collect()
+    _free_cuda()
 
     # ---- planning constants ----
     dev_eval_est = _estimate_eval_seconds(len(dev_ex), t_per_step, geo)
