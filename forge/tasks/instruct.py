@@ -647,7 +647,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     if pinned_route:
         telemetry.event("sft_v2_pinned_route_skip", model=spec.model)
     short_rows = False
-    if not pinned_route and sft_v2.strategy_for(params_b) == "lora":
+    _mt = str(getattr(getattr(loaded.model, "config", None), "model_type", "") or "")
+    if not pinned_route and sft_v2.strategy_for(params_b, _mt) == "lora":
         is_long, median_len = sft_v2.long_row_task(rows, spec, tokenizer)
         short_rows = not is_long
         telemetry.event("sft_v2_row_length_gate", median_tokens=median_len, long_rows=is_long)

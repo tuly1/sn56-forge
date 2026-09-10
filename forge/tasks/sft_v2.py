@@ -106,13 +106,25 @@ def long_row_task(rows: list, spec: TaskSpec, tokenizer: Any, *, sample: int = 5
     return med >= thr, med
 
 
-def strategy_for(params_b: float) -> str:
-    """'full' inside the full-weight gate, 'lora' inside the adapter gate, else ''.
-    FORGE_V2_STRATEGY=full|lora forces a strategy (harness use)."""
+# Model families that take full weights up to MAX_PARAMS_B regardless of the size gate
+# (harness-validated per family; empty until a family beats production).
+FULL_FT_MODEL_TYPES: frozenset[str] = frozenset()
+
+
+def _full_ft_types() -> frozenset[str]:
+    extra = {t.strip().lower() for t in os.environ.get("FORGE_V2_FULL_TYPES", "").split(",") if t.strip()}
+    return FULL_FT_MODEL_TYPES | frozenset(extra)
+
+
+def strategy_for(params_b: float, model_type: str | None = None) -> str:
+    """'full' inside the full-weight gate (or for a validated family), 'lora'
+    inside the adapter gate, else ''. FORGE_V2_STRATEGY=full|lora forces one."""
     forced = os.environ.get("FORGE_V2_STRATEGY", "auto").strip().lower()
     if forced in ("full", "lora"):
         return forced
     full_b, lora_b = _gates()
+    if model_type and str(model_type).lower() in _full_ft_types() and 0 < params_b <= MAX_PARAMS_B:
+        return "full"
     if 0 < params_b <= full_b:
         return "full"
     if 0 < params_b <= lora_b:
@@ -151,7 +163,8 @@ def eligible(spec: TaskSpec, *, is_kl: bool, params_b: float, n_gpus: int, model
     if spec.task_type != "InstructTextTask" or spec.instruct is None or is_kl:
         return False
     allow_cpu = os.environ.get("FORGE_SFT_V2_ALLOW_CPU") == "1"
-    if params_b <= 0 or params_b > MAX_PARAMS_B or not strategy_for(params_b):
+    model_type = str(getattr(getattr(model, "config", None), "model_type", "") or "")
+    if params_b <= 0 or params_b > MAX_PARAMS_B or not strategy_for(params_b, model_type):
         telemetry.event("sft_v2_size_gated", params_b=round(params_b, 3), gates=_gates())
         return False
     if n_gpus != 1 and not (allow_cpu and n_gpus == 0):
@@ -381,7 +394,7 @@ def run(
         except Exception as exc:  # fused kernels are an optimisation, never a requirement
             _event_and_print("liger_apply_failed", error=f"{type(exc).__name__}: {exc}")
             use_liger = False
-    strategy = strategy_for(params_b) or "full"
+    strategy = strategy_for(params_b, str(getattr(getattr(model, "config", None), "model_type", "") or "")) or "full"
     # adapters train at production's proven effective batch 16 (LFM: 875 updates/epoch at
     # batch 16 beat 178 at batch 76); full weights follow the champion's batch 64
     geo = choose_geometry(params_b=params_b, max_len=max_len, vocab=vocab, per_gpu_gb=per_gpu_gb, bnb_ok=_bnb_available(),
