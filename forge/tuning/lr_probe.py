@@ -147,6 +147,7 @@ def run_trial(
                 if t_prev is not None and opt_idx >= 2:
                     timing["secs"] = timing.get("secs", 0.0) + (now - t_prev)
                     timing["steps"] = timing.get("steps", 0) + 1
+                    timing.setdefault("intervals", []).append(now - t_prev)
                 t_prev = now
             step_loss = micro_acc / max(1, micro_n)
             micro_acc, micro_n = 0.0, 0
@@ -207,14 +208,15 @@ def lr_search(
         # Two cheap steps first: if a step is slow, a long warmup would eat the
         # budget the sweep needs, so scale the warmup length to the budget.
         run_trial(
-            model, batches, lr=center_lr, opt_steps=2, grad_accum=grad_accum,
+            model, batches, lr=center_lr, opt_steps=3, grad_accum=grad_accum,
             optimizer_factory=optimizer_factory, max_grad_norm=max_grad_norm,
             autocast_bf16=autocast_bf16, warmup_steps=0, out_step_losses=warm_losses, timing=timing,
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        probe_step = (time.perf_counter() - t0) / 2.0
-        steady = timing["secs"] / timing["steps"] if timing.get("steps", 0) >= 1 else probe_step
+        probe_step = (time.perf_counter() - t0) / 3.0
+        # steady state = the fastest of the timed steps (later steps still pay kernel autotuning for new shapes)
+        steady = min(timing["intervals"]) if timing.get("intervals") else probe_step
         if 3 * 15 * steady > budget_s - (time.perf_counter() - t0):
             # Short task: no sweep is affordable, so do not spend the warmup
             # budget either. Keep the prior, guard only against a blow-up.
@@ -225,16 +227,16 @@ def lr_search(
                         warm_losses=[round(x, 4) for x in warm_losses[:2]], center_lr_adjusted=center_lr * factor)
             log("lr_probe", diag)
             return center_lr * factor, steady, diag
-        extra = max(1, min(WARMUP_STEPS - 2, int(0.25 * budget_s / max(probe_step, 1e-3))))
+        extra = max(1, min(WARMUP_STEPS - 3, int(0.25 * budget_s / max(probe_step, 1e-3))))
         _restore_state(model, initial)
         run_trial(
             model, batches, lr=center_lr, opt_steps=extra + 1, grad_accum=grad_accum,
             optimizer_factory=optimizer_factory, max_grad_norm=max_grad_norm,
-            autocast_bf16=autocast_bf16, warmup_steps=0, out_step_losses=warm_losses, timing=timing, data_offset=2 * grad_accum,
+            autocast_bf16=autocast_bf16, warmup_steps=0, out_step_losses=warm_losses, timing=timing, data_offset=3 * grad_accum,
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        wall_per_step = (time.perf_counter() - t0) / (3 + extra)
+        wall_per_step = (time.perf_counter() - t0) / (4 + extra)
         t_per_step = timing["secs"] / timing["steps"] if timing.get("steps", 0) >= 3 else wall_per_step
         diag.update(t_per_step_wall=round(wall_per_step, 4))
         _restore_state(model, initial)

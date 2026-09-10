@@ -378,7 +378,10 @@ def run(
     except Exception:
         gns = None
     if strategy == "lora":
-        prior_lr = 2.0e-4  # production adapter LR neighbourhood; the sweep explores +/-0.3 decades
+        # production trains the adapter at 1.5e-4 with effective batch 16; the prior
+        # sits just above it and scales with sqrt(batch) (the Smol sweep chose
+        # 4.4e-4 at batch 84, consistent with this law).
+        prior_lr = 2.0e-4 * math.sqrt(max(1, geo.eff_batch) / 16.0)
     else:
         prior_lr = lr_probe.analytic_lr(weight_rms=_layer_weight_rms(model) or median_weight_rms(model), params_b=params_b,
                                         eff_batch=geo.eff_batch, gradient_noise_scale=gns)
@@ -460,9 +463,9 @@ def run(
                                                 + _dev_pass_estimate(len(dev_ex), t_per_step, geo))
         affordable = max(0.0, window0) * 0.85 * samples_per_s
         try:
-            min_updates = int(os.environ.get("FORGE_V2_MIN_UPDATES", "160"))
+            min_updates = int(os.environ.get("FORGE_V2_MIN_UPDATES", "500"))
         except ValueError:
-            min_updates = 160
+            min_updates = 500
         eff_new = int(affordable / max(1, min_updates))
         eff_new = max(16, min(geo.eff_batch, eff_new))
         eff_new = max(geo.micro_batch, (eff_new // geo.micro_batch) * geo.micro_batch)
@@ -476,7 +479,8 @@ def run(
 
     # ---- planning constants ----
     dev_eval_est = _estimate_eval_seconds(len(dev_ex), t_per_step, geo)
-    finish_reserve = EXPORT_RESERVE_S + 2.0 * dev_eval_est + _dev_pass_estimate(len(dev_ex), t_per_step, geo)
+    export_reserve = 60.0 if strategy == "lora" else EXPORT_RESERVE_S
+    finish_reserve = export_reserve + 1.5 * dev_eval_est + _dev_pass_estimate(len(dev_ex), t_per_step, geo)
     max_epochs_total = 4.0 if len(train_ex) < 10000 else 3.0
     steps_per_epoch = max(1, len(train_ex) // geo.eff_batch)
 
@@ -552,10 +556,10 @@ def run(
             _event_and_print("sft_v2_eval", step=step, dev_loss=round(loss, 6), best=round(state["best"], 6), eval_s=round(dt, 1),
                              pool=len(pool.items), improved=improved)
             if not self.governed and t_step:
-                # keep evaluation (incl. persistence) under ~10% of training time
+                # keep evaluation (incl. persistence) under ~6% of training time
                 self.governed = True
                 per_eval = dt + 0.5 * (state["persist_secs"] / max(1, state["eval_count"]))
-                widened = int(math.ceil(per_eval / (0.10 * max(t_step, 1e-3))))
+                widened = int(math.ceil(per_eval / (0.06 * max(t_step, 1e-3))))
                 if widened > self.eval_every:
                     _event_and_print("sft_v2_eval_governor", eval_every=widened, eval_s=round(dt, 1))
                     self.eval_every = widened
@@ -679,7 +683,7 @@ def run(
         return
 
     # ---- final evaluation of the last weights (may be the best) ----
-    if dev_rows_for_selection and state["last_eval_step"] != final_step and deadline.remaining_hard() > EXPORT_RESERVE_S + dev_eval_est:
+    if dev_rows_for_selection and state["last_eval_step"] != final_step and deadline.remaining_hard() > export_reserve + dev_eval_est:
         last_loss = eval_dev(model)
         telemetry.eval_point(final_step, last_loss)
         if last_loss < state["best"]:
@@ -690,7 +694,11 @@ def run(
     chosen_state: dict[str, Any] | None = None
     chosen_loss = state["best"]
     chosen_step = state["best_step"]
-    soup_budget = max(0.0, 0.5 * (deadline.remaining_hard() - EXPORT_RESERVE_S - _dev_pass_estimate(len(dev_ex), t_per_step, geo)))
+    soup_budget = max(0.0, 0.5 * (deadline.remaining_hard() - export_reserve - _dev_pass_estimate(len(dev_ex), t_per_step, geo)))
+    measured_eval = state["eval_secs"] / max(1, state["eval_count"]) if state["eval_count"] else dev_eval_est
+    if pool.items and dev_rows_for_selection and len(pool.items) >= 2 and soup_budget < 2.5 * measured_eval:
+        _event_and_print("sft_v2_soup_skipped", budget_s=round(soup_budget, 1), eval_s=round(measured_eval, 1))
+        pool.items = pool.items[:1]  # keep the best only: the soup would not fit a single trial
     if pool.items and dev_rows_for_selection:
         try:
             soup_loss, soup_state, members = selection.greedy_soup(
@@ -713,7 +721,7 @@ def run(
 
     # ---- dev pass: one low-LR epoch over the held-out slice from the chosen weights ----
     dev_pass_s = _dev_pass_estimate(len(dev_ex), t_per_step, geo)
-    if dev_ex and len(dev_ex) >= 100 and deadline.remaining_hard() > EXPORT_RESERVE_S + dev_pass_s + 30 and os.environ.get("FORGE_DEV_PASS", "1") != "0":
+    if dev_ex and len(dev_ex) >= 100 and deadline.remaining_hard() > export_reserve + dev_pass_s + 30 and os.environ.get("FORGE_DEV_PASS", "1") != "0":
         try:
             _dev_pass(model, dev_ex, collator, lr=lr * 0.25, geo=geo, autocast=autocast, optimizer_factory=optimizer_factory)
             chosen_state = None  # weights in the model are now the final ones
