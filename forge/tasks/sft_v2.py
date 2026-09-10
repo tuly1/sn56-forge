@@ -627,7 +627,7 @@ def run(
         # learning rate: the phase endpoints are the checkpoints the soup wants.
         # Without timing (probe OOM) phase 0 is one epoch and the clock guard
         # stops it if the epoch does not fit.
-        if t_step and steps_per_epoch * t_step * 6.0 < window and max_epochs_total < 8.0:
+        if os.environ.get("FORGE_V2_RICH_EPOCHS") == "1" and t_step and steps_per_epoch * t_step * 6.0 < window and max_epochs_total < 8.0:
             # an epoch costs < 1/6 of the window: keep training (annealed cycles at
             # decreasing peak LR); the overfit early stop ends it when dev turns.
             max_epochs_total = 8.0
