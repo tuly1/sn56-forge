@@ -383,6 +383,14 @@ def run(
         prior_lr = lr_probe.analytic_lr(weight_rms=_layer_weight_rms(model) or median_weight_rms(model), params_b=params_b,
                                         eff_batch=geo.eff_batch, gradient_noise_scale=gns)
 
+    try:
+        _lr_override = float(os.environ.get("FORGE_V2_LR", "") or 0.0)
+    except ValueError:
+        _lr_override = 0.0
+    if _lr_override > 0:
+        _event_and_print("sft_v2_lr_override", prior_lr=prior_lr, override=_lr_override)
+        prior_lr = _lr_override
+
     def optimizer_factory(params: list, lr: float):
         return torch.optim.AdamW(params, lr=lr, weight_decay=0.0, betas=(0.9, 0.999), eps=1e-8)
 
@@ -408,7 +416,7 @@ def run(
     probe_trainer = Trainer(model=model, args=make_args(1.0, prior_lr, 10, geo.micro_batch, geo.grad_accum), train_dataset=train_ds, data_collator=collator)
     steps_per_epoch = max(1, len(train_ex) // geo.eff_batch)
     remaining = deadline.remaining_hard()
-    probe_budget = min(0.15 * remaining, 480.0)
+    probe_budget = min(0.15 * remaining, 480.0) if _lr_override <= 0 else 0.0  # fixed LR: timing steps only
     batches: list[dict[str, Any]] = []
     # Cache enough distinct micro-batches that a 100-step probe never re-sees a
     # batch (re-seen batches are memorised and bias the sweep toward the fastest
