@@ -206,8 +206,10 @@ def test_floor_best_export_and_non_sft_handlers_remain_unchanged():
     assert trainer_policy < train < final_guard
 
     expected = {
+        # 2026-09-10: save_adapter gained an optional state_dict= parameter (default None,
+        # identical behaviour) for the v2 handler's bf16 snapshot export; pin refreshed.
         "forge/tasks/common.py": (
-            "9a7c9d546e0c9e4c8a344e767480d252b6aebb7c72f79acca62ef118111f93a0"
+            "2b7ea6bd2cc646f39c510f14af1e58de42b3eb07d68fd01fa767c13aff1ecfcd"
         ),
         "forge/tasks/fallback.py": (
             "16a556b7c5104f45584b0bdc24bb2f050835eb2945be496a9e659cef6e9ceed0"
