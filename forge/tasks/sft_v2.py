@@ -580,6 +580,32 @@ def run(
         finally:
             state["persist_secs"] += time.perf_counter() - t0
 
+    row_loss = os.environ.get("FORGE_V2_ROW_LOSS", "0") == "1"
+
+    class RowLossTrainer(Trainer):
+        """Per-example objective (validator statistic) instead of the token mean."""
+
+        def __init__(self, *a: Any, **k: Any) -> None:
+            super().__init__(*a, **k)
+            self.model_accepts_loss_kwargs = False  # the trainer then divides by the accumulation steps
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):  # noqa: ANN001
+            from forge.tuning.rowloss import row_mean_loss
+
+            try:
+                loss = row_mean_loss(model, inputs, use_fused=use_liger)
+            except Exception as exc:
+                import traceback
+
+                _event_and_print("sft_v2_row_loss_error", error=f"{type(exc).__name__}: {exc}",
+                                 trace=traceback.format_exc()[-600:])
+                raise
+            return (loss, None) if return_outputs else loss
+
+    TrainerCls = RowLossTrainer if row_loss else Trainer
+    if row_loss:
+        _event_and_print("sft_v2_row_loss", enabled=True, fused=use_liger)
+
     class SelectCallback(TrainerCallback):
         def __init__(self, eval_every: int, total_steps: int) -> None:
             self.eval_every = eval_every
@@ -694,7 +720,7 @@ def run(
         _event_and_print("sft_v2_plan", phase=phase, lr=phase_lr, t_per_step=t_step, epochs=epochs, total_steps=total_steps,
                          warmup=warmup, eval_every=eval_every, window_s=round(window, 1), epochs_done=round(state["epochs_done"], 3))
         cb = SelectCallback(eval_every, total_steps)
-        trainer = Trainer(
+        trainer = TrainerCls(
             model=model, args=make_args(epochs, phase_lr, warmup, geo.micro_batch, geo.grad_accum, seed=7 + phase),
             train_dataset=train_ds, data_collator=collator, callbacks=[cb, telemetry.make_trainer_callback(spec.output_dir)],
         )
