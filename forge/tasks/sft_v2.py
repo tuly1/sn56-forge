@@ -49,7 +49,12 @@ from forge.tuning import lr_probe, selection
 
 EVAL_CAP = 4096
 EFF_BATCH_TARGET = 64
-MAX_PARAMS_B = 5.0
+MAX_PARAMS_B = 5.0  # hard ceiling of the handler (memory / throughput)
+# Validated regime (2026-09-10 harness, official evaluator, paired rule): full-weight
+# v2 beat production LoRA on SmolLM2-360M (-2.6%, win rate 0.76) and lost on every
+# 2-3B model tried. Larger models stay on the production adapter path unless the
+# operator widens the gate with FORGE_V2_MAX_PARAMS_B.
+DEFAULT_MAX_PARAMS_B = 0.6
 FP32_MASTER_MAX_B = 3.3
 EXPORT_RESERVE_S = 150.0
 MIN_TASK_SECONDS_FOR_V2 = 20 * 60
@@ -83,7 +88,13 @@ def eligible(spec: TaskSpec, *, is_kl: bool, params_b: float, n_gpus: int, model
     if spec.task_type != "InstructTextTask" or spec.instruct is None or is_kl:
         return False
     allow_cpu = os.environ.get("FORGE_SFT_V2_ALLOW_CPU") == "1"
-    if params_b <= 0 or params_b > MAX_PARAMS_B:
+    try:
+        max_b = float(os.environ.get("FORGE_V2_MAX_PARAMS_B", str(DEFAULT_MAX_PARAMS_B)))
+    except ValueError:
+        max_b = DEFAULT_MAX_PARAMS_B
+    max_b = min(max_b, MAX_PARAMS_B)
+    if params_b <= 0 or params_b > max_b:
+        telemetry.event("sft_v2_size_gated", params_b=round(params_b, 3), max_params_b=max_b)
         return False
     if n_gpus != 1 and not (allow_cpu and n_gpus == 0):
         return False
