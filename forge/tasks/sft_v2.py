@@ -167,7 +167,7 @@ def estimate_train_gb(*, params_b: float, tokens: int, layers: int, hidden: int,
 
 
 def choose_geometry(*, params_b: float, max_len: int, vocab: int, per_gpu_gb: float, bnb_ok: bool,
-                    layers: int = 32, hidden: int = 2048, liger: bool = False) -> Geometry:
+                    layers: int = 32, hidden: int = 2048, liger: bool = False, eff_default: int = EFF_BATCH_TARGET) -> Geometry:
     """Geometry from measured behaviour (H100, Gemma-2-2B, 2026-09-10 benchmark):
     checkpointing with a large micro-batch (8 x 3136 tokens) ran at 5.7 samples/s
     while no-checkpointing at micro 2 crawled at 1.9 samples/s from memory
@@ -189,9 +189,9 @@ def choose_geometry(*, params_b: float, max_len: int, vocab: int, per_gpu_gb: fl
         tok_budget = int(tok_budget * 0.75)
     micro = max(1, min(64, tok_budget // max_len))
     try:
-        eff_target = int(os.environ.get("FORGE_V2_EFF_BATCH", str(EFF_BATCH_TARGET)))
+        eff_target = int(os.environ.get("FORGE_V2_EFF_BATCH", str(eff_default)))
     except ValueError:
-        eff_target = EFF_BATCH_TARGET
+        eff_target = eff_default
     if os.environ.get("FORGE_V2_GC") == "1":
         gc_on = True
     elif os.environ.get("FORGE_V2_GC") == "0":
@@ -347,8 +347,10 @@ def run(
             _event_and_print("liger_apply_failed", error=f"{type(exc).__name__}: {exc}")
             use_liger = False
     strategy = strategy_for(params_b) or "full"
+    # adapters train at production's proven effective batch 16 (LFM: 875 updates/epoch at
+    # batch 16 beat 178 at batch 76); full weights follow the champion's batch 64
     geo = choose_geometry(params_b=params_b, max_len=max_len, vocab=vocab, per_gpu_gb=per_gpu_gb, bnb_ok=_bnb_available(),
-                          layers=layers, hidden=hidden, liger=use_liger)
+                          layers=layers, hidden=hidden, liger=use_liger, eff_default=16 if strategy == "lora" else EFF_BATCH_TARGET)
     if strategy == "lora":
         from forge.model import attach_lora
 
