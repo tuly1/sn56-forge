@@ -25,6 +25,16 @@ PROBE_WARMUP = 4
 HALF_RANGE = 0.30  # decades
 
 
+def size_cap_lr(params_b: float) -> float:
+    """Ceiling on the full-fine-tune prior by model size (2x the public
+    champion's static buckets: 1e-4 below 2B, 7.5e-5 to 4B, 7e-5 to 5B)."""
+    if params_b < 2.0:
+        return 2.0e-4
+    if params_b < 4.0:
+        return 1.5e-4
+    return 1.4e-4
+
+
 def analytic_lr(
     *, weight_rms: float | None, params_b: float, eff_batch: int, gradient_noise_scale: float | None = None
 ) -> float:
@@ -34,6 +44,7 @@ def analytic_lr(
         lr *= math.sqrt(1.0 / params_b)
     if gradient_noise_scale and gradient_noise_scale > 0 and eff_batch > 0:
         lr *= math.sqrt(eff_batch / (eff_batch + gradient_noise_scale))
+    lr = min(lr, size_cap_lr(params_b))
     return max(CLAMP[0], min(CLAMP[1], lr))
 
 
@@ -47,6 +58,9 @@ def curvature_factor(step_losses: list[float]) -> tuple[float, dict[str, Any]]:
     rel_drop = (start - end) / max(abs(start), 1e-6)
     factor = 1.0 + 4.0 * (rel_drop - 0.04)
     factor = max(0.6, min(1.6, factor))
+    if rel_drop < -0.5:
+        # the loss more than doubled during warmup: the prior is far too hot
+        factor = 0.3
     return factor, {"l_start": start, "l_end": end, "rel_drop": rel_drop, "n": len(pts)}
 
 

@@ -346,7 +346,8 @@ def run(
         gns = getattr(baseline_summary, "gradient_noise_scale", None)
     except Exception:
         gns = None
-    prior_lr = lr_probe.analytic_lr(weight_rms=median_weight_rms(model), params_b=params_b, eff_batch=geo.eff_batch, gradient_noise_scale=gns)
+    prior_lr = lr_probe.analytic_lr(weight_rms=_layer_weight_rms(model) or median_weight_rms(model), params_b=params_b,
+                                    eff_batch=geo.eff_batch, gradient_noise_scale=gns)
 
     def optimizer_factory(params: list, lr: float):
         return torch.optim.AdamW(params, lr=lr, weight_decay=0.0, betas=(0.9, 0.999), eps=1e-8)
@@ -439,8 +440,8 @@ def run(
     stop_at = _StopAt(deadline, finish_reserve)
     state = {"best": float("inf"), "best_step": 0, "overfit": 0, "persisted_best": float("inf"), "persisted_step": 0,
              "eval_count": 0, "last_persist_at": 0.0, "step_offset": 0, "epochs_done": 0.0, "eval_secs": 0.0,
-             "persist_secs": 0.0, "stopped_overfit": False, "last_phase_complete": False}
-    eval_bs = 1
+             "persist_secs": 0.0, "stopped_overfit": False, "last_phase_complete": False, "restarts": 0}
+    eval_bs = selection.eval_batch_for(max_len=max_len, vocab=vocab)
     dev_rows_for_selection = dev_ex
 
     def eval_dev(m: Any) -> float:
@@ -502,13 +503,11 @@ def run(
                     state["last_persist_at"] = time.monotonic()
             _event_and_print("sft_v2_eval", step=step, dev_loss=round(loss, 6), best=round(state["best"], 6), eval_s=round(dt, 1),
                              pool=len(pool.items), improved=improved)
-            if not self.governed:
-                # keep evaluation under ~10% of the remaining window
+            if not self.governed and t_step:
+                # keep evaluation (incl. persistence) under ~10% of training time
                 self.governed = True
-                remaining_w = max(1.0, deadline.remaining_hard() - finish_reserve)
-                max_evals = max(3, int(remaining_w * 0.10 / max(dt, 1e-3)))
-                remaining_steps = max(1, self.total_steps - local_step)
-                widened = max(self.eval_every, remaining_steps // max_evals)
+                per_eval = dt + 0.5 * (state["persist_secs"] / max(1, state["eval_count"]))
+                widened = int(math.ceil(per_eval / (0.10 * max(t_step, 1e-3))))
                 if widened > self.eval_every:
                     _event_and_print("sft_v2_eval_governor", eval_every=widened, eval_s=round(dt, 1))
                     self.eval_every = widened
@@ -525,7 +524,18 @@ def run(
         remaining = deadline.remaining_hard()
         window = remaining - finish_reserve
         min_window = max(240.0, 25.0 * t_step) if t_step else 240.0
-        if state["stopped_overfit"] or (phase > 0 and window < min_window):
+        if state["stopped_overfit"]:
+            # One warm restart from the best snapshot at a lower learning rate
+            # when plenty of budget remains; a second overfit stop ends training.
+            if state["restarts"] >= 1 or window < max(600.0, 60.0 * (t_step or 10.0)) or pool.best() is None:
+                break
+            selection.load_state(model, pool.best()["state"])
+            state["restarts"] += 1
+            state["stopped_overfit"] = False
+            state["overfit"] = 0
+            lr = lr * 0.3
+            _event_and_print("sft_v2_restart", lr=lr, from_step=pool.best()["step"], window_s=round(window, 1))
+        if phase > 0 and window < min_window:
             break
         if t_step:
             achievable = window * 0.85 / t_step
@@ -538,7 +548,7 @@ def run(
             break
         warmup = min(200, max(3, int(0.03 * total_steps)))
         eval_every = max(10, min(max(1, steps_per_epoch // 8), max(1, total_steps // 8)))
-        phase_lr = lr if phase == 0 else lr * 0.5
+        phase_lr = lr if (phase == 0 or state["restarts"]) else lr * 0.5
         _event_and_print("sft_v2_plan", phase=phase, lr=phase_lr, t_per_step=t_step, epochs=epochs, total_steps=total_steps,
                          warmup=warmup, eval_every=eval_every, window_s=round(window, 1), epochs_done=round(state["epochs_done"], 3))
         cb = SelectCallback(eval_every, total_steps)
@@ -663,6 +673,23 @@ def trained_artifact_present(spec: TaskSpec) -> bool:
         return payload.get("truth") in (ARTIFACT_PARTIAL_TRAINED_BEST, ARTIFACT_COMPLETE_BEST)
     except Exception:
         return False
+
+
+def _layer_weight_rms(model: Any) -> float | None:
+    """Median RMS of 2-D weights inside transformer blocks (embeddings and the
+    output head excluded, as in the public LR law)."""
+    try:
+        vals = []
+        for name, p in model.named_parameters():
+            if p.dim() != 2 or "embed" in name or "lm_head" in name or "layers." not in name:
+                continue
+            vals.append(p.detach().float().pow(2).mean().sqrt().item())
+        if not vals:
+            return None
+        vals.sort()
+        return vals[len(vals) // 2]
+    except Exception:
+        return None
 
 
 def _neftune_alpha(summary: Any) -> float | None:
