@@ -292,14 +292,25 @@ def run(
         except Exception as exc:  # fused kernels are an optimisation, never a requirement
             _event_and_print("liger_apply_failed", error=f"{type(exc).__name__}: {exc}")
             use_liger = False
+    strategy = os.environ.get("FORGE_V2_STRATEGY", "full").strip().lower()
+    if strategy not in ("full", "lora"):
+        strategy = "full"
     geo = choose_geometry(params_b=params_b, max_len=max_len, vocab=vocab, per_gpu_gb=per_gpu_gb, bnb_ok=_bnb_available(),
                           layers=layers, hidden=hidden, liger=use_liger)
-    if geo.fp32_master:
-        model = model.float()
-    for p in model.parameters():
-        p.requires_grad_(True)
+    if strategy == "lora":
+        from forge.model import attach_lora
+
+        model = attach_lora(model, r=32, alpha=64, dropout=0.05)
+        # Adapter training is light: no fp32 master copy, plain fused AdamW,
+        # checkpointing only when the probe says the geometry does not fit.
+        geo = Geometry(geo.micro_batch, geo.grad_accum, geo.max_len, False, False, "adamw_torch_fused")
+    else:
+        if geo.fp32_master:
+            model = model.float()
+        for p in model.parameters():
+            p.requires_grad_(True)
     model.config.use_cache = False
-    autocast = geo.fp32_master and torch.cuda.is_available()
+    autocast = geo.fp32_master and torch.cuda.is_available() and strategy == "full"
     if not torch.cuda.is_available():
         geo = Geometry(geo.micro_batch, geo.grad_accum, geo.max_len, False, geo.fp32_master, "adamw_torch")
 
@@ -333,7 +344,7 @@ def run(
                 geo = Geometry(micro_c, max(1, math.ceil(eff_target / micro_c)), geo.max_len, gc_c, geo.fp32_master, geo.optim)
                 break
     telemetry.set_meta(
-        handler="sft_v2", strategy="full", params_b=round(params_b, 3), seq_len=max_len, batch=geo.micro_batch,
+        handler="sft_v2", strategy=strategy, params_b=round(params_b, 3), seq_len=max_len, batch=geo.micro_batch,
         grad_accum=geo.grad_accum, eff_batch=geo.eff_batch, gradient_checkpointing=geo.gradient_checkpointing,
         fp32_master=geo.fp32_master, optim=geo.optim, liger=use_liger, vocab=vocab, train_n=len(train_ex), val_n=len(dev_ex),
     )
@@ -346,8 +357,11 @@ def run(
         gns = getattr(baseline_summary, "gradient_noise_scale", None)
     except Exception:
         gns = None
-    prior_lr = lr_probe.analytic_lr(weight_rms=_layer_weight_rms(model) or median_weight_rms(model), params_b=params_b,
-                                    eff_batch=geo.eff_batch, gradient_noise_scale=gns)
+    if strategy == "lora":
+        prior_lr = 2.0e-4  # production adapter LR neighbourhood; the sweep explores +/-0.3 decades
+    else:
+        prior_lr = lr_probe.analytic_lr(weight_rms=_layer_weight_rms(model) or median_weight_rms(model), params_b=params_b,
+                                        eff_batch=geo.eff_batch, gradient_noise_scale=gns)
 
     def optimizer_factory(params: list, lr: float):
         return torch.optim.AdamW(params, lr=lr, weight_decay=0.0, betas=(0.9, 0.999), eps=1e-8)
