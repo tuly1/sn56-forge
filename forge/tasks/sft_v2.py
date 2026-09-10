@@ -530,10 +530,11 @@ def run(
             state["eval_count"] += 1
             telemetry.eval_point(step, loss)
             improved = loss < state["best"]
+            state["phase_evals"] = state.get("phase_evals", 0) + 1
             if improved:
                 state["best"], state["best_step"] = loss, step
                 state["overfit"] = 0
-            elif loss > state["best"] * 1.05:
+            elif loss > state["best"] * 1.05 and state["phase_evals"] > 1:
                 state["overfit"] += 1
                 if state["overfit"] >= 3:
                     _event_and_print("sft_v2_early_stop", step=step, best=state["best"], best_step=state["best_step"])
@@ -589,6 +590,11 @@ def run(
         # learning rate: the phase endpoints are the checkpoints the soup wants.
         # Without timing (probe OOM) phase 0 is one epoch and the clock guard
         # stops it if the epoch does not fit.
+        if t_step and steps_per_epoch * t_step * 6.0 < window and max_epochs_total < 8.0:
+            # an epoch costs < 1/6 of the window: keep training (annealed cycles at
+            # decreasing peak LR); the overfit early stop ends it when dev turns.
+            max_epochs_total = 8.0
+            _event_and_print("sft_v2_epoch_cap_raised", max_epochs=max_epochs_total, epoch_s=round(steps_per_epoch * t_step, 1))
         epochs_left = max_epochs_total - state["epochs_done"]
         if t_step:
             achievable = window * 0.85 / t_step
@@ -601,7 +607,9 @@ def run(
             break
         warmup = min(200, max(3, int(0.03 * total_steps)))
         eval_every = max(10, min(max(1, steps_per_epoch // 8), max(1, total_steps // 8)))
-        phase_lr = lr if (phase == 0 or state["restarts"]) else lr * 0.5
+        phase_lr = lr if (phase == 0 or state["restarts"]) else lr * max(0.1, 0.5 ** phase)
+        state["overfit"] = 0
+        state["phase_evals"] = 0
         _event_and_print("sft_v2_plan", phase=phase, lr=phase_lr, t_per_step=t_step, epochs=epochs, total_steps=total_steps,
                          warmup=warmup, eval_every=eval_every, window_s=round(window, 1), epochs_done=round(state["epochs_done"], 3))
         cb = SelectCallback(eval_every, total_steps)
