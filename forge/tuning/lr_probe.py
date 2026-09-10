@@ -214,6 +214,17 @@ def lr_search(
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         probe_step = (time.perf_counter() - t0) / 2.0
+        steady = timing["secs"] / timing["steps"] if timing.get("steps", 0) >= 1 else probe_step
+        if 3 * 15 * steady > budget_s - (time.perf_counter() - t0):
+            # Short task: no sweep is affordable, so do not spend the warmup
+            # budget either. Keep the prior, guard only against a blow-up.
+            factor = 1.0
+            if len(warm_losses) >= 2 and all(math.isfinite(x) for x in warm_losses[:2]) and warm_losses[1] > 1.5 * warm_losses[0]:
+                factor = 0.3
+            diag.update(mode="skip_short_task", t_per_step_warmup=round(steady, 4), curvature_factor=factor,
+                        warm_losses=[round(x, 4) for x in warm_losses[:2]], center_lr_adjusted=center_lr * factor)
+            log("lr_probe", diag)
+            return center_lr * factor, steady, diag
         extra = max(1, min(WARMUP_STEPS - 2, int(0.25 * budget_s / max(probe_step, 1e-3))))
         _restore_state(model, initial)
         run_trial(

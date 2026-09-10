@@ -421,6 +421,9 @@ def run(
                 if i >= n_probe_batches:
                     break
                 batches.append({k: (v.detach().cpu() if hasattr(v, "detach") else v) for k, v in b.items() if k != "length"})
+            import random as _random
+
+            _random.Random(11).shuffle(batches)  # the sampler front-loads the longest rows; timing needs a representative mix
             lr, t_per_step, diag = lr_probe.lr_search(
                 model, batches, center_lr=prior_lr, budget_s=probe_budget, grad_accum=geo.grad_accum,
                 optimizer_factory=optimizer_factory, autocast_bf16=autocast, log=lambda n, d: _event_and_print(n, **_flat(d)),
