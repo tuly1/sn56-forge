@@ -169,8 +169,18 @@ def choose_geometry(*, params_b: float, max_len: int, vocab: int, per_gpu_gb: fl
     return Geometry(micro, accum, max_len, gc_on, fp32_master, optim)
 
 
-def memory_probe(model: Any, *, micro: int, max_len: int, vocab: int, autocast: bool) -> bool:
-    """One synthetic forward/backward at the worst-case micro-batch shape."""
+def optimizer_state_bytes(model: Any, optim: str) -> int:
+    """Bytes the optimizer will allocate lazily at its first step (not visible
+    to a forward/backward probe): two fp32 moments per trainable parameter for
+    torch AdamW, two 8-bit moments for bitsandbytes' 8-bit AdamW."""
+    n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    per = 2 if "8bit" in optim else 8
+    return int(n * per)
+
+
+def memory_probe(model: Any, *, micro: int, max_len: int, vocab: int, autocast: bool, reserve_bytes: int = 0) -> bool:
+    """One synthetic forward/backward at the worst-case micro-batch shape. Fits
+    only if the peak plus `reserve_bytes` (optimizer state) leaves 7% headroom."""
     import torch
 
     device = next(model.parameters()).device
@@ -178,12 +188,21 @@ def memory_probe(model: Any, *, micro: int, max_len: int, vocab: int, autocast: 
     batch = {"input_ids": ids, "attention_mask": torch.ones_like(ids), "labels": ids.clone()}
     model.train()
     try:
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         if autocast:
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 loss = model(**batch).loss
         else:
             loss = model(**batch).loss
         loss.backward()
+        if device.type == "cuda" and reserve_bytes > 0:
+            peak = torch.cuda.max_memory_allocated(device)
+            total = torch.cuda.get_device_properties(device).total_memory
+            if peak + reserve_bytes > 0.93 * total:
+                _event_and_print("sft_v2_memory_probe_reserve", micro=micro, peak_gb=round(peak / 1e9, 1),
+                                 reserve_gb=round(reserve_bytes / 1e9, 1), total_gb=round(total / 1e9, 1))
+                return False
         return True
     except Exception as exc:  # noqa: BLE001
         if _is_oom(exc):
@@ -337,7 +356,8 @@ def run(
                 continue
             seen.add((micro_c, gc_c))
             _apply_gc(gc_c)
-            ok = memory_probe(model, micro=micro_c, max_len=geo.max_len, vocab=vocab, autocast=autocast)
+            ok = memory_probe(model, micro=micro_c, max_len=geo.max_len, vocab=vocab, autocast=autocast,
+                              reserve_bytes=optimizer_state_bytes(model, geo.optim))
             _event_and_print("sft_v2_memory_probe", micro=micro_c, gradient_checkpointing=gc_c, fits=ok)
             if ok:
                 eff_target = geo.eff_batch
@@ -370,7 +390,7 @@ def run(
         kwargs = dict(
             output_dir=workdir(spec), overwrite_output_dir=True, num_train_epochs=num_epochs,
             per_device_train_batch_size=micro, gradient_accumulation_steps=accum, learning_rate=learning_rate,
-            lr_scheduler_type="cosine_with_min_lr", lr_scheduler_kwargs={"min_lr_rate": 0.25}, warmup_steps=warmup_steps,
+            lr_scheduler_type="cosine_with_min_lr", lr_scheduler_kwargs={"min_lr_rate": 0.1}, warmup_steps=warmup_steps,
             weight_decay=0.0, optim=geo.optim, max_grad_norm=1.0, bf16=True, fp16=False,
             gradient_checkpointing=False,  # enabled on the model directly above
             logging_steps=5, save_strategy="no", eval_strategy="no", report_to=[], remove_unused_columns=False,
@@ -454,7 +474,7 @@ def run(
     stop_at = _StopAt(deadline, finish_reserve)
     state = {"best": float("inf"), "best_step": 0, "overfit": 0, "persisted_best": float("inf"), "persisted_step": 0,
              "eval_count": 0, "last_persist_at": 0.0, "step_offset": 0, "epochs_done": 0.0, "eval_secs": 0.0,
-             "persist_secs": 0.0, "stopped_overfit": False, "last_phase_complete": False, "restarts": 0}
+             "persist_secs": 0.0, "stopped_overfit": False, "last_phase_complete": False, "restarts": 0, "last_eval_step": -1}
     eval_bs = selection.eval_batch_for(max_len=max_len, vocab=vocab)
     dev_rows_for_selection = dev_ex
 
@@ -488,11 +508,13 @@ def run(
             m = kw.get("model")
             if stop_at.should_stop():
                 control.should_training_stop = True
-            due = local_step > 0 and local_step % self.eval_every == 0
+            end_step = int(getattr(st, "max_steps", 0) or self.total_steps)
+            due = local_step > 0 and (local_step % self.eval_every == 0 or local_step >= end_step)
             if not due or m is None or not dev_rows_for_selection:
                 return control
             t0 = time.perf_counter()
             loss = eval_dev(m)
+            state["last_eval_step"] = step
             dt = time.perf_counter() - t0
             state["eval_count"] += 1
             telemetry.eval_point(step, loss)
@@ -551,14 +573,20 @@ def run(
             _event_and_print("sft_v2_restart", lr=lr, from_step=pool.best()["step"], window_s=round(window, 1))
         if phase > 0 and window < min_window:
             break
+        # Each phase is a fully annealed cosine cycle of at most one epoch (the
+        # affordable fraction when less fits), so every phase ends on a low
+        # learning rate: the phase endpoints are the checkpoints the soup wants.
+        # Without timing (probe OOM) phase 0 is one epoch and the clock guard
+        # stops it if the epoch does not fit.
+        epochs_left = max_epochs_total - state["epochs_done"]
         if t_step:
             achievable = window * 0.85 / t_step
-            epochs = min(max_epochs_total - state["epochs_done"], 1.25 * achievable / steps_per_epoch)
+            epochs = min(epochs_left, 1.0, achievable / steps_per_epoch)
         else:
-            epochs = min(max_epochs_total, 2.0) if phase == 0 else 0.0
+            epochs = min(epochs_left, 1.0) if phase == 0 else 0.0
         epochs = round(max(0.0, epochs), 3)
         total_steps = int(math.ceil(steps_per_epoch * epochs))
-        if total_steps < 1 or (phase > 0 and total_steps < 10):
+        if total_steps < 1 or (phase > 0 and total_steps < max(10, int(0.15 * steps_per_epoch))):
             break
         warmup = min(200, max(3, int(0.03 * total_steps)))
         eval_every = max(10, min(max(1, steps_per_epoch // 8), max(1, total_steps // 8)))
@@ -602,17 +630,28 @@ def run(
         if trainer is None:
             continue
         steps_done = int(getattr(trainer.state, "global_step", 0) or 0)
+        planned_steps = int(getattr(trainer.state, "max_steps", 0) or total_steps)
         state["step_offset"] += steps_done
         state["epochs_done"] += steps_done / steps_per_epoch
-        state["last_phase_complete"] = steps_done >= total_steps
+        state["last_phase_complete"] = steps_done >= planned_steps
+        try:  # release the optimizer state (fp32 Adam moments) before the next phase / soup / dev pass
+            trainer.optimizer = None
+            trainer.lr_scheduler = None
+        except Exception:
+            pass
+        del trainer
+        trainer = None
+        model.zero_grad(set_to_none=True)
+        gc.collect()
+        _free_cuda()
         phase_wall = (time.monotonic() - t_phase0) - (state["eval_secs"] - eval0) - (state["persist_secs"] - pers0)
         if steps_done >= 5 and phase_wall > 0:
             t_step = phase_wall / steps_done
-        _event_and_print("sft_v2_phase_end", phase=phase, steps=steps_done, planned=total_steps, epochs_done=round(state["epochs_done"], 3),
+        _event_and_print("sft_v2_phase_end", phase=phase, steps=steps_done, planned=planned_steps, epochs_done=round(state["epochs_done"], 3),
                          t_per_step_measured=round(t_step, 3) if t_step else None, best=state["best"], best_step=state["best_step"],
                          remaining_s=round(deadline.remaining_hard(), 1))
         phase += 1
-        if steps_done < total_steps:
+        if steps_done < planned_steps and not state["stopped_overfit"]:
             break  # stopped by the clock (or trainer); no time for another phase
     final_step = state["step_offset"]
     _event_and_print("sft_v2_train_end", step=final_step, best=state["best"], best_step=state["best_step"],
@@ -621,7 +660,7 @@ def run(
         return
 
     # ---- final evaluation of the last weights (may be the best) ----
-    if dev_rows_for_selection and deadline.remaining_hard() > EXPORT_RESERVE_S + dev_eval_est:
+    if dev_rows_for_selection and state["last_eval_step"] != final_step and deadline.remaining_hard() > EXPORT_RESERVE_S + dev_eval_est:
         last_loss = eval_dev(model)
         telemetry.eval_point(final_step, last_loss)
         if last_loss < state["best"]:
