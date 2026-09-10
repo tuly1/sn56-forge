@@ -79,7 +79,7 @@ def _gates() -> tuple[float, float]:
 # The adapter path beats production only where production is throughput-bound: long
 # rows (gemma2-cas, median 762 tokens: 3/3 wins). On short-row tasks (median ~60–100
 # tokens: alpaca, indic-dolly) production's continuous schedule is as good or better.
-LORA_MIN_MEDIAN_TOKENS = 400
+LORA_MIN_MEDIAN_TOKENS = 256
 
 
 def long_row_task(rows: list, spec: TaskSpec, tokenizer: Any, *, sample: int = 512, threshold: int | None = None) -> tuple[bool, int]:
