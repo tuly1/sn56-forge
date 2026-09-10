@@ -635,7 +635,15 @@ def run(
         epochs_left = max_epochs_total - state["epochs_done"]
         if t_step:
             achievable = window * 0.85 / t_step
-            epochs = min(epochs_left, 1.0, achievable / steps_per_epoch)
+            if phase == 0 or state["restarts"]:
+                # first cycle: one fully annealed epoch (the strongest single
+                # candidate on small data), also the timing measurement
+                epochs = min(epochs_left, 1.0, achievable / steps_per_epoch)
+            else:
+                # then one continuous cosine over everything that still fits:
+                # repeated one-epoch cycles restart at a high LR each time and
+                # the dev loss spends most of each cycle recovering (Qwen2.5 run)
+                epochs = min(epochs_left, achievable / steps_per_epoch)
         else:
             epochs = min(epochs_left, 1.0) if phase == 0 else 0.0
         epochs = round(max(0.0, epochs), 3)
