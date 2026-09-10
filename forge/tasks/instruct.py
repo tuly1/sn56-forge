@@ -646,7 +646,12 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     )
     if pinned_route:
         telemetry.event("sft_v2_pinned_route_skip", model=spec.model)
-    if not pinned_route and sft_v2.eligible(
+    short_rows = False
+    if not pinned_route and sft_v2.strategy_for(params_b) == "lora":
+        is_long, median_len = sft_v2.long_row_task(rows, spec, tokenizer)
+        short_rows = not is_long
+        telemetry.event("sft_v2_row_length_gate", median_tokens=median_len, long_rows=is_long)
+    if not pinned_route and not short_rows and sft_v2.eligible(
         spec, is_kl=is_kl, params_b=params_b, n_gpus=n_gpus, model=loaded.model
     ):
         try:

@@ -76,6 +76,36 @@ def _gates() -> tuple[float, float]:
     return min(full_b, MAX_PARAMS_B), min(lora_b, MAX_PARAMS_B)
 
 
+# The adapter path beats production only where production is throughput-bound: long
+# rows (gemma2-cas, median 762 tokens: 3/3 wins). On short-row tasks (median ~60–100
+# tokens: alpaca, indic-dolly) production's continuous schedule is as good or better.
+LORA_MIN_MEDIAN_TOKENS = 400
+
+
+def long_row_task(rows: list, spec: TaskSpec, tokenizer: Any, *, sample: int = 512, threshold: int | None = None) -> tuple[bool, int]:
+    """(median tokenized length of a row sample >= threshold, median)."""
+    import random
+
+    thr = threshold if threshold is not None else int(os.environ.get("FORGE_V2_LORA_MIN_MEDIAN", str(LORA_MIN_MEDIAN_TOKENS)))
+    if spec.instruct is None or not rows:
+        return False, 0
+    picked = rows if len(rows) <= sample else random.Random(3).sample(list(rows), sample)
+    try:
+        if spec.instruct.output is None:
+            docs = prompts.build_completion_documents(picked, spec.instruct)
+            toks = tokenize.tokenize_completion(docs, tokenizer, EVAL_CAP)
+        else:
+            examples = prompts.build_instruct_examples(picked, spec.instruct)
+            toks = tokenize.tokenize_instruct(examples, tokenizer, EVAL_CAP)
+    except Exception:
+        return False, 0
+    lengths = sorted(len(ex["input_ids"]) for ex in toks)
+    if not lengths:
+        return False, 0
+    med = lengths[len(lengths) // 2]
+    return med >= thr, med
+
+
 def strategy_for(params_b: float) -> str:
     """'full' inside the full-weight gate, 'lora' inside the adapter gate, else ''.
     FORGE_V2_STRATEGY=full|lora forces a strategy (harness use)."""
@@ -200,6 +230,7 @@ def choose_geometry(*, params_b: float, max_len: int, vocab: int, per_gpu_gb: fl
         gc_on = True
     elif os.environ.get("FORGE_V2_GC") == "0":
         gc_on = False
+    micro = max(1, min(micro, max(1, eff_target)))  # short rows: the micro-batch alone exceeded the target
     accum = max(1, math.ceil(max(1, eff_target) / micro))
     if fp32_master:
         optim = "adamw_torch_fused"
