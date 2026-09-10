@@ -190,14 +190,26 @@ def lr_search(
         warm_losses: list[float] = []
         timing: dict[str, float] = {"secs": 0.0, "steps": 0}
         t0 = time.perf_counter()
+        # Two cheap steps first: if a step is slow, a long warmup would eat the
+        # budget the sweep needs, so scale the warmup length to the budget.
         run_trial(
-            model, batches, lr=center_lr, opt_steps=WARMUP_STEPS, grad_accum=grad_accum,
+            model, batches, lr=center_lr, opt_steps=2, grad_accum=grad_accum,
             optimizer_factory=optimizer_factory, max_grad_norm=max_grad_norm,
             autocast_bf16=autocast_bf16, warmup_steps=0, out_step_losses=warm_losses, timing=timing,
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        wall_per_step = (time.perf_counter() - t0) / WARMUP_STEPS
+        probe_step = (time.perf_counter() - t0) / 2.0
+        extra = max(1, min(WARMUP_STEPS - 2, int(0.25 * budget_s / max(probe_step, 1e-3))))
+        _restore_state(model, initial)
+        run_trial(
+            model, batches, lr=center_lr, opt_steps=extra + 1, grad_accum=grad_accum,
+            optimizer_factory=optimizer_factory, max_grad_norm=max_grad_norm,
+            autocast_bf16=autocast_bf16, warmup_steps=0, out_step_losses=warm_losses, timing=timing, data_offset=2 * grad_accum,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        wall_per_step = (time.perf_counter() - t0) / (3 + extra)
         t_per_step = timing["secs"] / timing["steps"] if timing.get("steps", 0) >= 3 else wall_per_step
         diag.update(t_per_step_wall=round(wall_per_step, 4))
         _restore_state(model, initial)

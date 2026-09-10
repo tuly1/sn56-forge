@@ -16,12 +16,17 @@ from typing import Any, Callable
 
 
 def per_example_dev_loss(
-    model: Any, dev: list[dict[str, list[int]]], collator: Any, *, batch_size: int = 8,
+    model: Any, dev: list[dict[str, list[int]]], collator: Any, *, batch_size: int = 1,
     autocast_bf16: bool = True, max_rows: int | None = None,
 ) -> tuple[float, list[float]]:
-    """Mean over rows of per-row completion-token-mean CE (validator metric)."""
+    """Mean over rows of per-row completion-token-mean CE (validator metric).
+
+    Evaluates one row at a time with labels, exactly like the validator's
+    batch-size-1 pass: the model's own loss is then the per-example token mean,
+    fused kernels never materialise the full-vocabulary logits, and peak memory
+    stays flat regardless of vocabulary size.
+    """
     import torch
-    import torch.nn.functional as F
 
     rows = dev if max_rows is None else dev[:max_rows]
     was_training = model.training
@@ -30,25 +35,15 @@ def per_example_dev_loss(
     losses: list[float] = []
     try:
         with torch.no_grad():
-            for start in range(0, len(rows), batch_size):
-                batch = collator(rows[start : start + batch_size])
-                input_ids = batch["input_ids"].to(device)
-                attn = batch["attention_mask"].to(device)
-                labels = batch["labels"].to(device)
+            for row in rows:
+                batch = collator([row])
+                batch = {k: v.to(device) for k, v in batch.items()}
                 ctx = torch.autocast("cuda", dtype=torch.bfloat16) if (autocast_bf16 and device.type == "cuda") else _null()
                 with ctx:
-                    out = model(input_ids=input_ids, attention_mask=attn)
-                logits = out.logits[:, :-1, :].float()
-                tgt = labels[:, 1:]
-                mask = tgt != -100
-                tok = F.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)), tgt.reshape(-1), ignore_index=-100, reduction="none"
-                ).view(tgt.shape)
-                counts = mask.sum(dim=1)
-                summed = (tok * mask).sum(dim=1)
-                per = torch.where(counts > 0, summed / counts.clamp(min=1), torch.full_like(summed, float("nan")))
-                losses.extend(per.tolist())
-                del out, logits, tok
+                    out = model(**batch)
+                loss = out.loss
+                losses.append(float(loss.item()) if loss is not None else float("nan"))
+                del out, loss
     finally:
         if was_training:
             model.train()

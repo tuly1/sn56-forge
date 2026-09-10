@@ -435,7 +435,7 @@ def run(
     state = {"best": float("inf"), "best_step": 0, "overfit": 0, "persisted_best": float("inf"), "persisted_step": 0,
              "eval_count": 0, "last_persist_at": 0.0, "step_offset": 0, "epochs_done": 0.0, "eval_secs": 0.0,
              "persist_secs": 0.0, "stopped_overfit": False, "last_phase_complete": False}
-    eval_bs = max(1, min(16, (16384 // max(1, max_len))))
+    eval_bs = 1
     dev_rows_for_selection = dev_ex
 
     def eval_dev(m: Any) -> float:
@@ -549,19 +549,29 @@ def run(
             if not _is_oom(exc):
                 raise
             step = int(getattr(trainer.state, "global_step", 0) or 0)
-            _event_and_print("sft_v2_train_oom", phase=phase, step=step, micro=geo.micro_batch)
-            if step == 0 and geo.micro_batch > 1 and oom_retries < 2:
-                oom_retries += 1
-                _free_cuda()
-                geo = Geometry(max(1, geo.micro_batch // 2), geo.grad_accum * 2, geo.max_len, True, geo.fp32_master, geo.optim)
-                if hasattr(model, "gradient_checkpointing_enable"):
-                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-                    if hasattr(model, "enable_input_require_grads"):
-                        model.enable_input_require_grads()
-                continue
-            if step == 0:
-                raise
-            break
+            _event_and_print("sft_v2_train_oom", phase=phase, step=step, micro=geo.micro_batch,
+                             gradient_checkpointing=geo.gradient_checkpointing)
+            try:
+                trainer.optimizer = None  # release optimizer state before retrying
+            except Exception:
+                pass
+            del trainer
+            trainer = None
+            _free_cuda()
+            # Keep whatever was trained; shrink the geometry and continue in a new phase.
+            state["step_offset"] += step
+            state["epochs_done"] += step / steps_per_epoch
+            if step > 0:
+                phase += 1
+            if oom_retries >= 3:
+                break
+            oom_retries += 1
+            new_micro = max(1, geo.micro_batch // 2) if (geo.gradient_checkpointing or geo.micro_batch > 1) else 1
+            geo = Geometry(new_micro, max(1, geo.eff_batch // new_micro), geo.max_len, True, geo.fp32_master, geo.optim)
+            _apply_gc(True)
+            continue
+        if trainer is None:
+            continue
         steps_done = int(getattr(trainer.state, "global_step", 0) or 0)
         state["step_offset"] += steps_done
         state["epochs_done"] += steps_done / steps_per_epoch
@@ -629,6 +639,8 @@ def run(
 
     # ---- final save (bf16 weights) ----
     truth = ARTIFACT_COMPLETE_BEST if state["last_phase_complete"] else ARTIFACT_PARTIAL_TRAINED_BEST
+    if final_step <= 0:
+        return
     final_state = chosen_state if chosen_state is not None else selection.snapshot_trainable(model)
     ok = persist(model, final_state, chosen_step or final_step, truth, "sft_v2_final")
     _event_and_print("sft_v2_final", saved=ok, chosen_loss=chosen_loss, chosen_step=chosen_step, truth=truth,
