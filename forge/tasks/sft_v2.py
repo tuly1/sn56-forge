@@ -486,7 +486,14 @@ def run(
     if strategy == "lora":
         from forge.model import attach_lora
 
-        model = attach_lora(model, r=32, alpha=64, dropout=0.05)
+        try:
+            _r = int(os.environ.get("FORGE_V2_LORA_R", "32"))
+            _alpha = int(os.environ.get("FORGE_V2_LORA_ALPHA", str(2 * _r)))
+            _drop = float(os.environ.get("FORGE_V2_LORA_DROPOUT", "0.05"))
+        except ValueError:
+            _r, _alpha, _drop = 32, 64, 0.05
+        _event_and_print("sft_v2_adapter", r=_r, alpha=_alpha, dropout=_drop)
+        model = attach_lora(model, r=_r, alpha=_alpha, dropout=_drop)
         # Adapter training is light: no fp32 master copy, plain fused AdamW,
         # checkpointing only when the probe says the geometry does not fit.
         geo = Geometry(geo.micro_batch, geo.grad_accum, geo.max_len, False, False, "adamw_torch_fused")
