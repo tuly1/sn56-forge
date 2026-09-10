@@ -116,6 +116,89 @@ def _full_ft_types() -> frozenset[str]:
     return FULL_FT_MODEL_TYPES | frozenset(extra)
 
 
+LEARNABILITY_RATIO = 3.0      # untrained loss / loss after a 60-step adapter probe
+LEARNABILITY_MIN_EPOCHS = 1.0  # projected full-weight epochs that must fit the window
+
+
+def learnability_probe(model: Any, tokenizer: Any, rows: list, spec: TaskSpec, deadline: Deadline, params_b: float,
+                       *, steps: int = 60, n_dev: int = 64) -> dict[str, Any]:
+    """Decide full weights vs adapter for a 0.6–5B task from the task itself.
+
+    A short adapter probe (steps x batch 16 at 2e-4) measures how far the loss
+    falls from the untrained model on held-out rows and how fast the adapter
+    trains. Structured tasks (QA generation, segmentation, formatting) fall by
+    3x or more within 60 steps and the field wins them with full weights;
+    open-ended instruct data falls by ~1.5x and adapters generalise better. Full
+    weights are only chosen when they can also afford >= 1 projected epoch at
+    about half the adapter's throughput. The temporary adapter is unloaded, so
+    the base weights are untouched."""
+    import torch
+    from forge.model import attach_lora
+
+    out: dict[str, Any] = {"decision": "lora"}
+    t0 = time.monotonic()
+    assert spec.instruct is not None
+    if spec.instruct.output is None:
+        docs = prompts.build_completion_documents(rows, spec.instruct)
+        tokenized = tokenize.tokenize_completion(docs, tokenizer, EVAL_CAP)
+    else:
+        examples = prompts.build_instruct_examples(rows, spec.instruct)
+        tokenized = tokenize.tokenize_instruct(examples, tokenizer, EVAL_CAP)
+    tokenized = exact_dedup(tokenized)
+    if len(tokenized) < 200:
+        out["reason"] = "too_few_rows"
+        return out
+    lengths = [len(ex["input_ids"]) for ex in tokenized]
+    max_len = adaptive_max_len(lengths, ceiling=EVAL_CAP)
+    train_ex, dev_ex = stratified_split(tokenized, dev_size_for(len(tokenized), hours=deadline.remaining_hard() / 3600.0), seed=7)
+    train_ex = [smart_truncate(ex, max_len) for ex in train_ex]
+    dev_probe = [smart_truncate(ex, max_len) for ex in dev_ex[:n_dev]]
+    collator = tokenize.PadCollator(tokenizer.pad_token_id)
+    micro = max(1, min(16, 24576 // max(1, max_len)))
+    accum = max(1, math.ceil(16 / micro))
+    import random as _random
+
+    rng = _random.Random(5)
+    picks = list(range(len(train_ex)))
+    rng.shuffle(picks)
+    need = steps * accum
+    batches = [collator([train_ex[i] for i in picks[j : j + micro]]) for j in range(0, min(len(picks), need * micro), micro)][:need]
+    model.config.use_cache = False
+    peft_model = attach_lora(model, r=32, alpha=64, dropout=0.05)
+    gc_on = params_b >= 0.8 and hasattr(peft_model, "gradient_checkpointing_enable")
+    if gc_on:
+        peft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    cuda = torch.cuda.is_available()
+    try:
+        untrained, _ = selection.per_example_dev_loss(peft_model, dev_probe, collator, batch_size=1, autocast_bf16=cuda)
+        timing: dict[str, Any] = {"secs": 0.0, "steps": 0}
+        lr_probe.run_trial(
+            peft_model, batches, lr=2.0e-4, opt_steps=steps, grad_accum=accum,
+            optimizer_factory=lambda ps, lr: torch.optim.AdamW(ps, lr=lr, weight_decay=0.0),
+            autocast_bf16=cuda, warmup_steps=6, timing=timing,
+        )
+        probe_loss, _ = selection.per_example_dev_loss(peft_model, dev_probe, collator, batch_size=1, autocast_bf16=cuda)
+    finally:
+        if gc_on and hasattr(peft_model, "gradient_checkpointing_disable"):
+            peft_model.gradient_checkpointing_disable()
+        base = peft_model.unload() if hasattr(peft_model, "unload") else peft_model
+        for prm in base.parameters():
+            prm.requires_grad_(False)
+        _free_cuda()
+    ratio = (untrained / probe_loss) if (probe_loss and math.isfinite(probe_loss) and probe_loss > 0) else 0.0
+    secs = float(timing.get("secs") or 0.0)
+    nsteps = int(timing.get("steps") or 0)
+    adapter_sps = (16.0 * nsteps / secs) if (secs > 0 and nsteps > 0) else 0.0
+    window = max(0.0, deadline.remaining_hard() - 600.0)
+    projected_full_epochs = (window * 0.85 * adapter_sps / 2.0 / max(1, len(train_ex))) if adapter_sps else 0.0
+    decision = "full" if (ratio >= LEARNABILITY_RATIO and projected_full_epochs >= LEARNABILITY_MIN_EPOCHS and params_b <= MAX_PARAMS_B) else "lora"
+    out.update(decision=decision, untrained=round(untrained, 4), probe_loss=round(probe_loss, 4), ratio=round(ratio, 3),
+               adapter_samples_per_s=round(adapter_sps, 2), projected_full_epochs=round(projected_full_epochs, 3),
+               median_len=sorted(lengths)[len(lengths) // 2], probe_s=round(time.monotonic() - t0, 1))
+    _event_and_print("sft_v2_learnability", **out)
+    return out
+
+
 def strategy_for(params_b: float, model_type: str | None = None) -> str:
     """'full' inside the full-weight gate (or for a validated family), 'lora'
     inside the adapter gate, else ''. FORGE_V2_STRATEGY=full|lora forces one."""
@@ -339,6 +422,7 @@ def run(
     baseline_summary: Any,
     params_b: float,
     per_gpu_gb: float,
+    strategy_override: str | None = None,
 ) -> None:
     import torch
     from datasets import Dataset
@@ -394,7 +478,7 @@ def run(
         except Exception as exc:  # fused kernels are an optimisation, never a requirement
             _event_and_print("liger_apply_failed", error=f"{type(exc).__name__}: {exc}")
             use_liger = False
-    strategy = strategy_for(params_b, str(getattr(getattr(model, "config", None), "model_type", "") or "")) or "full"
+    strategy = strategy_override or strategy_for(params_b, str(getattr(getattr(model, "config", None), "model_type", "") or "")) or "full"
     # adapters train at production's proven effective batch 16 (LFM: 875 updates/epoch at
     # batch 16 beat 178 at batch 76); full weights follow the champion's batch 64
     geo = choose_geometry(params_b=params_b, max_len=max_len, vocab=vocab, per_gpu_gb=per_gpu_gb, bnb_ok=_bnb_available(),

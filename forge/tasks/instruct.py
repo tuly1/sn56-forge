@@ -647,11 +647,27 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     if pinned_route:
         telemetry.event("sft_v2_pinned_route_skip", model=spec.model)
     short_rows = False
+    v2_strategy_override: str | None = None
     _mt = str(getattr(getattr(loaded.model, "config", None), "model_type", "") or "")
     if not pinned_route and sft_v2.strategy_for(params_b, _mt) == "lora":
         is_long, median_len = sft_v2.long_row_task(rows, spec, tokenizer)
         short_rows = not is_long
         telemetry.event("sft_v2_row_length_gate", median_tokens=median_len, long_rows=is_long)
+        import torch as _torch
+
+        if os.environ.get("FORGE_V2_LEARNABILITY_GATE", "0") == "1" and (
+            _torch.cuda.is_available() or os.environ.get("FORGE_SFT_V2_ALLOW_CPU") == "1"
+        ):
+            try:
+                probe = sft_v2.learnability_probe(loaded.model, tokenizer, rows, spec, deadline, params_b)
+                telemetry.event("sft_v2_learnability", **{k: v for k, v in probe.items()})
+                if probe.get("decision") == "full":
+                    v2_strategy_override = "full"
+                    short_rows = False  # full weights are chosen by learnability, not row length
+            except Exception as exc:  # the probe is advisory; never block the task
+                telemetry.event("sft_v2_learnability_failed", error=f"{type(exc).__name__}: {exc}")
+                loaded = load_base(spec.cached_model_dir, for_generation=False)
+                tokenizer = loaded.tokenizer
     if not pinned_route and not short_rows and sft_v2.eligible(
         spec, is_kl=is_kl, params_b=params_b, n_gpus=n_gpus, model=loaded.model
     ):
@@ -665,6 +681,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 baseline_summary=baseline_summary,
                 params_b=params_b,
                 per_gpu_gb=per_gpu_gb,
+                strategy_override=v2_strategy_override,
             )
             return
         except BaseException as exc:  # noqa: BLE001
