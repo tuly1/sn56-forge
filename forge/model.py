@@ -518,15 +518,35 @@ def attach_lora(model: Any, *, r: int, alpha: int, dropout: float) -> Any:
     """
     from peft import LoraConfig, get_peft_model
 
-    config = LoraConfig(
-        r=r,
-        lora_alpha=alpha,
-        lora_dropout=dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules="all-linear",
-    )
-    peft_model = get_peft_model(model, config)
+    def _config(targets: Any) -> LoraConfig:
+        return LoraConfig(
+            r=r,
+            lora_alpha=alpha,
+            lora_dropout=dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=targets,
+        )
+
+    try:
+        peft_model = get_peft_model(model, _config("all-linear"))
+    except ValueError as exc:
+        # PEFT's "all-linear" expansion finds nothing on some architectures
+        # (fused-expert MoE blocks, exotic module names) and then treats the
+        # string as a regex; fall back to the explicit linear leaf names,
+        # excluding the output head (the same set "all-linear" intends).
+        import torch
+
+        names = sorted(
+            {
+                name.split(".")[-1]
+                for name, module in model.named_modules()
+                if isinstance(module, torch.nn.Linear) and name.split(".")[-1] not in ("lm_head", "score")
+            }
+        )
+        if not names:
+            raise
+        peft_model = get_peft_model(model, _config(names))
     trainable = sum(
         int(parameter.numel())
         for parameter in peft_model.parameters()
