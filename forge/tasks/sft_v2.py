@@ -471,14 +471,12 @@ def run(
             import random as _random
 
             _random.Random(11).shuffle(batches)  # the sampler front-loads the longest rows; timing needs a representative mix
-            # 1) timing at the initial geometry (3 steps), guarding against a blow-up
+            # 1) timing at the initial geometry (3 steps) at a safe LR: step time does
+            #    not depend on the LR, and an un-warmed step at the full prior spikes
+            #    a full fine-tune (Gemma: 0.23 -> 2.7); the sweep judges LRs properly
             t_micro, warm = lr_probe.measure_step_time(
-                model, batches, lr=prior_lr, grad_accum=geo.grad_accum, optimizer_factory=optimizer_factory, autocast_bf16=autocast,
+                model, batches, lr=0.1 * prior_lr, grad_accum=geo.grad_accum, optimizer_factory=optimizer_factory, autocast_bf16=autocast,
             )
-            if len(warm) >= 2 and all(math.isfinite(x) for x in warm[:2]) and warm[1] > 1.5 * warm[0]:
-                _event_and_print("lr_probe_blowup", losses=[round(x, 4) for x in warm[:3]], prior_lr=prior_lr)
-                prior_lr *= 0.3
-                lr = prior_lr
             t_per_step = t_micro
             _event_and_print("sft_v2_timing", t_per_step=round(t_per_step, 4) if t_per_step else None, eff_batch=geo.eff_batch,
                              losses=[round(x, 4) for x in warm[:3]])
@@ -528,7 +526,9 @@ def run(
     # ---- learning-rate sweep at the final geometry ----
     if batches and t_per_step and _lr_override <= 0 and deadline.remaining_hard() > MIN_TASK_SECONDS_FOR_V2:
         try:
-            sweep_budget = min(0.15 * deadline.remaining_hard(), 480.0)
+            # the champion stack pays for its LR search even on 45-min tasks; full
+            # weights are far more LR-sensitive than an adapter, so give them more
+            sweep_budget = min((0.18 if strategy == "full" else 0.15) * deadline.remaining_hard(), 480.0)
             lr, t_sw, diag = lr_probe.lr_search(
                 model, batches, center_lr=lr, budget_s=sweep_budget, grad_accum=geo.grad_accum,
                 optimizer_factory=optimizer_factory, autocast_bf16=autocast, log=lambda n, d: _event_and_print(n, **_flat(d)),

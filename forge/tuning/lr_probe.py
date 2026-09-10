@@ -248,8 +248,8 @@ def lr_search(
         if known_t_per_step:
             t_per_step = known_t_per_step
             n_probes = 4 if budget_s >= 4 * 25 * t_per_step else 3
-            steps = max(15, min(100, int(budget_s / (n_probes * t_per_step))))
-            if n_probes * 15 * t_per_step > budget_s:
+            steps = max(12, min(100, int(budget_s / (n_probes * t_per_step))))
+            if n_probes * 12 * t_per_step > budget_s:
                 diag.update(mode="skip_no_budget", t_per_step=round(t_per_step, 4), steps=steps)
                 log("lr_probe", diag)
                 return center_lr, t_per_step, diag
