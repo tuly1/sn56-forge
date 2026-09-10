@@ -373,7 +373,10 @@ def run(
     remaining = deadline.remaining_hard()
     probe_budget = min(0.15 * remaining, 480.0)
     batches: list[dict[str, Any]] = []
-    n_probe_batches = min(60, 100 * geo.grad_accum)
+    # Cache enough distinct micro-batches that a 100-step probe never re-sees a
+    # batch (re-seen batches are memorised and bias the sweep toward the fastest
+    # memoriser rather than the best learner).
+    n_probe_batches = min(400, max(100 * geo.grad_accum, 60))
     lr, t_per_step, diag = prior_lr, None, {}
     if remaining > MIN_TASK_SECONDS_FOR_V2:
         try:
