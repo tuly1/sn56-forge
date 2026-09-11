@@ -518,6 +518,14 @@ def attach_lora(model: Any, *, r: int, alpha: int, dropout: float) -> Any:
     """
     from peft import LoraConfig, get_peft_model
 
+    import os
+
+    extra: dict[str, Any] = {}
+    if os.environ.get("FORGE_V2_DORA", "0") == "1":
+        extra["use_dora"] = True  # harness experiment knob (weight-decomposed LoRA)
+    if os.environ.get("FORGE_V2_RSLORA", "0") == "1":
+        extra["use_rslora"] = True
+
     def _config(targets: Any) -> LoraConfig:
         return LoraConfig(
             r=r,
@@ -526,6 +534,7 @@ def attach_lora(model: Any, *, r: int, alpha: int, dropout: float) -> Any:
             bias="none",
             task_type="CAUSAL_LM",
             target_modules=targets,
+            **extra,
         )
 
     try:
