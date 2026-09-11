@@ -649,13 +649,18 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     short_rows = False
     v2_strategy_override: str | None = None
     _mt = str(getattr(getattr(loaded.model, "config", None), "model_type", "") or "")
-    if not pinned_route and sft_v2.strategy_for(params_b, _mt) == "lora":
+    _v2_strategy = sft_v2.strategy_for(params_b, _mt) if not pinned_route else ""
+    if _v2_strategy in ("lora", "full"):
+        # Both v2 paths are validated on long-row tasks only (Smol-jb median 392,
+        # Gemma 762, ru-AAQG 302). On short-row open-ended data production's
+        # adapter wins for every size tried (Qwen2.5-0.5B full FT +4.1%, alpaca
+        # adapters neutral), so short rows always stay on production.
         is_long, median_len = sft_v2.long_row_task(rows, spec, tokenizer)
         short_rows = not is_long
-        telemetry.event("sft_v2_row_length_gate", median_tokens=median_len, long_rows=is_long)
+        telemetry.event("sft_v2_row_length_gate", median_tokens=median_len, long_rows=is_long, strategy=_v2_strategy)
         import torch as _torch
 
-        if os.environ.get("FORGE_V2_LEARNABILITY_GATE", "0") == "1" and (
+        if _v2_strategy == "lora" and os.environ.get("FORGE_V2_LEARNABILITY_GATE", "0") == "1" and (
             _torch.cuda.is_available() or os.environ.get("FORGE_SFT_V2_ALLOW_CPU") == "1"
         ):
             try:
