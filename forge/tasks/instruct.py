@@ -648,6 +648,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         telemetry.event("sft_v2_pinned_route_skip", model=spec.model)
     short_rows = False
     v2_strategy_override: str | None = None
+    v2_route_lr: float | None = None
     _mt = str(getattr(getattr(loaded.model, "config", None), "model_type", "") or "")
     _v2_strategy = sft_v2.strategy_for(params_b, _mt) if not pinned_route else ""
     if _v2_strategy in ("lora", "full"):
@@ -658,6 +659,13 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         is_long, median_len = sft_v2.long_row_task(rows, spec, tokenizer)
         short_rows = not is_long
         telemetry.event("sft_v2_row_length_gate", median_tokens=median_len, long_rows=is_long, strategy=_v2_strategy)
+        if _v2_strategy == "lora" and is_long and sft_v2.bigdata_full_route(
+            n_rows=len(rows), hours=deadline.remaining_hard() / 3600.0, model_type=_mt, params_b=params_b
+        ):
+            v2_strategy_override = "full"
+            v2_route_lr = sft_v2.BIGDATA_FULL_LR
+            telemetry.event("sft_v2_bigdata_full_route", rows=len(rows), hours=round(deadline.remaining_hard() / 3600.0, 2),
+                            model_type=_mt, lr=v2_route_lr)
         import torch as _torch
 
         if _v2_strategy == "lora" and os.environ.get("FORGE_V2_LEARNABILITY_GATE", "0") == "1" and (
@@ -687,6 +695,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 params_b=params_b,
                 per_gpu_gb=per_gpu_gb,
                 strategy_override=v2_strategy_override,
+                route_lr=v2_route_lr,
             )
             return
         except BaseException as exc:  # noqa: BLE001

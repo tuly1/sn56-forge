@@ -215,6 +215,36 @@ def strategy_for(params_b: float, model_type: str | None = None) -> str:
     return ""
 FP32_MASTER_MAX_B = 3.3
 EXPORT_RESERVE_S = 150.0
+
+# Large-data full-weight route (2026-09-11, Qwen2.5-3B-Instruct / ru-AAQG at the Aug 31
+# task's scale: 52k rows, 1.5 h): full FT at the champion's per-row LR, 1e-5 for 64
+# rows per update, one annealed epoch + soup + dev pass, scored 0.523538 where the
+# same recipe on 20k rows / 1 h ties the adapter. Off until the matched adapter
+# comparison (r59-lora) says the route wins by the confirmation margin.
+BIGDATA_FULL_MIN_ROWS = 40000
+BIGDATA_FULL_MIN_HOURS = 1.2
+BIGDATA_FULL_MODEL_TYPES: frozenset[str] = frozenset({"qwen2", "qwen3"})
+BIGDATA_FULL_LR = 1.0e-5
+
+
+def bigdata_full_route(*, n_rows: int, hours: float, model_type: str | None, params_b: float) -> bool:
+    """True when a long-row adapter task should train full weights instead:
+    validated model family, fp32-master-sized model, >= BIGDATA_FULL_MIN_ROWS rows
+    and >= BIGDATA_FULL_MIN_HOURS of budget. FORGE_V2_BIGDATA_FULL=1 enables it."""
+    if os.environ.get("FORGE_V2_BIGDATA_FULL", "0") != "1":
+        return False
+    try:
+        min_rows = int(os.environ.get("FORGE_V2_BIGDATA_MIN_ROWS", str(BIGDATA_FULL_MIN_ROWS)))
+        min_hours = float(os.environ.get("FORGE_V2_BIGDATA_MIN_HOURS", str(BIGDATA_FULL_MIN_HOURS)))
+    except ValueError:
+        min_rows, min_hours = BIGDATA_FULL_MIN_ROWS, BIGDATA_FULL_MIN_HOURS
+    types = BIGDATA_FULL_MODEL_TYPES | {t.strip().lower() for t in os.environ.get("FORGE_V2_BIGDATA_TYPES", "").split(",") if t.strip()}
+    return (
+        str(model_type or "").lower() in types
+        and 0 < params_b <= FP32_MASTER_MAX_B
+        and n_rows >= min_rows
+        and hours >= min_hours
+    )
 MIN_TASK_SECONDS_FOR_V2 = 20 * 60
 
 
@@ -423,6 +453,7 @@ def run(
     params_b: float,
     per_gpu_gb: float,
     strategy_override: str | None = None,
+    route_lr: float | None = None,
 ) -> None:
     import torch
     from datasets import Dataset
@@ -573,6 +604,12 @@ def run(
     if _lr_override > 0:
         _event_and_print("sft_v2_lr_override", prior_lr=prior_lr, override=_lr_override)
         prior_lr = _lr_override
+    elif route_lr and route_lr > 0:
+        # a routed recipe ships its tested LR: no sweep (the short-horizon probe
+        # picks 2.6e-5–7.5e-5 for full weights, which lose 4–13% at 64 rows/step)
+        _event_and_print("sft_v2_route_lr", prior_lr=prior_lr, route_lr=route_lr)
+        prior_lr = route_lr
+        _lr_override = route_lr
 
     def optimizer_factory(params: list, lr: float):
         return torch.optim.AdamW(params, lr=lr, weight_decay=0.0, betas=(0.9, 0.999), eps=1e-8)
