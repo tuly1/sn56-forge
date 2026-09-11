@@ -1018,6 +1018,13 @@ def _layer_weight_rms(model: Any) -> float | None:
 
 
 def _neftune_alpha(summary: Any) -> float | None:
+    forced = os.environ.get("FORGE_V2_NEFTUNE", "").strip()
+    if forced:
+        try:
+            v = float(forced)
+            return None if v <= 0 else v
+        except ValueError:
+            pass
     try:
         gns = getattr(summary, "gradient_noise_scale", None)
         if gns is not None and float(gns) > 1.0:
