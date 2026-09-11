@@ -581,7 +581,7 @@ def run(
         kwargs = dict(
             output_dir=workdir(spec), overwrite_output_dir=True, num_train_epochs=num_epochs,
             per_device_train_batch_size=micro, gradient_accumulation_steps=accum, learning_rate=learning_rate,
-            lr_scheduler_type="cosine_with_min_lr", lr_scheduler_kwargs={"min_lr_rate": 0.1}, warmup_steps=warmup_steps,
+            lr_scheduler_type="cosine_with_min_lr", lr_scheduler_kwargs={"min_lr_rate": _min_lr_rate()}, warmup_steps=warmup_steps,
             weight_decay=0.0, optim=geo.optim, max_grad_norm=1.0, bf16=True, fp16=False,
             gradient_checkpointing=False,  # enabled on the model directly above
             logging_steps=5, save_strategy="no", eval_strategy="no", report_to=[], remove_unused_columns=False,
@@ -693,6 +693,11 @@ def run(
     export_reserve = 60.0 if strategy == "lora" else EXPORT_RESERVE_S
     finish_reserve = export_reserve + 1.5 * dev_eval_est + _dev_pass_estimate(len(dev_ex), t_per_step, geo)
     max_epochs_total = 4.0 if len(train_ex) < 10000 else 3.0
+    try:
+        if os.environ.get("FORGE_V2_MAX_EPOCHS"):
+            max_epochs_total = float(os.environ["FORGE_V2_MAX_EPOCHS"])
+    except ValueError:
+        pass
     steps_per_epoch = max(1, len(train_ex) // geo.eff_batch)
 
     # ---- training with validator-style dev selection ----
@@ -724,6 +729,31 @@ def run(
 
     row_loss = os.environ.get("FORGE_V2_ROW_LOSS", "0") == "1"
 
+    try:
+        _lora_plus = float(os.environ.get("FORGE_V2_LORA_PLUS", "0") or 0)
+    except ValueError:
+        _lora_plus = 0.0
+
+    class LoraPlusTrainer(Trainer):
+        """LoRA+: the B matrices train at `ratio` x the A-matrix learning rate.
+        The configured learning rate is the B rate (the successful plain-LoRA
+        setting); A gets lr / ratio."""
+
+        def create_optimizer(self):
+            if self.optimizer is None and _lora_plus > 1.0:
+                import torch as _t
+
+                a_params = [p for n, p in self.model.named_parameters() if p.requires_grad and "lora_A" in n]
+                b_params = [p for n, p in self.model.named_parameters() if p.requires_grad and "lora_B" in n]
+                rest = [p for n, p in self.model.named_parameters() if p.requires_grad and "lora_A" not in n and "lora_B" not in n]
+                lr = self.args.learning_rate
+                groups = [{"params": b_params, "lr": lr}, {"params": a_params, "lr": lr / _lora_plus}]
+                if rest:
+                    groups.append({"params": rest, "lr": lr})
+                self.optimizer = _t.optim.AdamW(groups, lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, fused=_t.cuda.is_available())
+                _event_and_print("sft_v2_lora_plus", ratio=_lora_plus, lr_b=lr, lr_a=lr / _lora_plus, n_b=len(b_params), n_a=len(a_params))
+            return super().create_optimizer()
+
     class RowLossTrainer(Trainer):
         """Per-example objective (validator statistic) instead of the token mean."""
 
@@ -744,7 +774,7 @@ def run(
                 raise
             return (loss, None) if return_outputs else loss
 
-    TrainerCls = RowLossTrainer if row_loss else Trainer
+    TrainerCls = RowLossTrainer if row_loss else (LoraPlusTrainer if (_lora_plus > 1.0 and strategy == "lora") else Trainer)
     if row_loss:
         _event_and_print("sft_v2_row_loss", enabled=True, fused=use_liger)
 
@@ -1015,6 +1045,13 @@ def _layer_weight_rms(model: Any) -> float | None:
         return vals[len(vals) // 2]
     except Exception:
         return None
+
+
+def _min_lr_rate() -> float:
+    try:
+        return float(os.environ.get("FORGE_V2_MIN_LR_RATE", "0.1"))
+    except ValueError:
+        return 0.1
 
 
 def _neftune_alpha(summary: Any) -> float | None:
