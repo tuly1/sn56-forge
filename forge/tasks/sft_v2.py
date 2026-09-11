@@ -623,7 +623,7 @@ def run(
             gradient_checkpointing=False,  # enabled on the model directly above
             logging_steps=5, save_strategy="no", eval_strategy="no", report_to=[], remove_unused_columns=False,
             dataloader_num_workers=2, disable_tqdm=True, seed=seed, train_sampling_strategy="group_by_length", length_column_name="length",
-            neftune_noise_alpha=_neftune_alpha(baseline_summary),
+            neftune_noise_alpha=_neftune_alpha(baseline_summary, strategy),
         )
         return TrainingArguments(**compatible_dataclass_kwargs(TrainingArguments, kwargs, allow_removed={"overwrite_output_dir"}))
 
@@ -1155,7 +1155,12 @@ def _min_lr_rate() -> float:
         return 0.1
 
 
-def _neftune_alpha(summary: Any) -> float | None:
+def _neftune_alpha(summary: Any, strategy: str = "full") -> float | None:
+    """NEFTune alpha for the trainer. Adapters train without it (2026-09-11: on
+    Qwen2.5-3B-Instruct/ru-AAQG, NEFTune off at the 2e-4 prior scores 0.559766
+    vs 0.561–0.563 with it, and 0.517658 vs full FT 0.523538 at 52k rows; unpacked
+    ~300-token rows carry ~3.7x the field's packed-4096 noise at the same alpha).
+    Full weights keep alpha 1 (tested). FORGE_V2_NEFTUNE overrides (0 = off)."""
     forced = os.environ.get("FORGE_V2_NEFTUNE", "").strip()
     if forced:
         try:
@@ -1163,6 +1168,8 @@ def _neftune_alpha(summary: Any) -> float | None:
             return None if v <= 0 else v
         except ValueError:
             pass
+    if strategy == "lora":
+        return None
     try:
         gns = getattr(summary, "gradient_noise_scale", None)
         if gns is not None and float(gns) > 1.0:
