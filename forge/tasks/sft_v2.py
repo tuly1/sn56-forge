@@ -784,6 +784,14 @@ def run(
         _ema_frac = float(os.environ.get("FORGE_V2_TAIL_EMA", "0") or 0)  # fraction of the phase averaged (0 = off)
     except ValueError:
         _ema_frac = 0.0
+    try:
+        _seed_base = int(os.environ.get("FORGE_V2_SEED", "7") or 7)  # data-order seed (dev split stays seed 7)
+    except ValueError:
+        _seed_base = 7
+    try:
+        _restart_factor = float(os.environ.get("FORGE_V2_RESTART_LR_FACTOR", "0.5") or 0.5)  # later-phase LR = lr * f**phase
+    except ValueError:
+        _restart_factor = 0.5
     if strategy != "lora":
         _ema_frac = 0.0  # a full-weight fp32 average would not fit next to the optimizer state
     ema: dict[str, Any] = {}
@@ -918,14 +926,14 @@ def run(
             break
         warmup = min(200, max(3, int(0.03 * total_steps)))
         eval_every = max(10, min(max(1, steps_per_epoch // 8), max(1, total_steps // 8)))
-        phase_lr = lr if (phase == 0 or state["restarts"]) else lr * max(0.1, 0.5 ** phase)
+        phase_lr = lr if (phase == 0 or state["restarts"]) else lr * max(0.1, _restart_factor ** phase)
         state["overfit"] = 0
         state["phase_evals"] = 0
         _event_and_print("sft_v2_plan", phase=phase, lr=phase_lr, t_per_step=t_step, epochs=epochs, total_steps=total_steps,
                          warmup=warmup, eval_every=eval_every, window_s=round(window, 1), epochs_done=round(state["epochs_done"], 3))
         cb = SelectCallback(eval_every, total_steps)
         trainer = TrainerCls(
-            model=model, args=make_args(epochs, phase_lr, warmup, geo.micro_batch, geo.grad_accum, seed=7 + phase),
+            model=model, args=make_args(epochs, phase_lr, warmup, geo.micro_batch, geo.grad_accum, seed=_seed_base + phase),
             train_dataset=train_ds, data_collator=collator, callbacks=[cb, telemetry.make_trainer_callback(spec.output_dir)],
         )
         t_phase0 = time.monotonic()
