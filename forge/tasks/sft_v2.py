@@ -489,7 +489,7 @@ def run(
         try:
             _r = int(os.environ.get("FORGE_V2_LORA_R", "32"))
             _alpha = int(os.environ.get("FORGE_V2_LORA_ALPHA", str(2 * _r)))
-            _drop = float(os.environ.get("FORGE_V2_LORA_DROPOUT", "0.05"))
+            _drop = float(os.environ.get("FORGE_V2_LORA_DROPOUT", "0.0"))
         except ValueError:
             _r, _alpha, _drop = 32, 64, 0.05
         _event_and_print("sft_v2_adapter", r=_r, alpha=_alpha, dropout=_drop)
