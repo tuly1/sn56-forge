@@ -555,7 +555,9 @@ def run(
         # production trains the adapter at 1.5e-4 with effective batch 16; the prior
         # sits just above it and scales with sqrt(batch) (the Smol sweep chose
         # 4.4e-4 at batch 84, consistent with this law).
-        prior_lr = 2.0e-4 * math.sqrt(max(1, geo.eff_batch) / 16.0)
+        # LR scan on gemma2-cas at batch 15 (2026-09-11): 1.9e-4 → 0.0364, 3e-4 → 0.0358,
+        # 4.5e-4 → 0.0400 (worse than production); the sweep, when affordable, still explores ±0.3 decades
+        prior_lr = 3.0e-4 * math.sqrt(max(1, geo.eff_batch) / 16.0)
     else:
         prior_lr = lr_probe.analytic_lr(weight_rms=_layer_weight_rms(model) or median_weight_rms(model), params_b=params_b,
                                         eff_batch=geo.eff_batch, gradient_noise_scale=gns)
