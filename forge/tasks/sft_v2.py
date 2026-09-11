@@ -778,16 +778,46 @@ def run(
     if row_loss:
         _event_and_print("sft_v2_row_loss", enabled=True, fused=use_liger)
 
+    try:
+        _ema_frac = float(os.environ.get("FORGE_V2_TAIL_EMA", "0") or 0)  # fraction of the phase averaged (0 = off)
+    except ValueError:
+        _ema_frac = 0.0
+    if strategy != "lora":
+        _ema_frac = 0.0  # a full-weight fp32 average would not fit next to the optimizer state
+    ema: dict[str, Any] = {}
+
     class SelectCallback(TrainerCallback):
         def __init__(self, eval_every: int, total_steps: int) -> None:
             self.eval_every = eval_every
             self.total_steps = total_steps
             self.governed = False
+            self.ema_start = int(total_steps * (1.0 - _ema_frac)) if _ema_frac > 0 else None
+            self.ema_n = 0
+
+        def _ema_update(self, m: Any, local_step: int) -> None:
+            # Uniform (LAWA-style) running mean of the trainable weights over the
+            # tail of the phase — a dense average the greedy soup can consider.
+            if self.ema_start is None or local_step < self.ema_start:
+                return
+            import torch
+
+            with torch.no_grad():
+                self.ema_n += 1
+                w = 1.0 / self.ema_n
+                for n, p in m.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if n not in ema:
+                        ema[n] = p.detach().float().clone()
+                    else:
+                        ema[n].mul_(1.0 - w).add_(p.detach().float(), alpha=w)
 
         def on_step_end(self, args, st, control, **kw):  # noqa: ANN001
             local_step = int(st.global_step)
             step = state["step_offset"] + local_step
             m = kw.get("model")
+            if m is not None:
+                self._ema_update(m, local_step)
             if stop_at.should_stop():
                 control.should_training_stop = True
             end_step = int(getattr(st, "max_steps", 0) or self.total_steps)
@@ -948,6 +978,30 @@ def run(
         _event_and_print("sft_v2_phase_end", phase=phase, steps=steps_done, planned=planned_steps, epochs_done=round(state["epochs_done"], 3),
                          t_per_step_measured=round(t_step, 3) if t_step else None, best=state["best"], best_step=state["best_step"],
                          remaining_s=round(deadline.remaining_hard(), 1))
+        if ema and dev_rows_for_selection and deadline.remaining_hard() > finish_reserve + 2 * dev_eval_est:
+            try:
+                import torch as _torch
+
+                with _torch.no_grad():
+                    current = {n: p.detach().clone() for n, p in model.named_parameters() if n in ema}
+                    for n, p in model.named_parameters():
+                        if n in ema:
+                            p.data.copy_(ema[n].to(p.dtype))
+                ema_loss = eval_dev(model)
+                admitted = pool.consider(model, ema_loss, state["step_offset"])
+                if ema_loss < state["best"]:
+                    state["best"], state["best_step"] = ema_loss, state["step_offset"]
+                _event_and_print("sft_v2_tail_ema", phase=phase, n=cb.ema_n, dev_loss=round(ema_loss, 6), admitted=admitted,
+                                 best=round(state["best"], 6))
+                with _torch.no_grad():
+                    for n, p in model.named_parameters():
+                        if n in current:
+                            p.data.copy_(current[n])
+                del current
+            except Exception as exc:
+                _event_and_print("sft_v2_tail_ema_failed", error=f"{type(exc).__name__}: {exc}")
+            ema.clear()
+            _free_cuda()
         phase += 1
         if steps_done < planned_steps and not state["stopped_overfit"]:
             break  # stopped by the clock (or trainer); no time for another phase
