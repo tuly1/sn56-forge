@@ -668,6 +668,8 @@ def run(
             geo = Geometry(geo.micro_batch, eff_new // geo.micro_batch, geo.max_len, geo.gradient_checkpointing, geo.fp32_master, geo.optim)
 
     # ---- learning-rate sweep at the final geometry ----
+    _event_and_print("sft_v2_sweep_gate", batches=len(batches), t_per_step=round(t_per_step, 4) if t_per_step else None,
+                     lr_override=_lr_override, remaining_s=round(deadline.remaining_hard(), 1))
     if batches and t_per_step and _lr_override <= 0 and deadline.remaining_hard() > MIN_TASK_SECONDS_FOR_V2:
         try:
             # the champion stack pays for its LR search even on 45-min tasks; full
