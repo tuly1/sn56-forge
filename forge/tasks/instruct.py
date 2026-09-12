@@ -709,7 +709,21 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 # the floor); there is no time for a second full recipe.
                 telemetry.write_into(spec.output_dir)
                 return
-            # Fresh model for the validated LoRA path.
+            # Fresh model for the validated LoRA path. Drop every reference to the
+            # failed handler's model first: a sharded 32B left resident would starve
+            # the production geometry probe (2026-09-12 dry-2v cascaded to the floor).
+            import gc as _gc
+
+            exc = None
+            loaded = None
+            _gc.collect()
+            try:
+                import torch as _torch_fb
+
+                if _torch_fb.cuda.is_available():
+                    _torch_fb.cuda.empty_cache()
+            except Exception:
+                pass
             loaded = load_base(spec.cached_model_dir, for_generation=False)
             tokenizer = loaded.tokenizer
             telemetry.event("sft_v2_fallback_to_lora")

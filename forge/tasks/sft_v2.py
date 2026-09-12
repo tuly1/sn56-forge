@@ -417,6 +417,8 @@ def memory_probe(model: Any, *, micro: int, max_len: int, vocab: int, autocast: 
     except Exception as exc:  # noqa: BLE001
         if _is_oom(exc):
             return False
+        _event_and_print("sft_v2_memory_probe_error", micro=micro, error=f"{type(exc).__name__}: {exc}"[:200])
+        return False
         raise
     finally:
         model.zero_grad(set_to_none=True)
@@ -515,6 +517,14 @@ def run(
     layers = int(getattr(cfg, "num_hidden_layers", 32) or 32)
     hidden = int(getattr(cfg, "hidden_size", 2048) or 2048)
     use_liger = _liger_ok(model)
+    _dm = getattr(model, "hf_device_map", None) or {}
+    sharded = len({str(v) for v in _dm.values()}) > 1
+    if sharded:
+        # device_map model parallel (Round-2 32B on 4xH100): Triton fused kernels
+        # raised on cross-device tensors during the probe (2026-09-12 dry-2v), so
+        # the sharded route uses plain kernels and a capped micro-batch.
+        use_liger = False
+        _event_and_print("sft_v2_sharded", devices=len({str(v) for v in _dm.values()}), liger=False)
     if use_liger:
         try:
             from liger_kernel.transformers import _apply_liger_kernel_to_instance
@@ -542,6 +552,10 @@ def run(
         # Adapter training is light: no fp32 master copy, plain fused AdamW,
         # checkpointing only when the probe says the geometry does not fit.
         geo = Geometry(geo.micro_batch, geo.grad_accum, geo.max_len, False, False, "adamw_torch_fused")
+        if sharded and geo.micro_batch > 8:
+            # a 32B split over 4 cards keeps ~60 GB per card for activations:
+            # micro 16 x 768 tokens without checkpointing does not fit, micro 8 does
+            geo = Geometry(8, max(1, geo.eff_batch // 8), geo.max_len, False, False, "adamw_torch_fused")
     else:
         if geo.fp32_master:
             model = model.float()
