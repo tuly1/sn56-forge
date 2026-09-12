@@ -641,8 +641,12 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
 
     pinned_route = (
         is_qwen35_model(loaded.model)
-        or _g41._supported_model_route(spec)
-        or (_lfm25._supported_model_route(spec) and not sft_v2.V2_TAKES_LFM25)
+        or (_g41._supported_model_route(spec) and _g41._matches_base_model(loaded.model))
+        or (
+            _lfm25._supported_model_route(spec)
+            and _lfm25._matches_base_model(loaded.model)
+            and not sft_v2.V2_TAKES_LFM25
+        )
     )
     if pinned_route:
         telemetry.event("sft_v2_pinned_route_skip", model=spec.model)

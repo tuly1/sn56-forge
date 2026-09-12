@@ -72,6 +72,20 @@ def _targets(config: Any) -> tuple[str, ...]:
     return tuple(sorted(raw))
 
 
+def _matches_base_model(model: Any) -> bool:
+    """Match the measured base architecture before an adapter is attached."""
+    base = _base_config(model)
+    return bool(
+        str(_value(base, "model_type", "") or "").lower() == "lfm2"
+        and tuple(_value(base, "architectures", ()) or ()) == ("Lfm2ForCausalLM",)
+        and _value(base, "hidden_size") == 2048
+        and _value(base, "intermediate_size") == 10752
+        and _value(base, "num_hidden_layers") == 30
+        and _value(base, "num_attention_heads") == 32
+        and _value(base, "num_key_value_heads") == 8
+    )
+
+
 def eligible_lfm25_production_epoch_cap(
     spec: TaskSpec, model: Any, *, strategy: str, n_gpus: int
 ) -> bool:
@@ -87,16 +101,7 @@ def eligible_lfm25_production_epoch_cap(
     ):
         return False
 
-    base = _base_config(model)
-    if not (
-        str(_value(base, "model_type", "") or "").lower() == "lfm2"
-        and tuple(_value(base, "architectures", ()) or ()) == ("Lfm2ForCausalLM",)
-        and _value(base, "hidden_size") == 2048
-        and _value(base, "intermediate_size") == 10752
-        and _value(base, "num_hidden_layers") == 30
-        and _value(base, "num_attention_heads") == 32
-        and _value(base, "num_key_value_heads") == 8
-    ):
+    if not _matches_base_model(model):
         return False
 
     config = _default_peft_config(model)
