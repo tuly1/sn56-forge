@@ -1146,17 +1146,44 @@ def run(
         selection.load_state(model, chosen_state)
 
     # ---- dev pass: one low-LR epoch over the held-out slice from the chosen weights ----
+    # Harness knobs: FORGE_DEV_PASS_EPOCHS (passes, default 1), FORGE_DEV_PASS_LR_MULT
+    # (default 0.25), FORGE_V2_KEEP_STAGES=1 (export the pre-dev-pass weights and each
+    # pass to <output_dir>-stages/<name> so the stages can be scored separately).
     dev_pass_s = _dev_pass_estimate(len(dev_ex), t_per_step, geo)
-    if dev_ex and len(dev_ex) >= 100 and deadline.remaining_hard() > export_reserve + dev_pass_s + 30 and os.environ.get("FORGE_DEV_PASS", "1") != "0":
+    try:
+        _dp_epochs = max(1, int(os.environ.get("FORGE_DEV_PASS_EPOCHS", "1") or 1))
+        _dp_mult = float(os.environ.get("FORGE_DEV_PASS_LR_MULT", "0.25") or 0.25)
+    except ValueError:
+        _dp_epochs, _dp_mult = 1, 0.25
+    _keep_stages = os.environ.get("FORGE_V2_KEEP_STAGES", "0") == "1"
+
+    def _keep_stage(name: str) -> None:
+        if not _keep_stages:
+            return
         try:
-            _dev_pass(model, dev_ex, collator, lr=lr * 0.25, geo=geo, autocast=autocast, optimizer_factory=optimizer_factory)
-            chosen_state = None  # weights in the model are now the final ones
-            _event_and_print("sft_v2_dev_pass_done", rows=len(dev_ex), lr=lr * 0.25)
+            d = spec.output_dir.rstrip("/") + "-stages/" + name
+            save_adapter(model, tokenizer, d, artifact_truth=ARTIFACT_PARTIAL_TRAINED_BEST, optimizer_step=final_step,
+                         truth_reason="stage_" + name)
+            _event_and_print("sft_v2_stage_kept", stage=name, path=d)
         except Exception as exc:
-            _event_and_print("sft_v2_dev_pass_failed", error=f"{type(exc).__name__}: {exc}")
-            if pool.best() is not None:
-                chosen_state = pool.best()["state"]
-                selection.load_state(model, chosen_state)
+            _event_and_print("sft_v2_stage_failed", stage=name, error=f"{type(exc).__name__}: {exc}")
+
+    if dev_ex and len(dev_ex) >= 100 and deadline.remaining_hard() > export_reserve + dev_pass_s + 30 and os.environ.get("FORGE_DEV_PASS", "1") != "0":
+        _keep_stage("soup")
+        for _k in range(_dp_epochs):
+            if _k > 0 and deadline.remaining_hard() <= export_reserve + dev_pass_s + 30:
+                break
+            try:
+                _dev_pass(model, dev_ex, collator, lr=lr * _dp_mult, geo=geo, autocast=autocast, optimizer_factory=optimizer_factory)
+                chosen_state = None  # weights in the model are now the final ones
+                _event_and_print("sft_v2_dev_pass_done", rows=len(dev_ex), lr=lr * _dp_mult, pass_index=_k + 1)
+                _keep_stage(f"devpass{_k + 1}")
+            except Exception as exc:
+                _event_and_print("sft_v2_dev_pass_failed", error=f"{type(exc).__name__}: {exc}")
+                if pool.best() is not None:
+                    chosen_state = pool.best()["state"]
+                    selection.load_state(model, chosen_state)
+                break
 
     # ---- final save (bf16 weights) ----
     truth = ARTIFACT_COMPLETE_BEST if state["last_phase_complete"] else ARTIFACT_PARTIAL_TRAINED_BEST
