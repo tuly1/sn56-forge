@@ -770,7 +770,11 @@ def run(
     # ---- planning constants ----
     dev_eval_est = _estimate_eval_seconds(len(dev_ex), t_per_step, geo)
     export_reserve = 60.0 if strategy == "lora" else EXPORT_RESERVE_S
-    finish_reserve = export_reserve + 1.5 * dev_eval_est + _dev_pass_estimate(len(dev_ex), t_per_step, geo)
+    try:
+        _soup_reserve_evals = float(os.environ.get("FORGE_V2_SOUP_RESERVE_EVALS", "0") or 0)  # experiment: keep time for the soup
+    except ValueError:
+        _soup_reserve_evals = 0.0
+    finish_reserve = export_reserve + (1.5 + _soup_reserve_evals) * dev_eval_est + _dev_pass_estimate(len(dev_ex), t_per_step, geo)
     max_epochs_total = 4.0 if len(train_ex) < 10000 else 3.0
     try:
         if os.environ.get("FORGE_V2_MAX_EPOCHS"):
