@@ -65,13 +65,16 @@ V2_TAKES_LFM25 = False
 
 
 MULTI_GPU_LORA_MAX_PARAMS_B = 40.0  # device_map-sharded adapter route (Round-2 Qwen3-32B on 4xH100)
+MULTI_GPU_LORA_MIN_PARAMS_B = 12.0  # only the 4xH100 class is validated; 4–12B on 2 GPUs keeps the production path
 
 
 def _multi_gpu_lora() -> bool:
     """Adapter route for large models sharded across several GPUs (naive model
-    parallel via device_map). Off unless FORGE_V2_MULTI_GPU_LORA=1: the production
-    path is the validated multi-GPU route until the 32B dry runs say otherwise."""
-    return os.environ.get("FORGE_V2_MULTI_GPU_LORA", "0") == "1"
+    parallel via device_map). On by default since 2026-09-12: on Qwen3-32B / 4xH100
+    the v2 handler (no fused kernels, micro 8, one annealed cycle at 80% of the
+    window, periodic + final evals, soup, dev pass) scored 0.464868 against the
+    production path's 0.507592 (paired win 0.676). FORGE_V2_MULTI_GPU_LORA=0 disables."""
+    return os.environ.get("FORGE_V2_MULTI_GPU_LORA", "1") != "0"
 
 
 def _gates() -> tuple[float, float]:
@@ -293,7 +296,7 @@ def eligible(spec: TaskSpec, *, is_kl: bool, params_b: float, n_gpus: int, model
     if params_b <= 0 or params_b > cap or not strategy:
         telemetry.event("sft_v2_size_gated", params_b=round(params_b, 3), gates=_gates())
         return False
-    multi_ok = _multi_gpu_lora() and n_gpus > 1 and strategy == "lora"
+    multi_ok = _multi_gpu_lora() and n_gpus > 1 and strategy == "lora" and params_b >= MULTI_GPU_LORA_MIN_PARAMS_B
     if n_gpus != 1 and not (allow_cpu and n_gpus == 0) and not multi_ok:
         return False
     try:
