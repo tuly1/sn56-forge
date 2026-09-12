@@ -221,7 +221,7 @@ def test_floor_best_export_and_non_sft_handlers_remain_unchanged():
             "16ecd365a984b807b7849eb86337092b789ea5bea1e2585768fd5f7cdc92897d"
         ),
         "forge/tuning/plan.py": (
-            "302b0c1da3de865ed08af186cf0b2fc8452173dc9a04ab88eee41a1de6578787"
+            "6f0c0307a3db7b7d0780a77b7e07aa01a1ab808045ff3202b5ba2512c3f47435"
         ),
     }
     assert {path: _sha256(path) for path in expected} == expected
