@@ -64,16 +64,27 @@ DEFAULT_LORA_MAX_PARAMS_B = 5.0
 V2_TAKES_LFM25 = False
 
 
+MULTI_GPU_LORA_MAX_PARAMS_B = 40.0  # device_map-sharded adapter route (Round-2 Qwen3-32B on 4xH100)
+
+
+def _multi_gpu_lora() -> bool:
+    """Adapter route for large models sharded across several GPUs (naive model
+    parallel via device_map). Off unless FORGE_V2_MULTI_GPU_LORA=1: the production
+    path is the validated multi-GPU route until the 32B dry runs say otherwise."""
+    return os.environ.get("FORGE_V2_MULTI_GPU_LORA", "0") == "1"
+
+
 def _gates() -> tuple[float, float]:
     try:
         full_b = float(os.environ.get("FORGE_V2_MAX_PARAMS_B", str(DEFAULT_MAX_PARAMS_B)))
     except ValueError:
         full_b = DEFAULT_MAX_PARAMS_B
+    lora_cap = MULTI_GPU_LORA_MAX_PARAMS_B if _multi_gpu_lora() else MAX_PARAMS_B
     try:
-        lora_b = float(os.environ.get("FORGE_V2_LORA_MAX_PARAMS_B", str(DEFAULT_LORA_MAX_PARAMS_B)))
+        lora_b = float(os.environ.get("FORGE_V2_LORA_MAX_PARAMS_B", str(lora_cap)))
     except ValueError:
-        lora_b = DEFAULT_LORA_MAX_PARAMS_B
-    return min(full_b, MAX_PARAMS_B), min(lora_b, MAX_PARAMS_B)
+        lora_b = lora_cap
+    return min(full_b, MAX_PARAMS_B), min(lora_b, lora_cap)
 
 
 # The adapter path beats production only where production is throughput-bound: long
@@ -277,10 +288,13 @@ def eligible(spec: TaskSpec, *, is_kl: bool, params_b: float, n_gpus: int, model
         return False
     allow_cpu = os.environ.get("FORGE_SFT_V2_ALLOW_CPU") == "1"
     model_type = str(getattr(getattr(model, "config", None), "model_type", "") or "")
-    if params_b <= 0 or params_b > MAX_PARAMS_B or not strategy_for(params_b, model_type):
+    strategy = strategy_for(params_b, model_type)
+    cap = MULTI_GPU_LORA_MAX_PARAMS_B if (_multi_gpu_lora() and strategy == "lora") else MAX_PARAMS_B
+    if params_b <= 0 or params_b > cap or not strategy:
         telemetry.event("sft_v2_size_gated", params_b=round(params_b, 3), gates=_gates())
         return False
-    if n_gpus != 1 and not (allow_cpu and n_gpus == 0):
+    multi_ok = _multi_gpu_lora() and n_gpus > 1 and strategy == "lora"
+    if n_gpus != 1 and not (allow_cpu and n_gpus == 0) and not multi_ok:
         return False
     try:
         import torch
