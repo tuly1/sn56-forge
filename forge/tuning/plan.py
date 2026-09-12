@@ -138,9 +138,21 @@ def make_sft_plan(
     # OOM-retry ladder still backstops a misjudgment.
     if cuda and not use_kl and n_gpus == 1 and per_gpu_gb >= 60.0:
         b["gradient_checkpointing"] = False
+    # Harness experiment knobs for the production adapter (defaults unchanged):
+    # FORGE_LORA_R / FORGE_LORA_ALPHA / FORGE_LORA_DROPOUT / FORGE_LORA_LR.
+    import os as _os
+
+    def _envf(name: str, default: float) -> float:
+        try:
+            return float(_os.environ.get(name, "") or default)
+        except ValueError:
+            return default
+
+    _r = int(_envf("FORGE_LORA_R", 32))
+    _alpha = int(_envf("FORGE_LORA_ALPHA", 2 * _r if _r != 32 else 64))
     return TrainPlan(
-        lora_r=32, lora_alpha=64, lora_dropout=0.05,
-        learning_rate=1.5e-4, max_seq_len=4096, num_epochs=2, strategy="lora", **b,
+        lora_r=_r, lora_alpha=_alpha, lora_dropout=_envf("FORGE_LORA_DROPOUT", 0.05),
+        learning_rate=_envf("FORGE_LORA_LR", 1.5e-4), max_seq_len=4096, num_epochs=2, strategy="lora", **b,
     )
 
 
