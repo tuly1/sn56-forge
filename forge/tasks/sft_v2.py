@@ -292,7 +292,7 @@ def eligible(spec: TaskSpec, *, is_kl: bool, params_b: float, n_gpus: int, model
     allow_cpu = os.environ.get("FORGE_SFT_V2_ALLOW_CPU") == "1"
     model_type = str(getattr(getattr(model, "config", None), "model_type", "") or "")
     strategy = strategy_for(params_b, model_type)
-    cap = MULTI_GPU_LORA_MAX_PARAMS_B if (_multi_gpu_lora() and strategy == "lora") else MAX_PARAMS_B
+    cap = MULTI_GPU_LORA_MAX_PARAMS_B if (_multi_gpu_lora() and strategy == "lora" and n_gpus > 1) else MAX_PARAMS_B
     if params_b <= 0 or params_b > cap or not strategy:
         telemetry.event("sft_v2_size_gated", params_b=round(params_b, 3), gates=_gates())
         return False
