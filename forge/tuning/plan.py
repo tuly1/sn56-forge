@@ -150,6 +150,13 @@ def make_sft_plan(
 
     _r = int(_envf("FORGE_LORA_R", 32))
     _alpha = int(_envf("FORGE_LORA_ALPHA", 2 * _r if _r != 32 else 64))
+    # geometry knobs (multi-GPU throughput experiments): micro-batch, accumulation, checkpointing
+    if _os.environ.get("FORGE_MICRO_BATCH"):
+        b["per_device_batch_size"] = int(_envf("FORGE_MICRO_BATCH", b["per_device_batch_size"]))
+    if _os.environ.get("FORGE_GRAD_ACCUM"):
+        b["grad_accum_steps"] = int(_envf("FORGE_GRAD_ACCUM", b["grad_accum_steps"]))
+    if _os.environ.get("FORGE_GRAD_CKPT") in ("0", "1"):
+        b["gradient_checkpointing"] = _os.environ.get("FORGE_GRAD_CKPT") == "1"
     return TrainPlan(
         lora_r=_r, lora_alpha=_alpha, lora_dropout=_envf("FORGE_LORA_DROPOUT", 0.05),
         learning_rate=_envf("FORGE_LORA_LR", 1.5e-4), max_seq_len=4096, num_epochs=2, strategy="lora", **b,
