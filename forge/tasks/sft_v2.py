@@ -1013,6 +1013,13 @@ def run(
         epochs_left = max_epochs_total - state["epochs_done"]
         if t_step:
             achievable = window * 0.85 / t_step
+            if sharded:
+                # device_map models run ~20% slower in steady state than the timing
+                # probe says and their dev evals cost minutes (32B: 141 s each), so
+                # plan the annealed cycle at 80% of the window to keep the final eval,
+                # the greedy soup and the dev pass (dry-2v lost all three: 0.98 epoch,
+                # clock stop, soup skipped).
+                achievable *= 0.8
             if phase == 0 or state["restarts"] or seed_b_active:
                 # first cycle: one fully annealed epoch (the strongest single
                 # candidate on small data), also the timing measurement
