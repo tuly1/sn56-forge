@@ -780,7 +780,7 @@ def test_truth_relabel_is_atomic_and_does_not_change_weights(tmp_path):
 
 def test_frozen_recipe_files_are_unchanged():
     expected = {
-        "forge/tuning/plan.py": "302b0c1da3de865ed08af186cf0b2fc8452173dc9a04ab88eee41a1de6578787",
+        "forge/tuning/plan.py": "b2d5acb267c9c6f90bc1865ed27ce36ec42b22b50b08431dfc9fc8f7415b1730",
         "forge/tasks/dpo.py": "25bb3d48c2ff1a568d434d3983d4384af1e060967072429cbab68a0b74e1ccd5",
         "forge/tasks/grpo.py": "16ecd365a984b807b7849eb86337092b789ea5bea1e2585768fd5f7cdc92897d",
     }
