@@ -685,6 +685,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 telemetry.event("sft_v2_learnability_failed", error=f"{type(exc).__name__}: {exc}")
                 loaded = load_base(spec.cached_model_dir, for_generation=False)
                 tokenizer = loaded.tokenizer
+    v2_fallback = False
     if not pinned_route and not short_rows and sft_v2.eligible(
         spec, is_kl=is_kl, params_b=params_b, n_gpus=n_gpus, model=loaded.model
     ):
@@ -713,24 +714,29 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 # the floor); there is no time for a second full recipe.
                 telemetry.write_into(spec.output_dir)
                 return
-            # Fresh model for the validated LoRA path. Drop every reference to the
-            # failed handler's model first: a sharded 32B left resident would starve
-            # the production geometry probe (2026-09-12 dry-2v cascaded to the floor).
-            import gc as _gc
+            v2_fallback = True
+    if v2_fallback:
+        # Fresh model for the validated LoRA path. This runs outside the except
+        # suite on purpose: while the handler is active, the exception's traceback
+        # still owns the failed handler's frames (model, trainer, optimizer), so
+        # clearing locals and collecting inside it cannot free the old model. A
+        # sharded 32B left resident would starve the production geometry probe
+        # (2026-09-12 dry-2v cascaded to the floor).
+        import gc as _gc
 
-            exc = None
-            loaded = None
-            _gc.collect()
-            try:
-                import torch as _torch_fb
+        loaded = None
+        tokenizer = None
+        _gc.collect()
+        try:
+            import torch as _torch_fb
 
-                if _torch_fb.cuda.is_available():
-                    _torch_fb.cuda.empty_cache()
-            except Exception:
-                pass
-            loaded = load_base(spec.cached_model_dir, for_generation=False)
-            tokenizer = loaded.tokenizer
-            telemetry.event("sft_v2_fallback_to_lora")
+            if _torch_fb.cuda.is_available():
+                _torch_fb.cuda.empty_cache()
+        except Exception:
+            pass
+        loaded = load_base(spec.cached_model_dir, for_generation=False)
+        tokenizer = loaded.tokenizer
+        telemetry.event("sft_v2_fallback_to_lora")
     use_full = decide_full_finetune(
         use_kl=is_kl, params_b=params_b, n_gpus=n_gpus, per_gpu_gb=per_gpu_gb
     )
