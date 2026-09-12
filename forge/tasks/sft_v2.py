@@ -621,6 +621,10 @@ def run(
         # 4.5e-4 → 0.0400. With dropout 0 (now the default) 1.9e-4 gives 0.0352 while 3e-4 gives 0.0363:
         # the two changes overshoot together, so the prior stays at 2e-4; the sweep explores ±0.3 decades
         prior_lr = 2.0e-4 * math.sqrt(max(1, geo.eff_batch) / 16.0)
+        if sharded:
+            # 12–40B models sharded over several GPUs: 1.5e-4 is the tested value
+            # (Qwen3-32B dry-2v 0.464868); the 3B prior 2e-4 is untested there.
+            prior_lr = min(prior_lr, 1.5e-4)
     else:
         prior_lr = lr_probe.analytic_lr(weight_rms=_layer_weight_rms(model) or median_weight_rms(model), params_b=params_b,
                                         eff_batch=geo.eff_batch, gradient_noise_scale=gns)
