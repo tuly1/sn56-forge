@@ -916,6 +916,15 @@ def run(
     t_step = t_per_step
     phase = 0
     oom_retries = 0
+    # Two-seed exact soup (2026-09-12): a second independently initialised adapter
+    # trained for one annealed epoch in a different data order, combined with the
+    # first as an exact equal-weight soup (rank 2r). On ru-AAQG the exact soup of
+    # two seeds scored 0.557561 vs 0.558400 / 0.564622 for the seeds themselves
+    # (the seed spread alone is ~1%). Only where a second epoch fits comfortably.
+    two_seed = os.environ.get("FORGE_V2_TWO_SEED", "0") == "1" and strategy == "lora"
+    two_seed_result: tuple[float, int, str] | None = None
+    seed_b_active = False
+    seed_a: dict[str, Any] = {}
     while phase < 4:
         remaining = deadline.remaining_hard()
         window = remaining - finish_reserve
@@ -933,6 +942,27 @@ def run(
             _event_and_print("sft_v2_restart", lr=lr, from_step=pool.best()["step"], window_s=round(window, 1))
         if phase > 0 and window < min_window:
             break
+        if two_seed and phase == 1 and not seed_b_active and two_seed_result is None and state["last_phase_complete"] and t_step and pool.items:
+            need = steps_per_epoch * t_step * 1.2 + 4.0 * dev_eval_est + 90.0
+            if window > need:
+                try:
+                    loss_a, state_a, members_a = selection.greedy_soup(
+                        model, pool, eval_dev, time_budget_s=min(300.0, 0.2 * window), log=lambda n, d: _event_and_print(n, **_flat(d))
+                    )
+                    if state_a is None:
+                        loss_a, state_a = pool.best()["loss"], pool.best()["state"]
+                    seed_a = {"loss": loss_a, "state": state_a, "members": members_a, "step": state["step_offset"]}
+                    _reinit_lora(model, _seed_base + 1000)
+                    pool.items = []
+                    state.update(best=float("inf"), best_step=0, overfit=0, stopped_overfit=False, last_eval_step=-1, phase_evals=0)
+                    seed_b_active = True
+                    _event_and_print("sft_v2_two_seed_a", dev_loss=round(loss_a, 6), members=members_a, need_s=round(need, 1), window_s=round(window, 1))
+                except Exception as exc:
+                    _event_and_print("sft_v2_two_seed_failed", stage="a", error=f"{type(exc).__name__}: {exc}")
+                    two_seed = False
+            else:
+                _event_and_print("sft_v2_two_seed_skipped", need_s=round(need, 1), window_s=round(window, 1))
+                two_seed = False
         # Each phase is a fully annealed cosine cycle of at most one epoch (the
         # affordable fraction when less fits), so every phase ends on a low
         # learning rate: the phase endpoints are the checkpoints the soup wants.
@@ -946,7 +976,7 @@ def run(
         epochs_left = max_epochs_total - state["epochs_done"]
         if t_step:
             achievable = window * 0.85 / t_step
-            if phase == 0 or state["restarts"]:
+            if phase == 0 or state["restarts"] or seed_b_active:
                 # first cycle: one fully annealed epoch (the strongest single
                 # candidate on small data), also the timing measurement
                 epochs = min(epochs_left, 1.0, achievable / steps_per_epoch)
@@ -963,14 +993,15 @@ def run(
             break
         warmup = min(200, max(3, int(0.03 * total_steps)))
         eval_every = max(10, min(max(1, steps_per_epoch // 8), max(1, total_steps // 8)))
-        phase_lr = lr if (phase == 0 or state["restarts"]) else lr * max(0.1, _restart_factor ** phase)
+        phase_lr = lr if (phase == 0 or state["restarts"] or seed_b_active) else lr * max(0.1, _restart_factor ** phase)
         state["overfit"] = 0
         state["phase_evals"] = 0
         _event_and_print("sft_v2_plan", phase=phase, lr=phase_lr, t_per_step=t_step, epochs=epochs, total_steps=total_steps,
                          warmup=warmup, eval_every=eval_every, window_s=round(window, 1), epochs_done=round(state["epochs_done"], 3))
         cb = SelectCallback(eval_every, total_steps)
         trainer = TrainerCls(
-            model=model, args=make_args(epochs, phase_lr, warmup, geo.micro_batch, geo.grad_accum, seed=_seed_base + phase),
+            model=model, args=make_args(epochs, phase_lr, warmup, geo.micro_batch, geo.grad_accum,
+                                        seed=_seed_base + (1000 if seed_b_active else phase)),
             train_dataset=train_ds, data_collator=collator, callbacks=[cb, telemetry.make_trainer_callback(spec.output_dir)],
         )
         t_phase0 = time.monotonic()
@@ -1049,6 +1080,21 @@ def run(
                 _event_and_print("sft_v2_tail_ema_failed", error=f"{type(exc).__name__}: {exc}")
             ema.clear()
             _free_cuda()
+        if seed_b_active:
+            seed_b_active = False
+            try:
+                two_seed_result = _finish_two_seed(model, pool, seed_a, eval_dev, state, deadline, finish_reserve, dev_eval_est,
+                                                   log=_event_and_print, flat=_flat)
+            except Exception as exc:
+                _event_and_print("sft_v2_two_seed_failed", stage="b", error=f"{type(exc).__name__}: {exc}")
+                two_seed_result = None
+                if not pool.items and seed_a.get("state") is not None:
+                    selection.load_state(model, seed_a["state"])
+                    pool.items = [{"loss": seed_a["loss"], "step": seed_a["step"], "state": seed_a["state"]}]
+                    state["best"], state["best_step"] = seed_a["loss"], seed_a["step"]
+            if two_seed_result is not None:
+                phase += 1
+                break
         phase += 1
         if steps_done < planned_steps and not state["stopped_overfit"]:
             break  # stopped by the clock (or trainer); no time for another phase
@@ -1058,6 +1104,10 @@ def run(
     if final_step <= 0:
         return
 
+    if two_seed_result is not None:
+        # the chosen candidate (single seed or the exact two-seed soup) is loaded in the model
+        state["best"], state["best_step"], state["last_eval_step"] = two_seed_result[0], two_seed_result[1], final_step
+        pool.items = []
     # ---- final evaluation of the last weights (may be the best) ----
     if dev_rows_for_selection and state["last_eval_step"] != final_step and deadline.remaining_hard() > export_reserve + dev_eval_est:
         last_loss = eval_dev(model)
@@ -1146,6 +1196,101 @@ def _layer_weight_rms(model: Any) -> float | None:
         return vals[len(vals) // 2]
     except Exception:
         return None
+
+
+def _reinit_lora(model: Any, seed: int) -> None:
+    """Fresh LoRA initialisation (A: kaiming-uniform as PEFT does, B: zeros) under `seed`."""
+    import torch
+
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if ".lora_A." in name:
+                torch.nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+            elif ".lora_B." in name:
+                p.zero_()
+
+
+def _rebuild_default_adapter(model: Any, new_r: int) -> None:
+    """Replace the 'default' LoRA adapter by a fresh one of rank `new_r` (same
+    alpha/targets/dropout), so an exact two-adapter soup can live in the model
+    and be exported through the ordinary PEFT save path."""
+    import copy
+
+    cfg = copy.deepcopy(model.peft_config["default"])
+    cfg.r = int(new_r)
+    if isinstance(getattr(cfg, "rank_pattern", None), dict):
+        cfg.rank_pattern = {}
+    if isinstance(getattr(cfg, "alpha_pattern", None), dict):
+        cfg.alpha_pattern = {}
+    model.delete_adapter("default")
+    model.add_adapter("default", cfg)
+    model.set_adapter("default")
+    for name, p in model.named_parameters():
+        p.requires_grad_(".lora_" in name)
+
+
+def _load_two_seed_soup(model: Any, state_a: dict[str, Any], state_b: dict[str, Any]) -> int:
+    """Write A* = [A1; A2], B* = [B1 B2] into the (rank 2r) default adapter; alpha
+    unchanged, so the update equals the equal-weight average of the two adapters."""
+    import torch
+
+    n = 0
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name in state_a and name in state_b:
+                if ".lora_A." in name:
+                    p.data.copy_(torch.cat([state_a[name], state_b[name]], dim=0).to(device=p.device, dtype=p.dtype))
+                    n += 1
+                elif ".lora_B." in name:
+                    p.data.copy_(torch.cat([state_a[name], state_b[name]], dim=1).to(device=p.device, dtype=p.dtype))
+                    n += 1
+    return n
+
+
+def _finish_two_seed(model: Any, pool: Any, seed_a: dict[str, Any], eval_dev: Callable[[Any], float], state: dict[str, Any],
+                     deadline: Any, finish_reserve: float, dev_eval_est: float, *, log: Callable[..., None],
+                     flat: Callable[[dict], dict]) -> tuple[float, int, str] | None:
+    """After the seed-B epoch: soup B, build the exact A+B soup at rank 2r,
+    keep the best of {A, B, A+B} by dev loss (near-ties go to the soup)."""
+    window = deadline.remaining_hard() - finish_reserve
+    if not pool.items or window < 4.0 * dev_eval_est + 30.0:
+        return None
+    loss_b, state_b, members_b = selection.greedy_soup(
+        model, pool, eval_dev, time_budget_s=min(300.0, 0.3 * window), log=lambda n, d: log(n, **flat(d))
+    )
+    if state_b is None:
+        loss_b, state_b = pool.best()["loss"], pool.best()["state"]
+    step_b = state["step_offset"]
+    loss_a, state_a = float(seed_a["loss"]), seed_a["state"]
+    r = int(model.peft_config["default"].r)
+    loss_ab: float | None = None
+    try:
+        _rebuild_default_adapter(model, 2 * r)
+        n = _load_two_seed_soup(model, state_a, state_b)
+        if n == 0:
+            raise RuntimeError("no adapter tensors matched")
+        loss_ab = float(eval_dev(model))
+    except Exception as exc:
+        log("sft_v2_two_seed_soup_failed", error=f"{type(exc).__name__}: {exc}")
+        loss_ab = None
+    best_single = min(loss_a, loss_b)
+    if loss_ab is not None and math.isfinite(loss_ab) and loss_ab <= best_single * 1.003:
+        chosen, chosen_loss, chosen_step = "soup", loss_ab, step_b
+    else:
+        if int(model.peft_config["default"].r) != r:
+            _rebuild_default_adapter(model, r)
+        if loss_a <= loss_b:
+            selection.load_state(model, state_a)
+            chosen, chosen_loss, chosen_step = "a", loss_a, int(seed_a["step"])
+        else:
+            selection.load_state(model, state_b)
+            chosen, chosen_loss, chosen_step = "b", loss_b, step_b
+    log("sft_v2_two_seed", loss_a=round(loss_a, 6), loss_b=round(loss_b, 6), loss_soup=round(loss_ab, 6) if loss_ab is not None else None,
+        chosen=chosen, members_a=seed_a.get("members"), members_b=members_b, rank=int(model.peft_config["default"].r))
+    return chosen_loss, chosen_step, chosen
 
 
 def _min_lr_rate() -> float:
