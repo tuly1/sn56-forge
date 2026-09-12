@@ -990,6 +990,13 @@ def run(
             _event_and_print("sft_v2_restart", lr=lr, from_step=pool.best()["step"], window_s=round(window, 1))
         if phase > 0 and window < min_window:
             break
+        if phase > 0 and os.environ.get("FORGE_V2_SOUP_FIRST", "0") == "1" and t_step:
+            # experiment: a later phase only when the greedy soup (3 evals) and the
+            # dev pass still fit after it; otherwise stop and soup the phase-0 pool
+            soup_need = 3.0 * dev_eval_est + _dev_pass_estimate(len(dev_ex), t_step, geo) + 60.0
+            if window - soup_need < max(10, int(0.15 * steps_per_epoch)) * t_step:
+                _event_and_print("sft_v2_soup_first_stop", window_s=round(window, 1), soup_need_s=round(soup_need, 1))
+                break
         if two_seed and phase == 1 and not seed_b_active and two_seed_result is None and state["last_phase_complete"] and t_step and pool.items:
             need = steps_per_epoch * t_step * 1.2 + 4.0 * dev_eval_est + 90.0
             if window > need:
