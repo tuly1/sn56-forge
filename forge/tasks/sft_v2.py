@@ -733,6 +733,15 @@ def run(
             geo = Geometry(geo.micro_batch, eff_new // geo.micro_batch, geo.max_len, geo.gradient_checkpointing, geo.fp32_master, geo.optim)
 
     # ---- learning-rate sweep at the final geometry ----
+    # Adapters skip the sweep (2026-09-12): its 51-step probes cannot resolve the
+    # ~1% differences between 2.2e-4 and 3.2e-4 and pick the higher LR in about
+    # half the runs (Gemma-2-2B: 3.16e-4 → 0.035777 / 0.035153 vs 2.24e-4 → 0.034361
+    # with everything else equal), while the fixed prior is at or near the best on
+    # Qwen2.5-3B as well. The 15% of the budget goes to training instead.
+    # FORGE_V2_ADAPTER_SWEEP=1 re-enables it for experiments.
+    if strategy == "lora" and os.environ.get("FORGE_V2_ADAPTER_SWEEP", "0") != "1" and _lr_override <= 0:
+        _event_and_print("sft_v2_sweep_skipped", strategy=strategy, lr=prior_lr)
+        _lr_override = prior_lr
     _event_and_print("sft_v2_sweep_gate", batches=len(batches), t_per_step=round(t_per_step, 4) if t_per_step else None,
                      lr_override=_lr_override, remaining_s=round(deadline.remaining_hard(), 1))
     if batches and t_per_step and _lr_override <= 0 and deadline.remaining_hard() > MIN_TASK_SECONDS_FOR_V2:
