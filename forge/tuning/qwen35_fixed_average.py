@@ -96,14 +96,22 @@ def eligible_route(
     mode = _endpoint_mode(spec, n_gpus)
     if mode is None:
         return None
+    # The validator anonymizes several production models to the same 16-hex
+    # cache contract. Either exact Qwen3.5-4B payload or loaded-base identity
+    # claims this endpoint; both must agree before it can run. Unrelated
+    # anonymous models continue through their ordinary route.
+    exact_base = _exact_base(model)
+    exact_payload = _exact_payload(str(spec.cached_model_dir))
+    if mode == "anonymous_two_gpu" and not exact_base and not exact_payload:
+        return None
     if (
         spec.task_type != "InstructTextTask"
         or spec.instruct is None
         or spec.instruct.output is None
         or spec.use_kl
         or strategy != "lora"
-        or not _exact_payload(str(spec.cached_model_dir))
-        or not _exact_base(model)
+        or not exact_payload
+        or not exact_base
     ):
         raise ValueError("Qwen fixed-average production identity drift")
     return FixedAverageRoute(endpoint_mode=mode)

@@ -9,15 +9,32 @@ from safetensors.torch import load_file, save_file
 from forge.tuning import qwen35_fixed_average as fixed
 
 
-class Qwen3_5TextConfig:
-    model_type = "qwen3_5_text"
-    hidden_size = 2560
-    num_hidden_layers = 32
-    vocab_size = 248320
+def qwen35_model(*, hidden_size=2560, num_hidden_layers=32, vocab_size=248320):
+    config = type(
+        "Qwen3_5TextConfig",
+        (),
+        {
+            "model_type": "qwen3_5_text",
+            "hidden_size": hidden_size,
+            "num_hidden_layers": num_hidden_layers,
+            "vocab_size": vocab_size,
+        },
+    )
+    return type("Qwen3_5ForCausalLM", (), {"config": config()})()
 
 
-class Qwen3_5ForCausalLM:
-    config = Qwen3_5TextConfig()
+class Lfm2MoeForCausalLM:
+    class config:
+        model_type = "lfm2_moe"
+        hidden_size = 2048
+        intermediate_size = 7168
+        num_hidden_layers = 24
+        vocab_size = 128000
+
+
+class GraniteForCausalLM:
+    class config:
+        model_type = "granite"
 
 
 def spec(model="Qwen/Qwen3.5-4B", cache="/cache/models/Qwen--Qwen3.5-4B", baseline="/cache/baseline.json"):
@@ -30,12 +47,12 @@ def spec(model="Qwen/Qwen3.5-4B", cache="/cache/models/Qwen--Qwen3.5-4B", baseli
 
 def test_exact_named_and_anonymous_production_routes(monkeypatch):
     monkeypatch.setattr(fixed, "_exact_payload", lambda _path: True)
-    named = fixed.eligible_route(spec(), Qwen3_5ForCausalLM(), strategy="lora", n_gpus=1)
+    named = fixed.eligible_route(spec(), qwen35_model(), strategy="lora", n_gpus=1)
     assert named.endpoint_mode == "named_one_gpu"
     alias = "0123456789abcdef"
     anonymous = spec(alias, f"/cache/models/{alias}")
     route = fixed.eligible_route(
-        anonymous, Qwen3_5ForCausalLM(), strategy="lora", n_gpus=2
+        anonymous, qwen35_model(), strategy="lora", n_gpus=2
     )
     assert route.endpoint_mode == "anonymous_two_gpu"
     assert route.minimum_soft_seconds == 2400.0
@@ -45,15 +62,82 @@ def test_route_is_inert_for_other_models_and_rejects_provenance_drift(monkeypatc
     monkeypatch.setattr(fixed, "_exact_payload", lambda _path: True)
     assert fixed.eligible_route(
         spec("tiiuae/falcon-7b", "/cache/models/tiiuae--falcon-7b"),
-        Qwen3_5ForCausalLM(), strategy="lora", n_gpus=1,
+        qwen35_model(), strategy="lora", n_gpus=1,
     ) is None
     alias = "0123456789abcdef"
     assert fixed.eligible_route(
-        spec(alias, f"/cache/models/{alias}", baseline=None),
-        Qwen3_5ForCausalLM(), strategy="lora", n_gpus=2,
+        spec(alias, f"/cache/models/{alias}", baseline=None), qwen35_model(), strategy="lora", n_gpus=2,
     ) is None
     with pytest.raises(ValueError, match="identity drift"):
         fixed.eligible_route(spec(), object(), strategy="lora", n_gpus=1)
+
+
+def test_anonymous_non_qwen_families_skip_fixed_average(monkeypatch):
+    monkeypatch.setattr(fixed, "_exact_payload", lambda _path: False)
+    alias = "0123456789abcdef"
+    anonymous_lfm = spec(alias, f"/cache/models/{alias}")
+    assert fixed.eligible_route(
+        anonymous_lfm, Lfm2MoeForCausalLM(), strategy="lora", n_gpus=2
+    ) is None
+    assert fixed.eligible_route(
+        anonymous_lfm, GraniteForCausalLM(), strategy="lora", n_gpus=2
+    ) is None
+    assert fixed.eligible_route(
+        anonymous_lfm, qwen35_model(hidden_size=4096, num_hidden_layers=48), strategy="lora", n_gpus=2
+    ) is None
+
+
+def test_anonymous_exact_qwen_wrong_payload_still_raises(monkeypatch):
+    monkeypatch.setattr(fixed, "_exact_payload", lambda _path: False)
+    alias = "0123456789abcdef"
+    with pytest.raises(ValueError, match="identity drift"):
+        fixed.eligible_route(
+            spec(alias, f"/cache/models/{alias}"),
+            qwen35_model(),
+            strategy="lora",
+            n_gpus=2,
+        )
+
+
+def test_known_qwen_payload_with_wrong_loaded_base_still_raises(monkeypatch):
+    monkeypatch.setattr(fixed, "_exact_payload", lambda _path: True)
+    alias = "0123456789abcdef"
+    with pytest.raises(ValueError, match="identity drift"):
+        fixed.eligible_route(
+            spec(alias, f"/cache/models/{alias}"),
+            qwen35_model(hidden_size=4096, num_hidden_layers=48),
+            strategy="lora",
+            n_gpus=2,
+        )
+
+
+def test_wrapped_exact_qwen_with_wrong_payload_still_raises(monkeypatch):
+    monkeypatch.setattr(fixed, "_exact_payload", lambda _path: False)
+
+    class PeftModelForCausalLM:
+        def get_base_model(self):
+            return qwen35_model()
+
+    alias = "0123456789abcdef"
+    for endpoint, gpus in [(spec(), 1), (spec(alias, f"/cache/models/{alias}"), 2)]:
+        with pytest.raises(ValueError, match="identity drift"):
+            fixed.eligible_route(
+                endpoint, PeftModelForCausalLM(), strategy="lora", n_gpus=gpus
+            )
+
+
+def test_wrapped_anonymous_lfm_skips_fixed_average(monkeypatch):
+    monkeypatch.setattr(fixed, "_exact_payload", lambda _path: False)
+
+    class PeftModelForCausalLM:
+        def get_base_model(self):
+            return Lfm2MoeForCausalLM()
+
+    alias = "0123456789abcdef"
+    assert fixed.eligible_route(
+        spec(alias, f"/cache/models/{alias}"), PeftModelForCausalLM(),
+        strategy="lora", n_gpus=2,
+    ) is None
 
 
 def test_strict_peft_unwrap_and_deadline(monkeypatch):
@@ -61,7 +145,7 @@ def test_strict_peft_unwrap_and_deadline(monkeypatch):
 
     class PeftModelForCausalLM:
         def get_base_model(self):
-            return Qwen3_5ForCausalLM()
+            return qwen35_model()
 
     assert fixed.eligible_route(
         spec(), PeftModelForCausalLM(), strategy="lora", n_gpus=1
