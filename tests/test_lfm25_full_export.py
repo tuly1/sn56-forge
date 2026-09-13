@@ -168,6 +168,59 @@ def test_native_loader_does_not_retry_after_oom(monkeypatch, tmp_path):
     assert calls == ["sdpa"]
 
 
+def test_merge_precision_promotes_only_adapted_weights_then_casts_once():
+    torch = pytest.importorskip("torch")
+    peft = pytest.importorskip("peft")
+
+    class Tiny(torch.nn.Module):
+        def __init__(self, dtype=torch.bfloat16):
+            super().__init__()
+            self.linear = torch.nn.Linear(4, 4, bias=False, dtype=dtype)
+            self.unadapted = torch.nn.Linear(4, 4, bias=False, dtype=dtype)
+            self.register_buffer("unadapted_buffer", torch.ones(1, dtype=torch.float32))
+
+    config = peft.LoraConfig(
+        r=1, lora_alpha=1, lora_dropout=0.0, bias="none",
+        target_modules=["linear"], task_type=None,
+    )
+    model = peft.get_peft_model(Tiny(), config, adapter_name="default")
+    with torch.no_grad():
+        model.base_model.model.linear.lora_A["default"].weight.copy_(
+            torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        )
+        model.base_model.model.linear.lora_B["default"].weight.copy_(
+            torch.tensor([[-0.8886717557907104], [0.0], [0.0], [0.0]])
+        )
+        model.base_model.model.linear.weight[0, 0] = -0.09130859375
+    original = model.base_model.model.linear.weight.detach().float().clone()
+    a = model.base_model.model.linear.lora_A["default"].weight.detach().float()
+    b = model.base_model.model.linear.lora_B["default"].weight.detach().float()
+    expected = original + b @ a
+    legacy = model.base_model.model.linear.weight.detach().clone()
+    legacy += (b @ a).to(legacy.dtype)
+    promoted = export._promote_adapted_base_weights(model)
+    assert len(promoted) == 1
+    assert model.base_model.model.linear.weight.dtype == torch.float32
+    assert model.base_model.model.unadapted.weight.dtype == torch.bfloat16
+    assert model.base_model.model.unadapted_buffer.dtype == torch.float32
+    merged = model.merge_and_unload(safe_merge=True)
+    assert torch.equal(merged.linear.weight, expected)
+    assert legacy[0, 0] != expected[0, 0].to(torch.bfloat16)
+    cast = export._restore_adapted_base_weights(promoted, merged)
+    assert cast == 1
+    assert merged.linear.weight.dtype == torch.bfloat16
+    assert torch.equal(merged.linear.weight, expected.to(torch.bfloat16))
+    assert merged.unadapted_buffer.dtype == torch.float32
+
+    fp32_model = peft.get_peft_model(Tiny(dtype=torch.float32), config, adapter_name="default")
+    fp32_promoted = export._promote_adapted_base_weights(fp32_model)
+    assert len(fp32_promoted) == 1
+    assert all(dtype == torch.float32 for _, dtype in fp32_promoted)
+    fp32_merged = fp32_model.merge_and_unload(safe_merge=True)
+    assert export._restore_adapted_base_weights(fp32_promoted, fp32_merged) == 0
+    assert fp32_merged.unadapted_buffer.dtype == torch.float32
+
+
 def test_non_lfm_config_does_not_load_weights(monkeypatch, tmp_path):
     output = tmp_path / "output"
     _adapter_output(output)

@@ -179,6 +179,70 @@ def _load_native_base(base_dir: Path) -> SimpleNamespace:
     return SimpleNamespace(model=model, tokenizer=tokenizer)
 
 
+def _promote_adapted_base_weights(
+    model: Any, adapter_name: str = "default"
+) -> list[tuple[Any, Any]]:
+    """Promote only LoRA-targeted base weights before the native merge.
+
+    PEFT 0.19 computes a vanilla delta in the adapter dtype, then casts it to
+    the base dtype before adding it.  On the BF16 export path that rounds the
+    delta before addition, which is especially consequential for LFM router
+    gates.  Keeping the base weights of adapted layers in FP32 through
+    ``merge_and_unload`` preserves the FP32 sum; the promoted adapted
+    parameters are restored to their original dtype exactly once after the
+    native merge.
+    """
+    import torch
+
+    adapted: list[tuple[Any, Any]] = []
+    seen: set[int] = set()
+    with torch.no_grad():
+        for module in model.modules():
+            lora_a = getattr(module, "lora_A", None)
+            getter = getattr(module, "get_base_layer", None)
+            if lora_a is None or not callable(getter):
+                continue
+            try:
+                has_adapter = adapter_name in lora_a
+            except TypeError:
+                has_adapter = False
+            if not has_adapter:
+                continue
+            base_layer = getter()
+            for name in ("weight", "bias"):
+                parameter = getattr(base_layer, name, None)
+                if parameter is None or not parameter.is_floating_point():
+                    continue
+                if id(parameter) in seen:
+                    continue
+                seen.add(id(parameter))
+                original_dtype = parameter.dtype
+                adapted.append((parameter, original_dtype))
+                if original_dtype != torch.float32:
+                    parameter.data = parameter.data.float()
+    if not adapted:
+        raise RuntimeError("no adapted base weights were found")
+    return adapted
+
+
+def _restore_adapted_base_weights(
+    promoted: list[tuple[Any, Any]], merged: Any
+) -> int:
+    """Restore only promoted adapted parameters after the native merge."""
+    import torch
+
+    merged_parameter_ids = {id(parameter) for parameter in merged.parameters()}
+    cast = 0
+    with torch.no_grad():
+        for parameter, original_dtype in promoted:
+            if id(parameter) not in merged_parameter_ids:
+                raise RuntimeError("native merge replaced an adapted base parameter")
+            if parameter.dtype != original_dtype:
+                parameter.data = parameter.data.to(dtype=original_dtype)
+                cast += 1
+    return cast
+
+
 def _reconstruct_and_promote(
     spec: Any, output_dir: Path, backup: Path, truth: str, step: int
 ) -> None:
@@ -227,13 +291,19 @@ def _reconstruct_and_promote(
         if not torch.equal(roundtrip[key].detach().cpu(), value):
             raise RuntimeError(f"PEFT adapter tensor round trip differs: {key}")
 
+    promoted = _promote_adapted_base_weights(peft_model)
     merged = peft_model.merge_and_unload(safe_merge=True)
+    cast_back = _restore_adapted_base_weights(promoted, merged)
     telemetry.event(
         "lfm_moe_full_export_prepared",
         adapter_config_sha256=_sha256(backup / "adapter_config.json"),
         adapter_model_sha256=_sha256(backup / "adapter_model.safetensors"),
         adapter_tensor_count=len(saved),
         nonzero_lora_B_count=len(nonzero_b),
+        fp32_adapted_base_layers=sum(dtype != torch.float32 for _, dtype in promoted),
+        adapted_base_parameter_count=len(promoted),
+        merged_tensors_cast_back=cast_back,
+        merge_precision="fp32_adapted_base_then_single_cast",
         source_adapter_backup=str(backup),
         production_qualified=False,
     )
