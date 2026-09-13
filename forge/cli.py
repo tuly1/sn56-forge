@@ -135,11 +135,12 @@ def _run(spec: TaskSpec, deadline: Deadline) -> None:
     if handler is not None:
         try:
             handler(spec, deadline)
-            # This is a separately reviewed, opt-in post-handler operation. The
-            # handler's model/trainer locals are gone, so the full export loads a
-            # fresh base and cannot destructively merge the live training model.
-            # Export failures are diagnostic and must leave the selected adapter
-            # for the uploader; they must never enter the fallback path below.
+            # This is a separately reviewed, family/task-gated post-handler
+            # operation. The handler's model/trainer locals are gone, so the
+            # full export loads a fresh base and cannot destructively merge the
+            # live training model. Export failures are diagnostic and must leave
+            # the selected adapter for the uploader; they must never enter the
+            # fallback path below. FORGE_LFM_MOE_FULL_EXPORT=0 opts out.
             try:
                 from forge.tasks.lfm25_full_export import maybe_export
 

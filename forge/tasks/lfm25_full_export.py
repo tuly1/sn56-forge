@@ -1,12 +1,12 @@
-"""Opt-in post-handler export of a selected LFM2-MoE LoRA artifact.
+"""Family/task-gated post-handler export of a selected LFM2-MoE LoRA artifact.
 
-The validator's normal output is an adapter.  This module is deliberately
-disabled unless ``FORGE_LFM_MOE_FULL_EXPORT=1`` is set.  When enabled, it runs
-after the task handler has returned, backs up the selected adapter under the
-training work directory, reconstructs a fresh PEFT model from the native base,
-and atomically promotes a merged full model to the normal output path.  A
-failure is diagnostic only: the original adapter remains the output and the
-CLI must not invoke its fallback.
+The validator's normal output is an adapter.  For the native LFM2-MoE
+Instruct/non-KL task shape this runs by default after the task handler;
+``FORGE_LFM_MOE_FULL_EXPORT=0`` is the explicit opt-out.  It backs up the
+selected adapter under the training work directory, reconstructs a fresh PEFT
+model from the native base, and atomically promotes a merged full model to the
+normal output path.  A failure is diagnostic only: the original adapter remains
+the output and the CLI must not invoke its fallback.
 """
 
 from __future__ import annotations
@@ -316,8 +316,8 @@ def _reconstruct_and_promote(
 
 
 def maybe_export(spec: Any, deadline: Deadline) -> bool:
-    """Best-effort opt-in export; never raises into CLI fallback handling."""
-    if os.environ.get(EXPORT_ENV, "0") != "1":
+    """Best-effort gated export; never raises into CLI fallback handling."""
+    if os.environ.get(EXPORT_ENV, "1") != "1":
         return False
     output_dir = Path(spec.output_dir)
     try:

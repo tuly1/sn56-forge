@@ -62,8 +62,8 @@ def test_adapter_key_inserts_default_before_weight():
         export.internal_adapter_key("base.model.weight")
 
 
-def test_export_is_off_by_default_and_does_not_load_or_touch_output(monkeypatch):
-    monkeypatch.delenv(export.EXPORT_ENV, raising=False)
+def test_explicit_zero_opt_out_does_not_load_or_touch_output(monkeypatch):
+    monkeypatch.setenv(export.EXPORT_ENV, "0")
     def fail(*_args, **_kwargs):
         raise AssertionError("disabled export loaded a model")
     monkeypatch.setattr(export, "_load_native_base", fail)
@@ -91,7 +91,7 @@ def test_enabled_success_keeps_backup_and_promotes_via_isolated_stage(monkeypatc
     work = tmp_path / "work"
     spec = _spec(output=str(output))
     spec.cached_model_dir = str(base)
-    monkeypatch.setenv(export.EXPORT_ENV, "1")
+    monkeypatch.delenv(export.EXPORT_ENV, raising=False)
     monkeypatch.setattr(export, "workdir", lambda _spec: str(work))
     monkeypatch.setattr(export, "_reconstruct_and_promote", lambda *_args: None)
     monkeypatch.setattr(export, "telemetry", SimpleNamespace(event=lambda *_a, **_k: None))
