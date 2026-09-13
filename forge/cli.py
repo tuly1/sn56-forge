@@ -135,6 +135,21 @@ def _run(spec: TaskSpec, deadline: Deadline) -> None:
     if handler is not None:
         try:
             handler(spec, deadline)
+            # This is a separately reviewed, opt-in post-handler operation. The
+            # handler's model/trainer locals are gone, so the full export loads a
+            # fresh base and cannot destructively merge the live training model.
+            # Export failures are diagnostic and must leave the selected adapter
+            # for the uploader; they must never enter the fallback path below.
+            try:
+                from forge.tasks.lfm25_full_export import maybe_export
+
+                maybe_export(spec, deadline)
+            except BaseException as exc:  # noqa: BLE001
+                _log(f"post-handler full export failed ({type(exc).__name__}: {exc})")
+                telemetry.event(
+                    "lfm_moe_full_export_failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
             telemetry.event("run_complete")
             telemetry.write_into(spec.output_dir)
             return
