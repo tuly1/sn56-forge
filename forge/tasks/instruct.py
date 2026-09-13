@@ -142,6 +142,133 @@ class _BloomzPromotionError(RuntimeError):
     """The pinned production candidate cannot be exported safely."""
 
 
+def _strict_int(value: Any, expected: int) -> bool:
+    """Match config integers without accepting booleans or numeric strings."""
+    return type(value) is int and value == expected
+
+
+def _strict_bool(value: Any, expected: bool) -> bool:
+    """Match config booleans without accepting truthy strings or integers."""
+    return type(value) is bool and value is expected
+
+
+def _falcon_rw1b_tokenizer_compatible(tokenizer: Any) -> bool:
+    """Accept the retained GPT-2 tokenizer's own BOS/EOS mapping.
+
+    Falcon's model config advertises IDs 1/2, while the pinned tokenizer maps
+    both special-token strings to its vocabulary's ``<|endoftext|>`` entry
+    (50256).  The tokenizer mapping is authoritative for prompt construction;
+    requiring it to numerically equal the model config would reject the actual
+    retained Falcon bundle.
+    """
+    bos_token = getattr(tokenizer, "bos_token", None)
+    eos_token = getattr(tokenizer, "eos_token", None)
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if (
+        not isinstance(bos_token, str)
+        or not bos_token
+        or bos_token != "<|endoftext|>"
+        or bos_token != eos_token
+        or type(bos_id) is not int
+        or type(eos_id) is not int
+        or bos_id != eos_id
+        or not 0 <= bos_id < 50304
+        or not 0 <= eos_id < 50304
+    ):
+        return False
+    get_vocab = getattr(tokenizer, "get_vocab", None)
+    convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if not callable(get_vocab) or not callable(convert_tokens_to_ids):
+        return False
+    try:
+        vocab = get_vocab()
+    except Exception:
+        return False
+    if (
+        not isinstance(vocab, dict)
+        or vocab.get(bos_token) != bos_id
+        or vocab.get(eos_token) != eos_id
+    ):
+        return False
+    try:
+        if (
+            convert_tokens_to_ids(bos_token) != bos_id
+            or convert_tokens_to_ids(eos_token) != eos_id
+        ):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _falcon_rw1b_structural_match(model: Any, tokenizer: Any) -> bool:
+    """Recognize the retained Falcon-RW-1B base architecture.
+
+    Anonymous validator model IDs are intentionally not used here: the loaded
+    config is the identity evidence available at dispatch.  The complete shape
+    below excludes Falcon-7B and newer Falcon families while preserving the
+    historical anonymous and named request routes alike.
+    """
+    config = getattr(model, "config", None)
+    if config is None:
+        return False
+    if getattr(config, "model_type", None) != "falcon":
+        return False
+    try:
+        from transformers.models.falcon.modeling_falcon import FalconForCausalLM
+    except (ImportError, ModuleNotFoundError):
+        return False
+    if not isinstance(model, FalconForCausalLM):
+        return False
+    try:
+        architectures = tuple(getattr(config, "architectures", ()) or ())
+    except TypeError:
+        return False
+    return (
+        architectures == ("FalconForCausalLM",)
+        and _strict_int(getattr(config, "hidden_size", None), 2048)
+        and _strict_int(getattr(config, "num_hidden_layers", None), 24)
+        and _strict_int(getattr(config, "num_attention_heads", None), 32)
+        and _strict_int(getattr(config, "vocab_size", None), 50304)
+        and _strict_int(getattr(config, "bos_token_id", None), 1)
+        and _strict_int(getattr(config, "eos_token_id", None), 2)
+        and _strict_bool(getattr(config, "multi_query", None), False)
+        and _strict_bool(getattr(config, "new_decoder_architecture", None), False)
+        and _strict_bool(getattr(config, "parallel_attn", None), False)
+        and _strict_bool(getattr(config, "alibi", None), True)
+        and _falcon_rw1b_tokenizer_compatible(tokenizer)
+    )
+
+
+def eligible_falcon_rw1b_legacy_route(
+    spec: TaskSpec,
+    model: Any,
+    tokenizer: Any,
+    *,
+    is_kl: bool,
+    n_gpus: int,
+) -> bool:
+    """Keep the historical Falcon-RW-1B LoRA path out of generic v2.
+
+    Request names, cache paths, and baseline presence are deliberately absent
+    from this gate because the validator anonymizes otherwise equivalent
+    requests.  Loaded architecture, task contract, effective KL state, and
+    actual one-GPU topology are the only applicability conditions.
+    """
+    if (
+        spec.task_type != "InstructTextTask"
+        or spec.instruct is None
+        or not isinstance(spec.instruct.output, str)
+        or not spec.instruct.output.strip()
+        or is_kl is not False
+        or type(n_gpus) is not int
+        or n_gpus != 1
+    ):
+        return False
+    return _falcon_rw1b_structural_match(model, tokenizer)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -639,6 +766,9 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     from forge.tuning import granite41_epoch_cap as _g41
     from forge.tuning import lfm25_epoch_cap as _lfm25
 
+    falcon_legacy_route = eligible_falcon_rw1b_legacy_route(
+        spec, loaded.model, loaded.tokenizer, is_kl=is_kl, n_gpus=n_gpus
+    )
     pinned_route = (
         is_qwen35_model(loaded.model)
         or (_g41._supported_model_route(spec) and _g41._matches_base_model(loaded.model))
@@ -648,6 +778,12 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             and not sft_v2.V2_TAKES_LFM25
         )
     )
+    if falcon_legacy_route:
+        telemetry.event(
+            "falcon_rw1b_legacy_route",
+            n_gpus=n_gpus,
+            is_kl=is_kl,
+        )
     if pinned_route:
         telemetry.event("sft_v2_pinned_route_skip", model=spec.model)
     short_rows = False
@@ -686,7 +822,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 loaded = load_base(spec.cached_model_dir, for_generation=False)
                 tokenizer = loaded.tokenizer
     v2_fallback = False
-    if not pinned_route and not short_rows and sft_v2.eligible(
+    if not pinned_route and not falcon_legacy_route and not short_rows and sft_v2.eligible(
         spec, is_kl=is_kl, params_b=params_b, n_gpus=n_gpus, model=loaded.model
     ):
         try:
