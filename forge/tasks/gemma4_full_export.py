@@ -15,6 +15,7 @@ import os
 import shutil
 import stat
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -68,6 +69,38 @@ _E2B_LAYER_TYPES = tuple(
     "full_attention" if index % 5 == 4 else "sliding_attention"
     for index in range(_E2B_TEXT_GEOMETRY["num_hidden_layers"])
 )
+
+
+@contextmanager
+def _merge_precision_context(torch: Any):
+    """Temporarily select highest FP32 merge arithmetic and restore all flags."""
+    cuda_matmul = getattr(getattr(torch, "backends", None), "cuda", None)
+    cuda_matmul = getattr(cuda_matmul, "matmul", None)
+    old_precision = (
+        torch.get_float32_matmul_precision()
+        if hasattr(torch, "get_float32_matmul_precision")
+        else None
+    )
+    old_allow_tf32 = getattr(cuda_matmul, "allow_tf32", None)
+    try:
+        if old_precision is not None and hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("highest")
+        if old_allow_tf32 is not None:
+            cuda_matmul.allow_tf32 = False
+        policy = {
+            "float32_matmul_precision": (
+                torch.get_float32_matmul_precision()
+                if hasattr(torch, "get_float32_matmul_precision")
+                else None
+            ),
+            "cuda_matmul_allow_tf32": getattr(cuda_matmul, "allow_tf32", None),
+        }
+        yield policy
+    finally:
+        if old_allow_tf32 is not None:
+            cuda_matmul.allow_tf32 = old_allow_tf32
+        if old_precision is not None and hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision(old_precision)
 
 
 def _regular_bytes(path: Path) -> int:
@@ -403,7 +436,8 @@ def _reconstruct_and_promote(spec: Any, output_dir: Path, backup: Path, truth: s
     adapted_keys = _adapted_state_keys(peft_model, original_parameter_names)
     if not adapted_keys:
         raise RuntimeError("could not identify adapted base state keys")
-    merged = peft_model.merge_and_unload(safe_merge=True)
+    with _merge_precision_context(torch) as merge_precision_policy:
+        merged = peft_model.merge_and_unload(safe_merge=True)
     _restore_adapted_base_weights(promoted, merged)
     if embeddings_tied and not _embeddings_tied(merged):
         raise RuntimeError("native tied input/output embeddings were lost during merge")
@@ -423,6 +457,7 @@ def _reconstruct_and_promote(spec: Any, output_dir: Path, backup: Path, truth: s
         alias_field="vocab_size",
         architecture="Gemma4ForConditionalGeneration",
         merge_precision="adapted_base_parameters_promoted_only",
+        merge_precision_policy=merge_precision_policy,
         production_qualified=False,
     )
     try:

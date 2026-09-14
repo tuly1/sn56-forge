@@ -172,6 +172,27 @@ def test_full_keyset_checks_unadapted_values():
         export._validate_full_keyset(base, merged, {"untouched"})
 
 
+@pytest.mark.parametrize("original_precision", ["highest", "high", "medium"])
+def test_merge_precision_context_restores_torch_flags_on_exception(original_precision):
+    torch = pytest.importorskip("torch")
+    matmul = torch.backends.cuda.matmul
+    old_global = torch.get_float32_matmul_precision()
+    old_matmul_allow = matmul.allow_tf32
+    try:
+        torch.set_float32_matmul_precision(original_precision)
+        expected_allow = matmul.allow_tf32
+        with pytest.raises(RuntimeError, match="sentinel"):
+            with export._merge_precision_context(torch) as policy:
+                assert policy["float32_matmul_precision"] == "highest"
+                assert policy["cuda_matmul_allow_tf32"] is False
+                raise RuntimeError("sentinel")
+        assert torch.get_float32_matmul_precision() == original_precision
+        assert matmul.allow_tf32 == expected_allow
+    finally:
+        matmul.allow_tf32 = old_matmul_allow
+        torch.set_float32_matmul_precision(old_global)
+
+
 def test_default_off_does_not_resolve_or_touch_output(monkeypatch, tmp_path):
     output = tmp_path / "output"
     _adapter_output(output)
