@@ -196,9 +196,54 @@ def test_merge_precision_context_restores_torch_flags_on_exception(original_prec
 def test_default_off_does_not_resolve_or_touch_output(monkeypatch, tmp_path):
     output = tmp_path / "output"
     _adapter_output(output)
-    monkeypatch.delenv(export.EXPORT_ENV, raising=False)
-    monkeypatch.setattr(export, "resolve_model_dir", lambda *_a: pytest.fail("disabled load"))
+    calls = []
+    monkeypatch.setenv(export.EXPORT_ENV, "0")
+    monkeypatch.setattr(export, "resolve_model_dir", lambda *_a: calls.append("resolve"))
+    monkeypatch.setattr(export, "_trained_truth", lambda *_a: calls.append("artifact"))
     assert export.maybe_export(_spec(output=str(output)), SimpleNamespace(remaining_hard=lambda: 9999.0)) is False
+    assert calls == []
+
+
+def test_default_on_native_scope_reaches_artifact_gate(monkeypatch, tmp_path):
+    base = tmp_path / "base"
+    base.mkdir()
+    (base / "config.json").write_text(
+        json.dumps({
+            "model_type": "gemma4",
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "text_config": {
+                "model_type": "gemma4_text", "vocab_size": 8,
+                **export._E2B_TEXT_GEOMETRY,
+                "layer_types": list(export._E2B_LAYER_TYPES),
+            },
+        }),
+        encoding="utf-8",
+    )
+    spec = _spec(output=str(tmp_path / "missing"))
+    spec.cached_model_dir = str(base)
+    artifact_calls = []
+
+    def stop_at_artifact_gate(path):
+        artifact_calls.append(path)
+        raise RuntimeError("artifact-gate sentinel")
+
+    monkeypatch.delenv(export.EXPORT_ENV, raising=False)
+    monkeypatch.setattr(export, "resolve_model_dir", lambda *_a: str(base))
+    monkeypatch.setattr(export, "_trained_truth", stop_at_artifact_gate)
+    assert export.maybe_export(spec, SimpleNamespace(remaining_hard=lambda: 9999.0)) is False
+    # maybe_export catches BaseException: its False return alone cannot prove
+    # that the default-enabled path reached this gate rather than failing early.
+    assert artifact_calls == [Path(spec.output_dir)]
+
+
+@pytest.mark.parametrize("spec", [_spec(task_type="ChatTask"), _spec(use_kl=True)])
+def test_noneligible_task_does_not_read_model_or_artifact(monkeypatch, spec):
+    calls = []
+    monkeypatch.delenv(export.EXPORT_ENV, raising=False)
+    monkeypatch.setattr(export, "resolve_model_dir", lambda *_a: calls.append("resolve"))
+    monkeypatch.setattr(export, "_trained_truth", lambda *_a: calls.append("artifact"))
+    assert export.maybe_export(spec, SimpleNamespace(remaining_hard=lambda: calls.append("deadline"))) is False
+    assert calls == []
 
 
 def test_failed_export_preserves_selected_adapter_and_keeps_backup(monkeypatch, tmp_path):
@@ -239,11 +284,11 @@ def test_failed_export_preserves_selected_adapter_and_keeps_backup(monkeypatch, 
 
 
 def test_failed_export_does_not_cross_route(monkeypatch, tmp_path):
-    output = tmp_path / "output"
-    _adapter_output(output)
-    monkeypatch.setenv(export.EXPORT_ENV, "1")
-    monkeypatch.setattr(export, "resolve_model_dir", lambda *_a: pytest.fail("non-native route loaded"))
-    monkeypatch.setattr(export, "telemetry", SimpleNamespace(event=lambda *_a, **_k: None))
+    output = tmp_path / "missing-output"
+    calls = []
+    events = []
+    monkeypatch.delenv(export.EXPORT_ENV, raising=False)
+    monkeypatch.setattr(export, "telemetry", SimpleNamespace(event=lambda name, **fields: events.append((name, fields))))
     non_gemma = tmp_path / "base"
     non_gemma.mkdir()
     (non_gemma / "config.json").write_text(
@@ -254,5 +299,16 @@ def test_failed_export_does_not_cross_route(monkeypatch, tmp_path):
     spec.cached_model_dir = str(non_gemma)
     # The config gate is deliberately checked after resolving its JSON but before
     # loading any model weights.
-    monkeypatch.setattr(export, "resolve_model_dir", lambda *_a: str(non_gemma))
-    assert export.maybe_export(spec, SimpleNamespace(remaining_hard=lambda: 9999.0)) is False
+    def resolve(path):
+        calls.append(("resolve", path))
+        return str(non_gemma)
+
+    monkeypatch.setattr(export, "resolve_model_dir", resolve)
+    monkeypatch.setattr(export, "_trained_truth", lambda *_a: calls.append(("artifact",)))
+    assert export.maybe_export(spec, SimpleNamespace(remaining_hard=lambda: calls.append(("deadline",)))) is False
+    assert calls == [("resolve", str(non_gemma))]
+    assert events == [
+        ("gemma4_full_export_started", {}),
+        ("gemma4_full_export_skipped", {"reason": "native_identity_or_task_scope"}),
+    ]
+    assert not output.exists()

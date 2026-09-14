@@ -1,11 +1,12 @@
-"""Opt-in full-weight export for native Gemma 4 Instruct text tasks.
+"""Conditional full-weight export for native Gemma 4 Instruct text tasks.
 
 Gemma 4's multimodal config stores the text vocabulary under
 ``text_config.vocab_size`` while the unchanged evaluator currently reads the
 top-level field.  This module reconstructs the selected LoRA adapter on a
 fresh native base, merges it without changing any model buffers, and adds only
-that truthful top-level alias in the staged config.  It is disabled unless
-``FORGE_GEMMA4_FULL_EXPORT=1`` and failures leave the selected adapter intact.
+that truthful top-level alias in the staged config.  It is enabled for the
+eligible E2B task shape by default; ``FORGE_GEMMA4_FULL_EXPORT=0`` disables it,
+and failures leave the selected adapter intact.
 """
 from __future__ import annotations
 
@@ -47,7 +48,7 @@ _CONTEXT_FILES = (
     "chat_template.jinja",
     "generation_config.json",
 )
-# The current paid qualification scope is E2B only.  These are identity
+# The current candidate qualification scope is E2B only.  These are identity
 # fields from the pinned native E2B text config, rather than a model-size
 # estimate; a later E4B qualification can add its own explicit tuple.
 _E2B_TEXT_GEOMETRY = {
@@ -230,6 +231,16 @@ def eligible(spec: Any, model: Any) -> bool:
         and getattr(spec.instruct, "output", None) is not None
         and not bool(getattr(spec, "use_kl", False))
         and is_native_gemma4(model)
+    )
+
+
+def _task_scope(spec: Any) -> bool:
+    """Cheap task gate that performs no artifact or model-path reads."""
+    return bool(
+        getattr(spec, "task_type", None) == "InstructTextTask"
+        and getattr(spec, "instruct", None) is not None
+        and getattr(spec.instruct, "output", None) is not None
+        and not bool(getattr(spec, "use_kl", False))
     )
 
 
@@ -480,28 +491,27 @@ def _reconstruct_and_promote(spec: Any, output_dir: Path, backup: Path, truth: s
 
 
 def maybe_export(spec: Any, deadline: Deadline) -> bool:
-    """Run only when explicitly enabled; failures preserve the adapter."""
-    if os.environ.get(EXPORT_ENV, "0") != "1":
+    """Run by default for native E2B Instruct; env ``0`` opts out."""
+    if os.environ.get(EXPORT_ENV, "1") != "1":
+        return False
+    # Keep this before deadline, artifact-truth, and model-path inspection so
+    # unrelated task families never touch the selected artifact.
+    if not _task_scope(spec):
         return False
     started = time.monotonic()
     output_dir = Path(spec.output_dir)
     backup = None
     try:
         telemetry.event("gemma4_full_export_started")
+        base_dir = Path(resolve_model_dir(spec.cached_model_dir))
+        config = json.loads((base_dir / "config.json").read_text(encoding="utf-8"))
+        if not is_native_gemma4_config(config):
+            telemetry.event("gemma4_full_export_skipped", reason="native_identity_or_task_scope")
+            return False
         if deadline.remaining_hard() < MIN_REMAINING_HARD_SECONDS:
             telemetry.event("gemma4_full_export_skipped", reason="insufficient_deadline")
             return False
         truth, step = _trained_truth(output_dir)
-        base_dir = Path(resolve_model_dir(spec.cached_model_dir))
-        config = json.loads((base_dir / "config.json").read_text(encoding="utf-8"))
-        if not is_native_gemma4_config(config) or not (
-            getattr(spec, "task_type", None) == "InstructTextTask"
-            and getattr(spec, "instruct", None) is not None
-            and getattr(spec.instruct, "output", None) is not None
-            and not bool(getattr(spec, "use_kl", False))
-        ):
-            telemetry.event("gemma4_full_export_skipped", reason="native_identity_or_task_scope")
-            return False
         disk = _disk_preflight(spec, base_dir, output_dir)
         telemetry.event("gemma4_full_export_disk_preflight", **disk)
         import gc

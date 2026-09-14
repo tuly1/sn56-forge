@@ -141,8 +141,8 @@ def _run(spec: TaskSpec, deadline: Deadline) -> None:
             # live training model. Export failures are diagnostic and must leave
             # the selected adapter for the uploader; they must never enter the
             # fallback path below. LFM export keeps its existing opt-out, while
-            # Gemma 4 export is independently opt-in with
-            # FORGE_GEMMA4_FULL_EXPORT=1.
+            # Gemma 4 E2B export is on by default and accepts
+            # FORGE_GEMMA4_FULL_EXPORT=0 as its opt-out.
             try:
                 from forge.tasks.lfm25_full_export import maybe_export
 
