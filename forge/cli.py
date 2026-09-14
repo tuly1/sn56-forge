@@ -140,7 +140,9 @@ def _run(spec: TaskSpec, deadline: Deadline) -> None:
             # full export loads a fresh base and cannot destructively merge the
             # live training model. Export failures are diagnostic and must leave
             # the selected adapter for the uploader; they must never enter the
-            # fallback path below. FORGE_LFM_MOE_FULL_EXPORT=0 opts out.
+            # fallback path below. LFM export keeps its existing opt-out, while
+            # Gemma 4 export is independently opt-in with
+            # FORGE_GEMMA4_FULL_EXPORT=1.
             try:
                 from forge.tasks.lfm25_full_export import maybe_export
 
@@ -149,6 +151,16 @@ def _run(spec: TaskSpec, deadline: Deadline) -> None:
                 _log(f"post-handler full export failed ({type(exc).__name__}: {exc})")
                 telemetry.event(
                     "lfm_moe_full_export_failed",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            try:
+                from forge.tasks.gemma4_full_export import maybe_export as maybe_export_gemma4
+
+                maybe_export_gemma4(spec, deadline)
+            except BaseException as exc:  # noqa: BLE001
+                _log(f"Gemma 4 post-handler export failed ({type(exc).__name__}: {exc})")
+                telemetry.event(
+                    "gemma4_full_export_failed",
                     error=f"{type(exc).__name__}: {exc}",
                 )
             telemetry.event("run_complete")
