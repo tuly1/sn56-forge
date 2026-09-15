@@ -95,13 +95,29 @@ def field_full_types() -> frozenset[str]:
     return FIELD_FULL_MODEL_TYPES
 
 
-def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: str | None = None) -> bool:
+FIELD_FULL_MIN_ROWS = 15000  # below this the adapter won (CodeFeedback 8k: adapter 0.822 vs full 0.843–0.893)
+
+
+def field_full_min_rows() -> int:
+    try:
+        return int(os.environ.get("FORGE_V2_FIELD_MIN_ROWS", str(FIELD_FULL_MIN_ROWS)))
+    except ValueError:
+        return FIELD_FULL_MIN_ROWS
+
+
+def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: str | None = None,
+                     n_rows: int | None = None) -> bool:
     """Full weights at the field geometry for single-GPU, non-KL instruct tasks up to
     FIELD_FULL_MAX_PARAMS_B (FORGE_V2_FIELD_MAX_PARAMS_B overrides) on an allow-listed
-    model family (field_full_types). On by default; FORGE_V2_FIELD=0 disables it."""
+    model family (field_full_types) with at least field_full_min_rows() rows: full weights
+    memorise a small corpus within a few steps (CodeFeedback 8k: best dev at step 10 at both
+    1e-4 and 4.8e-5) while they keep improving for two epochs on 19.5k GossipCop rows.
+    On by default; FORGE_V2_FIELD=0 disables it."""
     if not _field_full() or is_kl or n_gpus != 1 or params_b <= 0:
         return False
     if model_type is not None and str(model_type).lower() not in field_full_types():
+        return False
+    if n_rows is not None and n_rows < field_full_min_rows():
         return False
     try:
         cap = float(os.environ.get("FORGE_V2_FIELD_MAX_PARAMS_B", str(FIELD_FULL_MAX_PARAMS_B)))
@@ -544,6 +560,7 @@ def run(
     per_gpu_gb: float,
     strategy_override: str | None = None,
     route_lr: float | None = None,
+    field_route: bool = False,
 ) -> None:
     import torch
     from datasets import Dataset
@@ -608,7 +625,9 @@ def run(
             _event_and_print("liger_apply_failed", error=f"{type(exc).__name__}: {exc}")
             use_liger = False
     strategy = strategy_override or strategy_for(params_b, str(getattr(getattr(model, "config", None), "model_type", "") or "")) or "full"
-    field = _field_full() and strategy == "full" and not sharded
+    # the field geometry applies only when the dispatcher chose the field route (family, rows,
+    # size gates); the legacy v2 full path (tiny models by size) keeps its previous behaviour
+    field = field_route and strategy == "full" and not sharded
     # adapters train at production's proven effective batch 16 (LFM: 875 updates/epoch at
     # batch 16 beat 178 at batch 76); full weights follow the champion's batch 64, or
     # the champion's size bucket on the field route
@@ -707,16 +726,22 @@ def run(
                                         eff_batch=geo.eff_batch, gradient_noise_scale=gns)
         # the analytic law under-shoots the field by ~7x on Gemma-2-2B (2e-5 vs
         # the champion's 7.5e-5 bucket); anchor the prior to the bucket, the sweep decides
-        prior_lr = max(prior_lr, 0.5 * lr_probe.size_cap_lr(params_b))
         if field:
-            # the field route ships the analytic prior (FORGE_V2_FIELD_LR_MULT scales it
-            # for the replay arms); no sweep — the short probe under-picks for full weights
+            # the field route ships the champion's analytic law WITHOUT the size-cap floor:
+            # the floored 1e-4 / 7.5e-5 was too hot everywhere it was tried against the raw
+            # law (GossipCop 0.9868 vs 0.9503; CodeFeedback dev best at step 10; Gemma-2-2B
+            # and Qwen2.5-3B regressions). Clamped to [2e-5, 1e-4]; FORGE_V2_FIELD_LR_MULT
+            # scales it for experiments; no sweep (the short probe under-picks for full weights).
+            _raw = lr_probe.analytic_lr(weight_rms=_layer_weight_rms(model) or median_weight_rms(model), params_b=params_b,
+                                        eff_batch=geo.eff_batch, gradient_noise_scale=gns)
             try:
                 _fm = float(os.environ.get("FORGE_V2_FIELD_LR_MULT", "1.0") or 1.0)
             except ValueError:
                 _fm = 1.0
-            prior_lr = prior_lr * _fm
-            _event_and_print("sft_v2_field_lr", prior_lr=prior_lr, mult=_fm, eff_batch=geo.eff_batch)
+            prior_lr = max(2.0e-5, min(1.0e-4, _raw)) * _fm
+            _event_and_print("sft_v2_field_lr", prior_lr=prior_lr, raw=_raw, mult=_fm, eff_batch=geo.eff_batch)
+        else:
+            prior_lr = max(prior_lr, 0.5 * lr_probe.size_cap_lr(params_b))
 
     try:
         _lr_override = float(os.environ.get("FORGE_V2_LR", "") or 0.0)

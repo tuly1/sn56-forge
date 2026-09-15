@@ -795,7 +795,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         bool(_v2_strategy)
         and not pinned_route
         and not falcon_legacy_route
-        and sft_v2.field_full_route(params_b=params_b, n_gpus=n_gpus, is_kl=is_kl, model_type=_mt)
+        and sft_v2.field_full_route(params_b=params_b, n_gpus=n_gpus, is_kl=is_kl, model_type=_mt, n_rows=len(rows))
     )
     if field_route:
         # full weights at the champion's geometry regardless of row length (Sept 14:
@@ -849,6 +849,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 per_gpu_gb=per_gpu_gb,
                 strategy_override=v2_strategy_override,
                 route_lr=v2_route_lr,
+                field_route=field_route,
             )
             return
         except BaseException as exc:  # noqa: BLE001

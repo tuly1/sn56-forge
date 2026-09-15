@@ -62,3 +62,13 @@ def test_family_allowlist_env_override(monkeypatch):
     monkeypatch.setenv("FORGE_V2_FIELD_TYPES", "llama, qwen2")
     assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="qwen2")
     assert not sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="gemma2")
+
+
+def test_rows_gate(monkeypatch):
+    monkeypatch.setenv("FORGE_V2_FIELD", "1")
+    monkeypatch.delenv("FORGE_V2_FIELD_MIN_ROWS", raising=False)
+    assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="llama", n_rows=19505)
+    assert not sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="llama", n_rows=8000)
+    assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="llama", n_rows=None)
+    monkeypatch.setenv("FORGE_V2_FIELD_MIN_ROWS", "5000")
+    assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="llama", n_rows=8000)
