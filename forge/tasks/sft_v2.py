@@ -59,7 +59,10 @@ FIELD_FULL_MAX_PARAMS_B = 3.5
 
 
 def _field_full() -> bool:
-    return os.environ.get("FORGE_V2_FIELD", "0") == "1"
+    """Field route on by default since 2026-09-15 (GossipCop replay: full weights 0.9868 vs the
+    adapter 1.1983 on identical rows, −17.7%, the Sept 14 gap to the winners). FORGE_V2_FIELD=0
+    restores the adapter-first routing."""
+    return os.environ.get("FORGE_V2_FIELD", "1") != "0"
 
 
 def field_eff_batch(params_b: float) -> int:
@@ -77,11 +80,28 @@ def field_eff_batch(params_b: float) -> int:
     return 48
 
 
-def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool) -> bool:
+FIELD_FULL_MODEL_TYPES = frozenset({"llama"})  # families where the field route beat the adapter on a replayed task
+
+
+def field_full_types() -> frozenset[str]:
+    """Model families allowed on the field route (FORGE_V2_FIELD_TYPES overrides, comma-separated).
+    Validated 2026-09-15: llama (GossipCop replay −17.7% vs the adapter). Excluded after a
+    measured loss: gemma2 (gemma2-cas: full weights 0.0760 vs adapter 0.0333). Unknown families
+    keep the adapter route — the downside of full weights on a sensitive family is far larger
+    than the upside."""
+    forced = os.environ.get("FORGE_V2_FIELD_TYPES", "").strip()
+    if forced:
+        return frozenset(x.strip().lower() for x in forced.split(",") if x.strip())
+    return FIELD_FULL_MODEL_TYPES
+
+
+def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: str | None = None) -> bool:
     """Full weights at the field geometry for single-GPU, non-KL instruct tasks up to
-    FIELD_FULL_MAX_PARAMS_B (FORGE_V2_FIELD_MAX_PARAMS_B overrides). Off unless
-    FORGE_V2_FIELD=1 until the replayed Sept 14 tasks confirm it."""
+    FIELD_FULL_MAX_PARAMS_B (FORGE_V2_FIELD_MAX_PARAMS_B overrides) on an allow-listed
+    model family (field_full_types). On by default; FORGE_V2_FIELD=0 disables it."""
     if not _field_full() or is_kl or n_gpus != 1 or params_b <= 0:
+        return False
+    if model_type is not None and str(model_type).lower() not in field_full_types():
         return False
     try:
         cap = float(os.environ.get("FORGE_V2_FIELD_MAX_PARAMS_B", str(FIELD_FULL_MAX_PARAMS_B)))

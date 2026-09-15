@@ -16,8 +16,10 @@ def test_eff_batch_buckets(monkeypatch):
     assert sft_v2.field_eff_batch(1.24) == 64
 
 
-def test_route_off_by_default(monkeypatch):
+def test_route_on_by_default_and_env_off(monkeypatch):
     monkeypatch.delenv("FORGE_V2_FIELD", raising=False)
+    assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False)
+    monkeypatch.setenv("FORGE_V2_FIELD", "0")
     assert not sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False)
 
 
@@ -46,3 +48,17 @@ def test_min_lr_rate_default(monkeypatch):
     assert sft_v2._min_lr_rate(0.25) == 0.25
     monkeypatch.setenv("FORGE_V2_MIN_LR_RATE", "0.3")
     assert sft_v2._min_lr_rate(0.25) == 0.3
+
+
+@pytest.mark.parametrize("model_type,expected", [("llama", True), ("LLAMA", True), ("gemma2", False), ("qwen2", False), ("lfm2", False), ("unknown", False)])
+def test_family_allowlist(monkeypatch, model_type, expected):
+    monkeypatch.setenv("FORGE_V2_FIELD", "1")
+    monkeypatch.delenv("FORGE_V2_FIELD_TYPES", raising=False)
+    assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type=model_type) is expected
+
+
+def test_family_allowlist_env_override(monkeypatch):
+    monkeypatch.setenv("FORGE_V2_FIELD", "1")
+    monkeypatch.setenv("FORGE_V2_FIELD_TYPES", "llama, qwen2")
+    assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="qwen2")
+    assert not sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="gemma2")

@@ -795,7 +795,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         bool(_v2_strategy)
         and not pinned_route
         and not falcon_legacy_route
-        and sft_v2.field_full_route(params_b=params_b, n_gpus=n_gpus, is_kl=is_kl)
+        and sft_v2.field_full_route(params_b=params_b, n_gpus=n_gpus, is_kl=is_kl, model_type=_mt)
     )
     if field_route:
         # full weights at the champion's geometry regardless of row length (Sept 14:
