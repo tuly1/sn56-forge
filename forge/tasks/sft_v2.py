@@ -399,6 +399,8 @@ def choose_geometry(*, params_b: float, max_len: int, vocab: int, per_gpu_gb: fl
     checkpointing. The memory-shape probe below still shrinks anything that does
     not fit."""
     fp32_master = params_b <= FP32_MASTER_MAX_B
+    if os.environ.get("FORGE_V2_FP32_MASTER", "").strip() in ("0", "1"):
+        fp32_master = os.environ["FORGE_V2_FP32_MASTER"].strip() == "1"  # ablation knob: bf16 weights + 8-bit AdamW when 0
     gc_on = params_b >= 0.8
     if gc_on:
         tok_budget = 24576 if fp32_master else 49152
