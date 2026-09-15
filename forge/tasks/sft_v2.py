@@ -126,6 +126,19 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
     return params_b <= cap
 
 
+def _field_bf16_min_b() -> float:
+    try:
+        return float(os.environ.get("FORGE_V2_FIELD_BF16_MIN_B", "2.0"))
+    except ValueError:
+        return 2.0
+
+
+def _field_sweep() -> bool:
+    """Run the LR search on the field route (centred on the raw analytic law). The champion
+    stack always searches; our fixed law lost on every 2–4B family at the floored value."""
+    return os.environ.get("FORGE_V2_FIELD_SWEEP", "0") == "1"
+
+
 def v2_takes_lfm25() -> bool:
     forced = os.environ.get("FORGE_V2_TAKES_LFM25", "").strip()
     if forced in ("0", "1"):
@@ -636,6 +649,15 @@ def run(
         _event_and_print("sft_v2_field_route", params_b=round(params_b, 3), eff_batch=_eff_default)
     geo = choose_geometry(params_b=params_b, max_len=max_len, vocab=vocab, per_gpu_gb=per_gpu_gb, bnb_ok=_bnb_available(),
                           layers=layers, hidden=hidden, liger=use_liger, eff_default=_eff_default)
+    if field and geo.fp32_master and os.environ.get("FORGE_V2_FIELD_BF16", "0") == "1" and params_b >= _field_bf16_min_b() and os.environ.get("FORGE_V2_FP32_MASTER", "").strip() != "1":
+        # 2–4B full weights in fp32 master are throughput-bound in a tournament window
+        # (Gemma-2-2B 12.4 s/step → 0.49 epoch in 45 min); bf16 weights + 8-bit AdamW
+        # learned identically to fp32 on the Llama ablation at 1.4x the speed
+        tok_budget = 49152 if vocab < 200_000 else 36864
+        micro = max(1, min(64, tok_budget // max_len, _eff_default))
+        geo = Geometry(micro, max(1, math.ceil(_eff_default / micro)), geo.max_len, geo.gradient_checkpointing, False,
+                       "paged_adamw_8bit" if _bnb_available() else "adamw_torch")
+        _event_and_print("sft_v2_field_bf16", params_b=round(params_b, 3), micro=geo.micro_batch, grad_accum=geo.grad_accum, optim=geo.optim)
     if strategy == "lora":
         from forge.model import attach_lora
 
@@ -750,7 +772,7 @@ def run(
     if _lr_override > 0:
         _event_and_print("sft_v2_lr_override", prior_lr=prior_lr, override=_lr_override)
         prior_lr = _lr_override
-    elif field:
+    elif field and not _field_sweep():
         _lr_override = prior_lr  # fixed LR: timing steps only, no sweep
     elif route_lr and route_lr > 0:
         # a routed recipe ships its tested LR: no sweep (the short-horizon probe

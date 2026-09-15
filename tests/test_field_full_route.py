@@ -72,3 +72,14 @@ def test_rows_gate(monkeypatch):
     assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="llama", n_rows=None)
     monkeypatch.setenv("FORGE_V2_FIELD_MIN_ROWS", "5000")
     assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="llama", n_rows=8000)
+
+
+def test_field_bf16_threshold_and_sweep_knobs(monkeypatch):
+    monkeypatch.delenv("FORGE_V2_FIELD_BF16_MIN_B", raising=False)
+    assert sft_v2._field_bf16_min_b() == 2.0
+    monkeypatch.setenv("FORGE_V2_FIELD_BF16_MIN_B", "1.0")
+    assert sft_v2._field_bf16_min_b() == 1.0
+    monkeypatch.delenv("FORGE_V2_FIELD_SWEEP", raising=False)
+    assert not sft_v2._field_sweep()
+    monkeypatch.setenv("FORGE_V2_FIELD_SWEEP", "1")
+    assert sft_v2._field_sweep()
