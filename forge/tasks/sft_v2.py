@@ -439,9 +439,12 @@ def optimizer_state_bytes(model: Any, optim: str) -> int:
     return int(n * per)
 
 
-def memory_probe(model: Any, *, micro: int, max_len: int, vocab: int, autocast: bool, reserve_bytes: int = 0) -> bool:
+def memory_probe(model: Any, *, micro: int, max_len: int, vocab: int, autocast: bool, reserve_bytes: int = 0,
+                 headroom: float = 0.07) -> bool:
     """One synthetic forward/backward at the worst-case micro-batch shape. Fits
-    only if the peak plus `reserve_bytes` (optimizer state) leaves 7% headroom."""
+    only if the peak plus `reserve_bytes` (optimizer state) leaves `headroom`
+    (7% by default; fp32-master full weights use 15%: LFM2.5-2.6B passed at
+    micro 13 with 7% and OOM'd on the first real optimizer step, 2026-09-15)."""
     import torch
 
     device = next(model.parameters()).device
@@ -460,7 +463,7 @@ def memory_probe(model: Any, *, micro: int, max_len: int, vocab: int, autocast: 
         if device.type == "cuda" and reserve_bytes > 0:
             peak = torch.cuda.max_memory_allocated(device)
             total = torch.cuda.get_device_properties(device).total_memory
-            if peak + reserve_bytes > 0.93 * total:
+            if peak + reserve_bytes > (1.0 - headroom) * total:
                 _event_and_print("sft_v2_memory_probe_reserve", micro=micro, peak_gb=round(peak / 1e9, 1),
                                  reserve_gb=round(reserve_bytes / 1e9, 1), total_gb=round(total / 1e9, 1))
                 return False
@@ -646,7 +649,8 @@ def run(
             seen.add((micro_c, gc_c))
             _apply_gc(gc_c)
             ok = memory_probe(model, micro=micro_c, max_len=geo.max_len, vocab=vocab, autocast=autocast,
-                              reserve_bytes=optimizer_state_bytes(model, geo.optim))
+                              reserve_bytes=optimizer_state_bytes(model, geo.optim),
+                              headroom=0.15 if (geo.fp32_master and strategy == "full") else 0.07)
             _event_and_print("sft_v2_memory_probe", micro=micro_c, gradient_checkpointing=gc_c, fits=ok)
             if ok:
                 eff_target = geo.eff_batch
@@ -1029,6 +1033,7 @@ def run(
     t_step = t_per_step
     phase = 0
     oom_retries = 0
+    oom_continue = False  # the next loop iteration is an OOM retry, not a new phase
     # Two-seed exact soup (2026-09-12): a second independently initialised adapter
     # trained for one annealed epoch in a different data order, combined with the
     # first as an exact equal-weight soup (rank 2r). On ru-AAQG the exact soup of
@@ -1055,8 +1060,9 @@ def run(
             _event_and_print("sft_v2_restart", lr=lr, from_step=pool.best()["step"], window_s=round(window, 1))
         if phase > 0 and window < min_window:
             break
-        if phase > 0 and field:
+        if phase > 0 and field and not oom_continue:
             break  # the field route is one cosine: no continuation phases
+        oom_continue = False
         if phase > 0 and os.environ.get("FORGE_V2_SOUP_FIRST", "0") == "1" and t_step:
             # experiment: a later phase only when the greedy soup (3 evals) and the
             # dev pass still fit after it; otherwise stop and soup the phase-0 pool
@@ -1163,6 +1169,7 @@ def run(
             if oom_retries >= 3:
                 break
             oom_retries += 1
+            oom_continue = True
             new_micro = max(1, geo.micro_batch // 2) if (geo.gradient_checkpointing or geo.micro_batch > 1) else 1
             geo = Geometry(new_micro, max(1, geo.eff_batch // new_micro), geo.max_len, True, geo.fp32_master, geo.optim)
             _apply_gc(True)
