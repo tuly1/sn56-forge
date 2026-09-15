@@ -775,7 +775,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         or (
             _lfm25._supported_model_route(spec)
             and _lfm25._matches_base_model(loaded.model)
-            and not sft_v2.V2_TAKES_LFM25
+            and not sft_v2.v2_takes_lfm25()
         )
     )
     if falcon_legacy_route:
@@ -791,13 +791,25 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     v2_route_lr: float | None = None
     _mt = str(getattr(getattr(loaded.model, "config", None), "model_type", "") or "")
     _v2_strategy = sft_v2.strategy_for(params_b, _mt) if not pinned_route else ""
+    field_route = (
+        bool(_v2_strategy)
+        and not pinned_route
+        and not falcon_legacy_route
+        and sft_v2.field_full_route(params_b=params_b, n_gpus=n_gpus, is_kl=is_kl)
+    )
+    if field_route:
+        # full weights at the champion's geometry regardless of row length (Sept 14:
+        # every winner on every task, long or short rows, uploaded full weights)
+        _v2_strategy = "full"
+        v2_strategy_override = "full"
+        telemetry.event("sft_v2_field_full_route", params_b=round(params_b, 3), eff_batch=sft_v2.field_eff_batch(params_b))
     if _v2_strategy in ("lora", "full"):
         # Both v2 paths are validated on long-row tasks only (Smol-jb median 392,
         # Gemma 762, ru-AAQG 302). On short-row open-ended data production's
         # adapter wins for every size tried (Qwen2.5-0.5B full FT +4.1%, alpaca
         # adapters neutral), so short rows always stay on production.
         is_long, median_len = sft_v2.long_row_task(rows, spec, tokenizer)
-        short_rows = not is_long
+        short_rows = (not is_long) and not field_route
         telemetry.event("sft_v2_row_length_gate", median_tokens=median_len, long_rows=is_long, strategy=_v2_strategy)
         if _v2_strategy == "lora" and is_long and sft_v2.bigdata_full_route(
             n_rows=len(rows), hours=deadline.remaining_hard() / 3600.0, model_type=_mt, params_b=params_b

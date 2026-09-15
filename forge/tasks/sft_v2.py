@@ -49,6 +49,52 @@ from forge.tuning import lr_probe, selection
 
 EVAL_CAP = 4096
 EFF_BATCH_TARGET = 64
+# Field route (2026-09-15, after the Sept 14 Round-1 loss): every Round-1 winner on
+# every task uploaded full weights trained at the public champion's geometry —
+# unpacked rows at effective batch 140 (<1B) / 100 (1–2B) / 48 (2–4B), the analytic
+# LR law without a sweep, one cosine sized 25% past the window (min-LR 0.25) so the
+# wall-clock stop lands near the LR floor, early stop, greedy soup, dev pass. Our
+# adapters (r32) finished 7th/15th/7th behind every competent full-weight entry.
+FIELD_FULL_MAX_PARAMS_B = 3.5
+
+
+def _field_full() -> bool:
+    return os.environ.get("FORGE_V2_FIELD", "0") == "1"
+
+
+def field_eff_batch(params_b: float) -> int:
+    """Champion size buckets (rows per optimizer step, one GPU)."""
+    try:
+        forced = int(os.environ.get("FORGE_V2_FIELD_EFF_BATCH", "0") or 0)
+    except ValueError:
+        forced = 0
+    if forced > 0:
+        return forced
+    if params_b < 1.0:
+        return 140
+    if params_b < 2.0:
+        return 100
+    return 48
+
+
+def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool) -> bool:
+    """Full weights at the field geometry for single-GPU, non-KL instruct tasks up to
+    FIELD_FULL_MAX_PARAMS_B (FORGE_V2_FIELD_MAX_PARAMS_B overrides). Off unless
+    FORGE_V2_FIELD=1 until the replayed Sept 14 tasks confirm it."""
+    if not _field_full() or is_kl or n_gpus != 1 or params_b <= 0:
+        return False
+    try:
+        cap = float(os.environ.get("FORGE_V2_FIELD_MAX_PARAMS_B", str(FIELD_FULL_MAX_PARAMS_B)))
+    except ValueError:
+        cap = FIELD_FULL_MAX_PARAMS_B
+    return params_b <= cap
+
+
+def v2_takes_lfm25() -> bool:
+    forced = os.environ.get("FORGE_V2_TAKES_LFM25", "").strip()
+    if forced in ("0", "1"):
+        return forced == "1"
+    return V2_TAKES_LFM25
 MAX_PARAMS_B = 5.0  # hard ceiling of the handler (memory / throughput)
 # Validated regime (2026-09-10 harness, official evaluator, paired rule): full-weight
 # v2 beat production LoRA on SmolLM2-360M (-2.6%, win rate 0.76) and lost on every
@@ -537,10 +583,15 @@ def run(
             _event_and_print("liger_apply_failed", error=f"{type(exc).__name__}: {exc}")
             use_liger = False
     strategy = strategy_override or strategy_for(params_b, str(getattr(getattr(model, "config", None), "model_type", "") or "")) or "full"
+    field = _field_full() and strategy == "full" and not sharded
     # adapters train at production's proven effective batch 16 (LFM: 875 updates/epoch at
-    # batch 16 beat 178 at batch 76); full weights follow the champion's batch 64
+    # batch 16 beat 178 at batch 76); full weights follow the champion's batch 64, or
+    # the champion's size bucket on the field route
+    _eff_default = 16 if strategy == "lora" else (field_eff_batch(params_b) if field else EFF_BATCH_TARGET)
+    if field:
+        _event_and_print("sft_v2_field_route", params_b=round(params_b, 3), eff_batch=_eff_default)
     geo = choose_geometry(params_b=params_b, max_len=max_len, vocab=vocab, per_gpu_gb=per_gpu_gb, bnb_ok=_bnb_available(),
-                          layers=layers, hidden=hidden, liger=use_liger, eff_default=16 if strategy == "lora" else EFF_BATCH_TARGET)
+                          layers=layers, hidden=hidden, liger=use_liger, eff_default=_eff_default)
     if strategy == "lora":
         from forge.model import attach_lora
 
@@ -631,6 +682,15 @@ def run(
         # the analytic law under-shoots the field by ~7x on Gemma-2-2B (2e-5 vs
         # the champion's 7.5e-5 bucket); anchor the prior to the bucket, the sweep decides
         prior_lr = max(prior_lr, 0.5 * lr_probe.size_cap_lr(params_b))
+        if field:
+            # the field route ships the analytic prior (FORGE_V2_FIELD_LR_MULT scales it
+            # for the replay arms); no sweep — the short probe under-picks for full weights
+            try:
+                _fm = float(os.environ.get("FORGE_V2_FIELD_LR_MULT", "1.0") or 1.0)
+            except ValueError:
+                _fm = 1.0
+            prior_lr = prior_lr * _fm
+            _event_and_print("sft_v2_field_lr", prior_lr=prior_lr, mult=_fm, eff_batch=geo.eff_batch)
 
     try:
         _lr_override = float(os.environ.get("FORGE_V2_LR", "") or 0.0)
@@ -639,6 +699,8 @@ def run(
     if _lr_override > 0:
         _event_and_print("sft_v2_lr_override", prior_lr=prior_lr, override=_lr_override)
         prior_lr = _lr_override
+    elif field:
+        _lr_override = prior_lr  # fixed LR: timing steps only, no sweep
     elif route_lr and route_lr > 0:
         # a routed recipe ships its tested LR: no sweep (the short-horizon probe
         # picks 2.6e-5–7.5e-5 for full weights, which lose 4–13% at 64 rows/step)
@@ -653,7 +715,7 @@ def run(
         kwargs = dict(
             output_dir=workdir(spec), overwrite_output_dir=True, num_train_epochs=num_epochs,
             per_device_train_batch_size=micro, gradient_accumulation_steps=accum, learning_rate=learning_rate,
-            lr_scheduler_type="cosine_with_min_lr", lr_scheduler_kwargs={"min_lr_rate": _min_lr_rate()}, warmup_steps=warmup_steps,
+            lr_scheduler_type="cosine_with_min_lr", lr_scheduler_kwargs={"min_lr_rate": _min_lr_rate(0.25 if field else 0.1)}, warmup_steps=warmup_steps,
             weight_decay=0.0, optim=geo.optim, max_grad_norm=1.0, bf16=True, fp16=False,
             gradient_checkpointing=False,  # enabled on the model directly above
             logging_steps=5, save_strategy="no", eval_strategy="no", report_to=[], remove_unused_columns=False,
@@ -715,7 +777,8 @@ def run(
     _free_cuda()
 
     # ---- adaptive effective batch: guarantee enough optimizer updates in short tasks ----
-    if t_per_step:
+    # (not on the field route: the champion keeps its bucket and trains fewer steps)
+    if t_per_step and not field:
         samples_per_s = geo.eff_batch / t_per_step
         window0 = deadline.remaining_hard() - (EXPORT_RESERVE_S + 2.0 * _estimate_eval_seconds(len(dev_ex), t_per_step, geo)
                                                 + _dev_pass_estimate(len(dev_ex), t_per_step, geo))
@@ -980,7 +1043,7 @@ def run(
         if state["stopped_overfit"]:
             # One warm restart from the best snapshot at a lower learning rate
             # when plenty of budget remains; a second overfit stop ends training.
-            if state["restarts"] >= 1 or window < max(600.0, 60.0 * (t_step or 10.0)) or pool.best() is None:
+            if field or state["restarts"] >= 1 or window < max(600.0, 60.0 * (t_step or 10.0)) or pool.best() is None:
                 break
             selection.load_state(model, pool.best()["state"])
             state["restarts"] += 1
@@ -990,6 +1053,8 @@ def run(
             _event_and_print("sft_v2_restart", lr=lr, from_step=pool.best()["step"], window_s=round(window, 1))
         if phase > 0 and window < min_window:
             break
+        if phase > 0 and field:
+            break  # the field route is one cosine: no continuation phases
         if phase > 0 and os.environ.get("FORGE_V2_SOUP_FIRST", "0") == "1" and t_step:
             # experiment: a later phase only when the greedy soup (3 evals) and the
             # dev pass still fit after it; otherwise stop and soup the phase-0 pool
@@ -1038,7 +1103,12 @@ def run(
                 # the greedy soup and the dev pass (dry-2v lost all three: 0.98 epoch,
                 # clock stop, soup skipped).
                 achievable *= 0.8
-            if phase == 0 or state["restarts"] or seed_b_active:
+            if field and phase == 0:
+                # field route: one cosine over everything that fits, planned 25% past
+                # the window (champion planner) so the wall-clock stop lands near the
+                # LR floor; the early stop and the best-snapshot pool cover the tail
+                epochs = min(epochs_left, 1.25 * achievable / steps_per_epoch)
+            elif phase == 0 or state["restarts"] or seed_b_active:
                 # first cycle: one fully annealed epoch (the strongest single
                 # candidate on small data), also the timing measurement
                 epochs = min(epochs_left, 1.0, achievable / steps_per_epoch)
@@ -1382,11 +1452,11 @@ def _finish_two_seed(model: Any, pool: Any, seed_a: dict[str, Any], eval_dev: Ca
     return chosen_loss, chosen_step, chosen
 
 
-def _min_lr_rate() -> float:
+def _min_lr_rate(default: float = 0.1) -> float:
     try:
-        return float(os.environ.get("FORGE_V2_MIN_LR_RATE", "0.1"))
+        return float(os.environ.get("FORGE_V2_MIN_LR_RATE", str(default)))
     except ValueError:
-        return 0.1
+        return default
 
 
 def _neftune_alpha(summary: Any, strategy: str = "full") -> float | None:
