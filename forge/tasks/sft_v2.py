@@ -492,7 +492,7 @@ def memory_probe(model: Any, *, micro: int, max_len: int, vocab: int, autocast: 
                  headroom: float = 0.07) -> bool:
     """One synthetic forward/backward at the worst-case micro-batch shape. Fits
     only if the peak plus `reserve_bytes` (optimizer state) leaves `headroom`
-    (7% by default; fp32-master full weights use 15%: LFM2.5-2.6B passed at
+    (7% by default; fp32-master field-route weights use 15%: LFM2.5-2.6B passed at
     micro 13 with 7% and OOM'd on the first real optimizer step, 2026-09-15)."""
     import torch
 
@@ -711,7 +711,7 @@ def run(
             _apply_gc(gc_c)
             ok = memory_probe(model, micro=micro_c, max_len=geo.max_len, vocab=vocab, autocast=autocast,
                               reserve_bytes=optimizer_state_bytes(model, geo.optim),
-                              headroom=0.15 if (geo.fp32_master and strategy == "full") else 0.07)
+                              headroom=0.15 if (field and geo.fp32_master and strategy == "full") else 0.07)
             _event_and_print("sft_v2_memory_probe", micro=micro_c, gradient_checkpointing=gc_c, fits=ok)
             if ok:
                 eff_target = geo.eff_batch
