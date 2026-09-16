@@ -119,7 +119,12 @@ def field_full_min_tokens() -> int:
         return FIELD_FULL_MIN_TOKENS
 
 
-FIELD_FULL_VOCABS = frozenset({128256, 128000})  # Llama-3.x (128256) and LFM2.5 (128000); TinyLlama (32000) and SmolLM2 (49152) share model_type "llama" but are unvalidated
+# validated vocabulary per family: Llama-3.x 128256 (TinyLlama 32000 / SmolLM2 49152 share model_type "llama" but are
+# unvalidated); LFM2.5 128000. Family-specific on purpose: a llama with 128000 or an lfm2 with 128256 is not the validated model.
+FIELD_FULL_VOCABS: dict[str, frozenset[int]] = {"llama": frozenset({128256}), "lfm2": frozenset({128000})}
+# minimum size per family where the validated configuration applies: lfm2 was validated only on LFM2.5-2.6B, which takes
+# the bf16 + paged 8-bit AdamW path (>= _field_bf16_min_b()); smaller lfm2 models would run an unvalidated fp32 path
+FIELD_FULL_MIN_PARAMS_B: dict[str, float] = {"lfm2": 2.0}
 
 
 def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: str | None = None,
@@ -132,10 +137,16 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
     On by default; FORGE_V2_FIELD=0 disables it."""
     if not _field_full() or is_kl or n_gpus != 1 or params_b <= 0:
         return False
-    if model_type is not None and str(model_type).lower() not in field_full_types():
+    _mt = str(model_type).lower() if model_type is not None else None
+    if _mt is not None and _mt not in field_full_types():
         return False
-    if vocab_size is not None and not os.environ.get("FORGE_V2_FIELD_TYPES") and int(vocab_size) not in FIELD_FULL_VOCABS:
-        return False  # the validated win is Meta Llama-3.2; other "llama"-architecture families keep their routes
+    if vocab_size is not None and not os.environ.get("FORGE_V2_FIELD_TYPES"):
+        # family-specific: the validated wins are Meta Llama-3.2 (128256) and LFM2.5 (128000); an unknown family
+        # or a mismatched vocabulary keeps its route
+        if _mt is None or int(vocab_size) not in FIELD_FULL_VOCABS.get(_mt, frozenset()):
+            return False
+    if _mt is not None and not os.environ.get("FORGE_V2_FIELD_TYPES") and params_b < FIELD_FULL_MIN_PARAMS_B.get(_mt, 0.0):
+        return False  # below the size where the family's validated configuration applies
     if n_rows is not None and n_rows < field_full_min_rows():
         return False
     if total_tokens is not None and total_tokens < field_full_min_tokens():

@@ -50,11 +50,13 @@ def test_min_lr_rate_default(monkeypatch):
     assert sft_v2._min_lr_rate(0.25) == 0.3
 
 
-@pytest.mark.parametrize("model_type,expected", [("llama", True), ("LLAMA", True), ("gemma2", False), ("qwen2", False), ("lfm2", True), ("unknown", False)])
+@pytest.mark.parametrize("model_type,expected", [("llama", True), ("LLAMA", True), ("gemma2", False), ("qwen2", False), ("lfm2", False), ("unknown", False)])
 def test_family_allowlist(monkeypatch, model_type, expected):
+    """At 1.24 B: llama admitted; lfm2 refused below its 2.0 B validated floor (LFM2.5-2.6B is admitted, see below)."""
     monkeypatch.setenv("FORGE_V2_FIELD", "1")
     monkeypatch.delenv("FORGE_V2_FIELD_TYPES", raising=False)
     assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type=model_type) is expected
+    assert sft_v2.field_full_route(params_b=2.697, n_gpus=1, is_kl=False, model_type="lfm2") is True
 
 
 def test_family_allowlist_env_override(monkeypatch):

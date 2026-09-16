@@ -823,6 +823,10 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                                         vocab_size=int(getattr(getattr(loaded.model, "config", None), "vocab_size", 0) or 0) or None)
         )
         telemetry.event("sft_v2_field_gate", total_tokens=_total_tokens, rows=len(rows), model_type=_mt, field_route=field_route)
+        if lfm_pin and field_route and _total_tokens is None:
+            # a protected pin is released only on evidence: without a known token count the gate is unproven
+            field_route = False
+            telemetry.event("sft_v2_pin_release_refused", model=spec.model, model_type=_mt, reason="unknown_total_tokens")
         if lfm_pin and field_route:
             pinned_route = False
             telemetry.event("sft_v2_pin_released_to_field", model=spec.model, model_type=_mt)

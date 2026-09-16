@@ -30,6 +30,24 @@ def test_lfm2_field_gate_matches_the_replayed_win(monkeypatch):
     # an lfm2 model with a different vocabulary (not LFM2.5) is not released
     assert sft_v2.field_full_route(params_b=2.697, n_gpus=1, is_kl=False, model_type="lfm2", n_rows=58892,
                                    total_tokens=37_592_948, vocab_size=65536) is False
+    # vocabularies are family-specific: llama with LFM's 128000 and lfm2 with Llama's 128256 are not the validated models
+    assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="llama", n_rows=20000,
+                                   total_tokens=12_000_000, vocab_size=128000) is False
+    assert sft_v2.field_full_route(params_b=2.697, n_gpus=1, is_kl=False, model_type="lfm2", n_rows=58892,
+                                   total_tokens=37_592_948, vocab_size=128256) is False
+    assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="llama", n_rows=20000,
+                                   total_tokens=12_000_000, vocab_size=128256) is True
+    # an unknown family with a vocabulary given keeps its route; without model_type the older size-only contract holds
+    assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="mistral", n_rows=20000,
+                                   total_tokens=12_000_000, vocab_size=128256) is False
+    # smaller lfm2 models (LFM2-1.2B: fp32 path, unvalidated) stay off; the 2.6B qualified configuration is admitted
+    assert sft_v2.field_full_route(params_b=1.17, n_gpus=1, is_kl=False, model_type="lfm2", n_rows=58892,
+                                   total_tokens=37_592_948, vocab_size=128000) is False
+    assert sft_v2.field_full_route(params_b=1.999, n_gpus=1, is_kl=False, model_type="lfm2", n_rows=58892,
+                                   total_tokens=37_592_948, vocab_size=128000) is False
+    # llama has no size floor beyond the handler's (1B validated)
+    assert sft_v2.field_full_route(params_b=1.24, n_gpus=1, is_kl=False, model_type="llama", n_rows=20000,
+                                   total_tokens=12_000_000, vocab_size=None) is True
     # KL / multi-GPU / above the size cap stay off, as for llama
     assert sft_v2.field_full_route(params_b=2.697, n_gpus=2, is_kl=False, model_type="lfm2", n_rows=58892,
                                    total_tokens=37_592_948, vocab_size=128000) is False
@@ -107,3 +125,20 @@ def test_lfm_pin_stands_when_field_disabled(monkeypatch, tmp_path):
         _run_dispatch(args)
     events = {name for name, _ in seen["events"]}
     assert "sft_v2_pinned_route_skip" in events and "sft_v2_pin_released_to_field" not in events
+
+
+def test_lfm_pin_stands_without_a_known_token_count(monkeypatch, tmp_path):
+    """No baseline total_tokens and no usable row-length estimate: the protected pin is not released on guesswork."""
+    args, seen, stats = prepare(monkeypatch, tmp_path, "lfm2", n_rows=20000, long_rows=True)
+    import json as _json
+    d = _json.loads(stats.read_text()); d["dataset"].pop("total_tokens", None); stats.write_text(_json.dumps(d))
+    loaded = instruct.load_base("x")
+    loaded.model = _lfm_model()
+    _pin_lfm(monkeypatch, loaded.model)
+    monkeypatch.setattr(sft_v2, "long_row_task", lambda rows, spec, tok: (True, None))
+    with pytest.raises(StopAtLegacyPlan):
+        _run_dispatch(args)
+    events = {name for name, _ in seen["events"]}
+    assert "sft_v2_pin_release_refused" in events and "sft_v2_pinned_route_skip" in events
+    assert "sft_v2_pin_released_to_field" not in events and "sft_v2_field_full_route" not in events
+    assert seen["routes"] == [{"handler": "legacy", "field": False, "strategy": "lora"}]
