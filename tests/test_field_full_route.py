@@ -50,7 +50,7 @@ def test_min_lr_rate_default(monkeypatch):
     assert sft_v2._min_lr_rate(0.25) == 0.3
 
 
-@pytest.mark.parametrize("model_type,expected", [("llama", True), ("LLAMA", True), ("gemma2", False), ("qwen2", False), ("lfm2", False), ("unknown", False)])
+@pytest.mark.parametrize("model_type,expected", [("llama", True), ("LLAMA", True), ("gemma2", False), ("qwen2", False), ("lfm2", True), ("unknown", False)])
 def test_family_allowlist(monkeypatch, model_type, expected):
     monkeypatch.setenv("FORGE_V2_FIELD", "1")
     monkeypatch.delenv("FORGE_V2_FIELD_TYPES", raising=False)

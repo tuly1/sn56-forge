@@ -769,7 +769,15 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     falcon_legacy_route = eligible_falcon_rw1b_legacy_route(
         spec, loaded.model, loaded.tokenizer, is_kl=is_kl, n_gpus=n_gpus
     )
-    pinned_route = (
+    # The LFM2.5 pin (one-epoch production adapter) yields to the field route only when the
+    # field gates pass (family, rows, tokens, vocabulary): MathFusionQA replay 2026-09-16, full
+    # weights 0.33848 vs the pinned adapter 0.34438 (paired win 0.693). Below the gates the pin stands.
+    lfm_pin = (
+        _lfm25._supported_model_route(spec)
+        and _lfm25._matches_base_model(loaded.model)
+        and not sft_v2.v2_takes_lfm25()
+    )
+    pinned_route = (  # self-contained: tests/test_sft_v2_anonymous_pinning.py compiles this expression from source
         is_qwen35_model(loaded.model)
         or (_g41._supported_model_route(spec) and _g41._matches_base_model(loaded.model))
         or (
@@ -784,13 +792,13 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             n_gpus=n_gpus,
             is_kl=is_kl,
         )
-    if pinned_route:
-        telemetry.event("sft_v2_pinned_route_skip", model=spec.model)
     short_rows = False
     v2_strategy_override: str | None = None
     v2_route_lr: float | None = None
+    if pinned_route and not lfm_pin:
+        telemetry.event("sft_v2_pinned_route_skip", model=spec.model)
     _mt = str(getattr(getattr(loaded.model, "config", None), "model_type", "") or "")
-    _v2_strategy = sft_v2.strategy_for(params_b, _mt) if not pinned_route else ""
+    _v2_strategy = sft_v2.strategy_for(params_b, _mt) if (not pinned_route or lfm_pin) else ""
     field_route = False
     if _v2_strategy in ("lora", "full"):
         # Both v2 paths are validated on long-row tasks only (Smol-jb median 392,
@@ -808,13 +816,19 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         if _total_tokens is None and median_len:
             _total_tokens = int(median_len) * len(rows)
         field_route = (
-            not pinned_route
+            (not pinned_route or lfm_pin)
             and not falcon_legacy_route
             and sft_v2.field_full_route(params_b=params_b, n_gpus=n_gpus, is_kl=is_kl, model_type=_mt, n_rows=len(rows),
                                         total_tokens=_total_tokens,
                                         vocab_size=int(getattr(getattr(loaded.model, "config", None), "vocab_size", 0) or 0) or None)
         )
         telemetry.event("sft_v2_field_gate", total_tokens=_total_tokens, rows=len(rows), model_type=_mt, field_route=field_route)
+        if lfm_pin and field_route:
+            pinned_route = False
+            telemetry.event("sft_v2_pin_released_to_field", model=spec.model, model_type=_mt)
+        elif lfm_pin:
+            _v2_strategy = ""  # the pin stands: nothing else on the v2 path is evaluated
+            telemetry.event("sft_v2_pinned_route_skip", model=spec.model)
         if field_route:
             # full weights at the champion's geometry regardless of row length, on the
             # validated regime only (llama family, >=15k rows, >=8M tokens)
@@ -822,7 +836,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             v2_strategy_override = "full"
             telemetry.event("sft_v2_field_full_route", params_b=round(params_b, 3), eff_batch=sft_v2.field_eff_batch(params_b))
         short_rows = (not is_long) and not field_route
-        telemetry.event("sft_v2_row_length_gate", median_tokens=median_len, long_rows=is_long, strategy=_v2_strategy)
+        if _v2_strategy:
+            telemetry.event("sft_v2_row_length_gate", median_tokens=median_len, long_rows=is_long, strategy=_v2_strategy)
         if _v2_strategy == "lora" and is_long and sft_v2.bigdata_full_route(
             n_rows=len(rows), hours=deadline.remaining_hard() / 3600.0, model_type=_mt, params_b=params_b
         ):

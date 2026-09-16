@@ -81,7 +81,10 @@ def field_eff_batch(params_b: float) -> int:
     return 48
 
 
-FIELD_FULL_MODEL_TYPES = frozenset({"llama"})  # families where the field route beat the adapter on a replayed task
+FIELD_FULL_MODEL_TYPES = frozenset({"llama", "lfm2"})  # families where the field route beat the adapter on a replayed task
+# lfm2 (LFM2.5-2.6B) joined 2026-09-16: MathFusionQA replay 58.9k rows / 37.6M tokens, full weights at the raw
+# analytic LR (2.8e-5) with bf16 + paged 8-bit AdamW 0.33848 vs the pinned one-epoch adapter 0.34438 (paired win 0.693,
+# lb99 0.633) and vs the v2 adapter 0.34255 (win 0.715). The earlier +22% loss was the floored LR (7.5e-5) in fp32.
 
 
 def field_full_types() -> frozenset[str]:
@@ -116,7 +119,7 @@ def field_full_min_tokens() -> int:
         return FIELD_FULL_MIN_TOKENS
 
 
-FIELD_FULL_VOCABS = frozenset({128256})  # Llama-3.x family; TinyLlama (32000) and SmolLM2 (49152) share model_type "llama" but are unvalidated
+FIELD_FULL_VOCABS = frozenset({128256, 128000})  # Llama-3.x (128256) and LFM2.5 (128000); TinyLlama (32000) and SmolLM2 (49152) share model_type "llama" but are unvalidated
 
 
 def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: str | None = None,
@@ -151,6 +154,20 @@ def _field_bf16_min_b() -> float:
         return float(os.environ.get("FORGE_V2_FIELD_BF16_MIN_B", "2.0"))
     except ValueError:
         return 2.0
+
+
+FIELD_BF16_DEFAULT_TYPES = frozenset({"lfm2"})  # families whose field win was measured with bf16 weights + paged 8-bit AdamW
+
+
+def _field_bf16_enabled(model_type: str | None) -> bool:
+    """bf16 weights + paged 8-bit AdamW on the field route (>= _field_bf16_min_b() B). FORGE_V2_FIELD_BF16=1/0
+    forces it; unset, it is on only for FIELD_BF16_DEFAULT_TYPES (lfm2: the 2026-09-16 MathFusion win ran this way,
+    1.7 epochs in 2 h; fp32 master at the same size managed 0.49–2.2 partial epochs). Llama-1B never reaches the
+    size threshold, so its deployed fp32 path is unchanged."""
+    forced = os.environ.get("FORGE_V2_FIELD_BF16", "").strip()
+    if forced in ("0", "1"):
+        return forced == "1"
+    return str(model_type or "").lower() in FIELD_BF16_DEFAULT_TYPES
 
 
 def _field_lr_calibration() -> bool:
@@ -698,7 +715,7 @@ def run(
         _event_and_print("sft_v2_field_route", params_b=round(params_b, 3), eff_batch=_eff_default)
     geo = choose_geometry(params_b=params_b, max_len=max_len, vocab=vocab, per_gpu_gb=per_gpu_gb, bnb_ok=_bnb_available(),
                           layers=layers, hidden=hidden, liger=use_liger, eff_default=_eff_default)
-    if field and geo.fp32_master and os.environ.get("FORGE_V2_FIELD_BF16", "0") == "1" and params_b >= _field_bf16_min_b() and os.environ.get("FORGE_V2_FP32_MASTER", "").strip() != "1":
+    if field and geo.fp32_master and _field_bf16_enabled(str(getattr(getattr(model, "config", None), "model_type", "") or "")) and params_b >= _field_bf16_min_b() and os.environ.get("FORGE_V2_FP32_MASTER", "").strip() != "1":
         # 2–4B full weights in fp32 master are throughput-bound in a tournament window
         # (Gemma-2-2B 12.4 s/step → 0.49 epoch in 45 min); bf16 weights + 8-bit AdamW
         # learned identically to fp32 on the Llama ablation at 1.4x the speed
