@@ -105,8 +105,18 @@ def field_full_min_rows() -> int:
         return FIELD_FULL_MIN_ROWS
 
 
+FIELD_FULL_MIN_TOKENS = 8_000_000  # GossipCop 11.8M tokens won; Alpaca-20k 1.2M and CodeFeedback 3.9M lost (2026-09-16)
+
+
+def field_full_min_tokens() -> int:
+    try:
+        return int(float(os.environ.get("FORGE_V2_FIELD_MIN_TOKENS", str(FIELD_FULL_MIN_TOKENS))))
+    except ValueError:
+        return FIELD_FULL_MIN_TOKENS
+
+
 def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: str | None = None,
-                     n_rows: int | None = None) -> bool:
+                     n_rows: int | None = None, total_tokens: int | None = None) -> bool:
     """Full weights at the field geometry for single-GPU, non-KL instruct tasks up to
     FIELD_FULL_MAX_PARAMS_B (FORGE_V2_FIELD_MAX_PARAMS_B overrides) on an allow-listed
     model family (field_full_types) with at least field_full_min_rows() rows: full weights
@@ -118,6 +128,10 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
     if model_type is not None and str(model_type).lower() not in field_full_types():
         return False
     if n_rows is not None and n_rows < field_full_min_rows():
+        return False
+    if total_tokens is not None and total_tokens < field_full_min_tokens():
+        # data volume, not row count, separates the wins from the losses: full weights
+        # overfit small token budgets within an epoch at every tested LR
         return False
     try:
         cap = float(os.environ.get("FORGE_V2_FIELD_MAX_PARAMS_B", str(FIELD_FULL_MAX_PARAMS_B)))

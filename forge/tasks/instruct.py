@@ -791,24 +791,35 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     v2_route_lr: float | None = None
     _mt = str(getattr(getattr(loaded.model, "config", None), "model_type", "") or "")
     _v2_strategy = sft_v2.strategy_for(params_b, _mt) if not pinned_route else ""
-    field_route = (
-        bool(_v2_strategy)
-        and not pinned_route
-        and not falcon_legacy_route
-        and sft_v2.field_full_route(params_b=params_b, n_gpus=n_gpus, is_kl=is_kl, model_type=_mt, n_rows=len(rows))
-    )
-    if field_route:
-        # full weights at the champion's geometry regardless of row length (Sept 14:
-        # every winner on every task, long or short rows, uploaded full weights)
-        _v2_strategy = "full"
-        v2_strategy_override = "full"
-        telemetry.event("sft_v2_field_full_route", params_b=round(params_b, 3), eff_batch=sft_v2.field_eff_batch(params_b))
+    field_route = False
     if _v2_strategy in ("lora", "full"):
         # Both v2 paths are validated on long-row tasks only (Smol-jb median 392,
         # Gemma 762, ru-AAQG 302). On short-row open-ended data production's
         # adapter wins for every size tried (Qwen2.5-0.5B full FT +4.1%, alpaca
         # adapters neutral), so short rows always stay on production.
         is_long, median_len = sft_v2.long_row_task(rows, spec, tokenizer)
+        _total_tokens = None
+        try:
+            _bt = int(getattr(baseline_summary, "total_tokens", 0) or 0)  # validator model-prep statistic
+            if _bt > 0:
+                _total_tokens = _bt
+        except Exception:
+            _total_tokens = None
+        if _total_tokens is None and median_len:
+            _total_tokens = int(median_len) * len(rows)
+        field_route = (
+            not pinned_route
+            and not falcon_legacy_route
+            and sft_v2.field_full_route(params_b=params_b, n_gpus=n_gpus, is_kl=is_kl, model_type=_mt, n_rows=len(rows),
+                                        total_tokens=_total_tokens)
+        )
+        telemetry.event("sft_v2_field_gate", total_tokens=_total_tokens, rows=len(rows), model_type=_mt, field_route=field_route)
+        if field_route:
+            # full weights at the champion's geometry regardless of row length, on the
+            # validated regime only (llama family, >=15k rows, >=8M tokens)
+            _v2_strategy = "full"
+            v2_strategy_override = "full"
+            telemetry.event("sft_v2_field_full_route", params_b=round(params_b, 3), eff_batch=sft_v2.field_eff_batch(params_b))
         short_rows = (not is_long) and not field_route
         telemetry.event("sft_v2_row_length_gate", median_tokens=median_len, long_rows=is_long, strategy=_v2_strategy)
         if _v2_strategy == "lora" and is_long and sft_v2.bigdata_full_route(

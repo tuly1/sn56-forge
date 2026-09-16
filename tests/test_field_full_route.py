@@ -83,3 +83,15 @@ def test_field_bf16_threshold_and_sweep_knobs(monkeypatch):
     assert not sft_v2._field_sweep()
     monkeypatch.setenv("FORGE_V2_FIELD_SWEEP", "1")
     assert sft_v2._field_sweep()
+
+
+def test_token_gate(monkeypatch):
+    monkeypatch.setenv("FORGE_V2_FIELD", "1")
+    monkeypatch.delenv("FORGE_V2_FIELD_MIN_TOKENS", raising=False)
+    ok = dict(params_b=1.24, n_gpus=1, is_kl=False, model_type="llama", n_rows=19505)
+    assert sft_v2.field_full_route(**ok, total_tokens=11_768_429)   # GossipCop
+    assert not sft_v2.field_full_route(**ok, total_tokens=1_200_000)  # Alpaca-20k
+    assert not sft_v2.field_full_route(**ok, total_tokens=3_900_000)  # CodeFeedback
+    assert sft_v2.field_full_route(**ok, total_tokens=None)
+    monkeypatch.setenv("FORGE_V2_FIELD_MIN_TOKENS", "1e6")
+    assert sft_v2.field_full_route(**ok, total_tokens=1_200_000)
