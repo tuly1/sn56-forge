@@ -24,7 +24,7 @@ from typing import Any, Callable
 
 from forge import telemetry
 from forge.clock import Deadline
-from forge.data import hygiene, prompts, tokenize
+from forge.data import hygiene, packing, prompts, tokenize
 from forge.data.schema import TaskSpec
 from forge.data.split import (
     adaptive_max_len,
@@ -615,7 +615,7 @@ def optimizer_state_bytes(model: Any, optim: str) -> int:
 
 
 def memory_probe(model: Any, *, micro: int, max_len: int, vocab: int, autocast: bool, reserve_bytes: int = 0,
-                 headroom: float = 0.07) -> bool:
+                 headroom: float = 0.07, packed_mode: str = "off") -> bool:
     """One synthetic forward/backward at the worst-case micro-batch shape. Fits
     only if the peak plus `reserve_bytes` (optimizer state) leaves `headroom`
     (7% by default; fp32-master field-route weights use 15%: LFM2.5-2.6B passed at
@@ -624,7 +624,8 @@ def memory_probe(model: Any, *, micro: int, max_len: int, vocab: int, autocast: 
 
     device = next(model.parameters()).device
     ids = torch.randint(5, max(6, vocab - 1), (micro, max_len), device=device)
-    batch = {"input_ids": ids, "attention_mask": torch.ones_like(ids), "labels": ids.clone()}
+    batch = (packing.probe_batch(ids, packed_mode) if packed_mode != "off" else
+             {"input_ids": ids, "attention_mask": torch.ones_like(ids), "labels": ids.clone()})
     model.train()
     try:
         if device.type == "cuda":
@@ -791,20 +792,30 @@ def run(
         except Exception as exc:  # fused kernels are an optimisation, never a requirement
             _event_and_print("liger_apply_failed", error=f"{type(exc).__name__}: {exc}")
             use_liger = False
+    if field:
+        model.config.use_cache = False
+    pack = packing.plan_field_packing(
+        model, train_ex, max_len=max_len, pad_token_id=tokenizer.pad_token_id,
+        model_cap=min(EVAL_CAP, model_cap), field_route=field,
+        field_hygiene=field_hygiene, log=_event_and_print,
+    )
+    unit_len = pack.pack_len if pack else max_len
     # adapters train at production's proven effective batch 16 (LFM: 875 updates/epoch at
     # batch 16 beat 178 at batch 76); full weights follow the champion's batch 64, or
     # the champion's size bucket on the field route
     _eff_default = 16 if strategy == "lora" else (field_eff_batch(params_b) if field else EFF_BATCH_TARGET)
     if field:
         _event_and_print("sft_v2_field_route", params_b=round(params_b, 3), eff_batch=_eff_default)
-    geo = choose_geometry(params_b=params_b, max_len=max_len, vocab=vocab, per_gpu_gb=per_gpu_gb, bnb_ok=_bnb_available(),
+    if pack:
+        _eff_default = pack.eff_blocks(_eff_default)
+    geo = choose_geometry(params_b=params_b, max_len=unit_len, vocab=vocab, per_gpu_gb=per_gpu_gb, bnb_ok=_bnb_available(),
                           layers=layers, hidden=hidden, liger=use_liger, eff_default=_eff_default)
     if field and geo.fp32_master and _field_bf16_enabled(str(getattr(getattr(model, "config", None), "model_type", "") or "")) and params_b >= _field_bf16_min_b(str(getattr(getattr(model, "config", None), "model_type", "") or "")) and os.environ.get("FORGE_V2_FP32_MASTER", "").strip() != "1":
         # 2–4B full weights in fp32 master are throughput-bound in a tournament window
         # (Gemma-2-2B 12.4 s/step → 0.49 epoch in 45 min); bf16 weights + 8-bit AdamW
         # learned identically to fp32 on the Llama ablation at 1.4x the speed
         tok_budget = 49152 if vocab < 200_000 else 36864
-        micro = max(1, min(64, tok_budget // max_len, _eff_default))
+        micro = max(1, min(64, tok_budget // unit_len, _eff_default))
         geo = Geometry(micro, max(1, math.ceil(_eff_default / micro)), geo.max_len, geo.gradient_checkpointing, False,
                        "paged_adamw_8bit" if _bnb_available() else "adamw_torch")
         _event_and_print("sft_v2_field_bf16", params_b=round(params_b, 3), micro=geo.micro_batch, grad_accum=geo.grad_accum, optim=geo.optim)
@@ -861,7 +872,8 @@ def run(
             _apply_gc(gc_c)
             ok = memory_probe(model, micro=micro_c, max_len=geo.max_len, vocab=vocab, autocast=autocast,
                               reserve_bytes=optimizer_state_bytes(model, geo.optim),
-                              headroom=0.15 if (field and geo.fp32_master and strategy == "full") else 0.07)
+                              headroom=0.15 if (field and geo.fp32_master and strategy == "full") else 0.07,
+                              packed_mode=pack.mode if pack else "off")
             _event_and_print("sft_v2_memory_probe", micro=micro_c, gradient_checkpointing=gc_c, fits=ok)
             if ok:
                 eff_target = geo.eff_batch
@@ -873,10 +885,19 @@ def run(
         fp32_master=geo.fp32_master, optim=geo.optim, liger=use_liger, vocab=vocab, train_n=len(train_ex), val_n=len(dev_ex),
     )
 
+    if pack:
+        telemetry.set_meta(packing=pack.telemetry(), train_blocks=pack.n_blocks,
+                           rows_per_step=pack.rows_per_step(geo.eff_batch))
+
+    def rows_per_step() -> int:
+        return pack.rows_per_step(geo.eff_batch) if pack else geo.eff_batch
+
     collator = tokenize.PadCollator(tokenizer.pad_token_id)
     # training rows carry per-token loss weights while the hygiene prompt-loss weight is active; dev
     # evaluation, the timing probe and the dev pass keep the plain collator (plain CE, validator statistic)
     train_collator = hygiene.PromptWeightCollator(tokenizer.pad_token_id, hyg["plw"]) if (field_hygiene and hyg["plw"] > 0) else collator
+    if pack:
+        train_collator = pack.collator
     from forge.model import median_weight_rms
 
     # BaselineSummary.gradient_noise_scale (validator training statistic) feeds only the gated NEFTune
@@ -896,7 +917,7 @@ def run(
             prior_lr = min(prior_lr, 1.5e-4)
     else:
         prior_lr = lr_probe.analytic_lr(weight_rms=_layer_weight_rms(model) or median_weight_rms(model), params_b=params_b,
-                                        eff_batch=geo.eff_batch, gradient_noise_scale=gns)
+                                        eff_batch=rows_per_step(), gradient_noise_scale=gns)
         # the analytic law under-shoots the field by ~7x on Gemma-2-2B (2e-5 vs
         # the champion's 7.5e-5 bucket); anchor the prior to the bucket, the sweep decides
         if field:
@@ -906,10 +927,10 @@ def run(
             # and Qwen2.5-3B regressions). Clamped to [2e-5, 1e-4]; FORGE_V2_FIELD_LR_MULT
             # scales it for experiments; no sweep (the short probe under-picks for full weights).
             _raw = lr_probe.analytic_lr(weight_rms=_layer_weight_rms(model) or median_weight_rms(model), params_b=params_b,
-                                        eff_batch=geo.eff_batch, gradient_noise_scale=gns)
+                                        eff_batch=rows_per_step(), gradient_noise_scale=gns)
             _fm = _field_lr_mult(str(getattr(getattr(model, "config", None), "model_type", "") or ""))
             prior_lr = max(2.0e-5, min(1.0e-4, _raw)) * _fm
-            _event_and_print("sft_v2_field_lr", prior_lr=prior_lr, raw=_raw, mult=_fm, eff_batch=geo.eff_batch)
+            _event_and_print("sft_v2_field_lr", prior_lr=prior_lr, raw=_raw, mult=_fm, eff_batch=geo.eff_batch, rows_per_step=rows_per_step())
         else:
             prior_lr = max(prior_lr, 0.5 * lr_probe.size_cap_lr(params_b))
 
@@ -954,11 +975,12 @@ def run(
     def with_lengths(exs: list[dict]) -> Dataset:
         return Dataset.from_list([{**ex, "length": len(ex["input_ids"])} for ex in exs])
 
-    train_ds = with_lengths(train_ex)
+    train_ds = with_lengths(pack.features if pack else train_ex)
 
     # ---- learning-rate probe on cached batches from the real dataloader ----
-    probe_trainer = Trainer(model=model, args=make_args(1.0, prior_lr, 10, geo.micro_batch, geo.grad_accum), train_dataset=train_ds, data_collator=collator)
-    steps_per_epoch = max(1, len(train_ex) // geo.eff_batch)
+    probe_trainer = Trainer(model=model, args=make_args(1.0, prior_lr, 10, geo.micro_batch, geo.grad_accum), train_dataset=train_ds, data_collator=pack.collator if pack else collator)
+    steps_per_epoch = (packing.optimizer_steps(pack.n_blocks, geo.micro_batch, geo.grad_accum)
+                       if pack else max(1, len(train_ex) // geo.eff_batch))
     remaining = deadline.remaining_hard()
     probe_budget = min(0.15 * remaining, 480.0) if _lr_override <= 0 else 0.0  # fixed LR: timing steps only
     batches: list[dict[str, Any]] = []
@@ -1109,7 +1131,8 @@ def run(
             max_epochs_total = float(os.environ["FORGE_V2_MAX_EPOCHS"])
     except ValueError:
         pass
-    steps_per_epoch = max(1, len(train_ex) // geo.eff_batch)
+    steps_per_epoch = (packing.optimizer_steps(pack.n_blocks, geo.micro_batch, geo.grad_accum)
+                       if pack else max(1, len(train_ex) // geo.eff_batch))
 
     # ---- training with validator-style dev selection ----
     pool = selection.SnapshotPool(k=8)
@@ -1188,7 +1211,7 @@ def run(
     TrainerCls = RowLossTrainer if row_loss else (LoraPlusTrainer if (_lora_plus > 1.0 and strategy == "lora") else Trainer)
     if row_loss:
         _event_and_print("sft_v2_row_loss", enabled=True, fused=use_liger)
-    elif train_collator is not collator:
+    elif field_hygiene and hyg["plw"] > 0:
         TrainerCls = make_prompt_weight_trainer(Trainer, use_fused=use_liger)
         _event_and_print("sft_v2_prompt_loss_weight", plw=hyg["plw"], ratio=hyg["ratio"], fused=use_liger)
 
@@ -1430,6 +1453,8 @@ def run(
             oom_continue = True
             new_micro = max(1, geo.micro_batch // 2) if (geo.gradient_checkpointing or geo.micro_batch > 1) else 1
             geo = Geometry(new_micro, max(1, geo.eff_batch // new_micro), geo.max_len, True, geo.fp32_master, geo.optim)
+            if pack:
+                steps_per_epoch = packing.optimizer_steps(pack.n_blocks, geo.micro_batch, geo.grad_accum)
             _apply_gc(True)
             continue
         if trainer is None:
