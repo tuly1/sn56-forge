@@ -115,8 +115,11 @@ def field_full_min_tokens() -> int:
         return FIELD_FULL_MIN_TOKENS
 
 
+FIELD_FULL_VOCABS = frozenset({128256})  # Llama-3.x family; TinyLlama (32000) and SmolLM2 (49152) share model_type "llama" but are unvalidated
+
+
 def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: str | None = None,
-                     n_rows: int | None = None, total_tokens: int | None = None) -> bool:
+                     n_rows: int | None = None, total_tokens: int | None = None, vocab_size: int | None = None) -> bool:
     """Full weights at the field geometry for single-GPU, non-KL instruct tasks up to
     FIELD_FULL_MAX_PARAMS_B (FORGE_V2_FIELD_MAX_PARAMS_B overrides) on an allow-listed
     model family (field_full_types) with at least field_full_min_rows() rows: full weights
@@ -127,6 +130,8 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
         return False
     if model_type is not None and str(model_type).lower() not in field_full_types():
         return False
+    if vocab_size is not None and not os.environ.get("FORGE_V2_FIELD_TYPES") and int(vocab_size) not in FIELD_FULL_VOCABS:
+        return False  # the validated win is Meta Llama-3.2; other "llama"-architecture families keep their routes
     if n_rows is not None and n_rows < field_full_min_rows():
         return False
     if total_tokens is not None and total_tokens < field_full_min_tokens():
@@ -145,6 +150,11 @@ def _field_bf16_min_b() -> float:
         return float(os.environ.get("FORGE_V2_FIELD_BF16_MIN_B", "2.0"))
     except ValueError:
         return 2.0
+
+
+def _field_lr_calibration() -> bool:
+    """CPU-reviewed research integration; never enabled by default."""
+    return os.environ.get("FORGE_V2_FIELD_LR_CALIBRATION", "0") == "1"
 
 
 def _field_sweep() -> bool:
@@ -795,6 +805,12 @@ def run(
         prior_lr = route_lr
         _lr_override = route_lr
 
+    # A separate opt-in FIELD experiment owns its bounded probes. Suppress the
+    # older generic sweep even when conflicting experiment flags are rejected.
+    field_calibration = field and _field_lr_calibration()
+    if field_calibration:
+        _lr_override = prior_lr
+
     def optimizer_factory(params: list, lr: float):
         return torch.optim.AdamW(params, lr=lr, weight_decay=0.0, betas=(0.9, 0.999), eps=1e-8)
 
@@ -826,6 +842,8 @@ def run(
     # batch (re-seen batches are memorised and bias the sweep toward the fastest
     # memoriser rather than the best learner).
     n_probe_batches = min(400, max(100 * geo.grad_accum, 60))
+    if field_calibration:
+        n_probe_batches = 25 * geo.grad_accum  # one full, non-wrapping experimental panel prefix
     lr, t_per_step, diag = prior_lr, None, {}
     if remaining > MIN_TASK_SECONDS_FOR_V2:
         try:
@@ -836,17 +854,31 @@ def run(
             import random as _random
 
             _random.Random(11).shuffle(batches)  # the sampler front-loads the longest rows; timing needs a representative mix
-            # 1) timing at the initial geometry (3 steps) at a safe LR: step time does
-            #    not depend on the LR, and an un-warmed step at the full prior spikes
-            #    a full fine-tune (Gemma: 0.23 -> 2.7); the sweep judges LRs properly
-            t_micro, warm = lr_probe.measure_step_time(
-                model, batches, lr=0.1 * prior_lr, grad_accum=geo.grad_accum, optimizer_factory=optimizer_factory, autocast_bf16=autocast,
-            )
-            t_per_step = t_micro
-            _event_and_print("sft_v2_timing", t_per_step=round(t_per_step, 4) if t_per_step else None, eff_batch=geo.eff_batch,
-                             losses=[round(x, 4) for x in warm[:3]])
-            # 2) batch adaptation (below) needs the timing; 3) the sweep runs after it at the final geometry
+            if field_calibration:
+                from forge.tuning.field_lr_calibration import run_field_calibration
+
+                _probe_reserve = EXPORT_RESERVE_S + 2.0 * _estimate_eval_seconds(len(dev_ex), None, geo) + _dev_pass_estimate(len(dev_ex), None, geo)
+                lr, t_per_step, diag = run_field_calibration(
+                    probe_trainer, batches, prior_lr=prior_lr, deadline=deadline,
+                    finish_reserve_s=_probe_reserve,
+                    log=lambda n, d: _event_and_print(n, **_flat(d)),
+                )
+            else:
+                # 1) timing at the initial geometry (3 steps) at a safe LR: step time does
+                #    not depend on the LR, and an un-warmed step at the full prior spikes
+                #    a full fine-tune (Gemma: 0.23 -> 2.7); the sweep judges LRs properly
+                t_micro, warm = lr_probe.measure_step_time(
+                    model, batches, lr=0.1 * prior_lr, grad_accum=geo.grad_accum, optimizer_factory=optimizer_factory, autocast_bf16=autocast,
+                )
+                t_per_step = t_micro
+                _event_and_print("sft_v2_timing", t_per_step=round(t_per_step, 4) if t_per_step else None, eff_batch=geo.eff_batch,
+                                 losses=[round(x, 4) for x in warm[:3]])
+                # 2) batch adaptation (below) needs the timing; 3) the sweep runs after it at the final geometry
         except Exception as exc:
+            if field_calibration:
+                # The experimental runner only returns after verified recovery.
+                # Restoration failure must never train on partially probed state.
+                raise
             if _is_oom(exc):
                 _event_and_print("lr_probe_oom", micro=geo.micro_batch)
                 _free_cuda()

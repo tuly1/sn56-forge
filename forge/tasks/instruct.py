@@ -811,7 +811,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             not pinned_route
             and not falcon_legacy_route
             and sft_v2.field_full_route(params_b=params_b, n_gpus=n_gpus, is_kl=is_kl, model_type=_mt, n_rows=len(rows),
-                                        total_tokens=_total_tokens)
+                                        total_tokens=_total_tokens,
+                                        vocab_size=int(getattr(getattr(loaded.model, "config", None), "vocab_size", 0) or 0) or None)
         )
         telemetry.event("sft_v2_field_gate", total_tokens=_total_tokens, rows=len(rows), model_type=_mt, field_route=field_route)
         if field_route:
