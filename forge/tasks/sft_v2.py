@@ -24,12 +24,13 @@ from typing import Any, Callable
 
 from forge import telemetry
 from forge.clock import Deadline
-from forge.data import prompts, tokenize
+from forge.data import hygiene, prompts, tokenize
 from forge.data.schema import TaskSpec
 from forge.data.split import (
     adaptive_max_len,
     dev_size_for,
     exact_dedup,
+    grouped_stratified_split,
     random_subsample,
     smart_truncate,
     stratified_split,
@@ -626,12 +627,42 @@ def run(
     tokenized = exact_dedup(tokenized)
     if not tokenized:
         raise RuntimeError("no trainable examples after tokenization")
+    strategy = strategy_override or strategy_for(params_b, str(getattr(getattr(model, "config", None), "model_type", "") or "")) or "full"
+    _dm = getattr(model, "hf_device_map", None) or {}
+    sharded = len({str(v) for v in _dm.values()}) > 1
+    # the field geometry applies only when the dispatcher chose the field route (family, rows,
+    # size gates); the legacy v2 full path (tiny models by size) keeps its previous behaviour
+    field = field_route and strategy == "full" and not sharded
+    # ---- field hygiene (FORGE_V2_FIELD_HYGIENE=1, field route only): near-duplicate groups (removed when the
+    # validator reports a duplicated corpus), group-aware dev split, prompt-loss weight; see forge.data.hygiene ----
+    field_hygiene = field and hygiene.enabled()
+    hyg: dict[str, Any] = {"dedup_removed": 0, "groups": 0, "grouped_rows": 0, "dedup": False, "ratio": None, "plw": 0.0}
+    dup_groups: list[list[int]] | None = None
+    if field_hygiene:
+        try:
+            dup_groups = hygiene.near_duplicate_groups(hygiene.render_texts(tokenized, tokenizer))
+            hyg["groups"] = sum(1 for g in dup_groups if len(g) > 1)
+            hyg["grouped_rows"] = sum(len(g) for g in dup_groups if len(g) > 1)
+            hyg["dedup"] = hygiene.dedup_triggered(baseline_summary, forced=hygiene.dedup_forced())
+            if hyg["dedup"]:
+                before = len(tokenized)
+                tokenized, dup_groups = hygiene.drop_near_duplicates(tokenized, dup_groups)
+                hyg["dedup_removed"] = before - len(tokenized)
+            hyg["ratio"] = hygiene.prompt_completion_ratio(tokenized)
+            hyg["plw"] = hygiene.prompt_loss_weight(hyg["ratio"])
+        except Exception as exc:  # an opt-in experiment must never floor the task: keep the plain data path
+            _event_and_print("sft_v2_hygiene_failed", stage="data", error=f"{type(exc).__name__}: {exc}"[:200])
+            dup_groups = None
+            hyg["plw"] = 0.0
     lengths = [len(ex["input_ids"]) for ex in tokenized]
     model_cap = int(getattr(model.config, "max_position_embeddings", EVAL_CAP) or EVAL_CAP)
     max_len = adaptive_max_len(lengths, ceiling=min(EVAL_CAP, max(256, model_cap)))
     hours_total = deadline.remaining_hard() / 3600.0
     dev_n = dev_size_for(len(tokenized), hours=hours_total)
-    train_ex, dev_ex = stratified_split(tokenized, dev_n, seed=7)
+    if dup_groups is not None:
+        train_ex, dev_ex = grouped_stratified_split(tokenized, dev_n, dup_groups, seed=7)
+    else:
+        train_ex, dev_ex = stratified_split(tokenized, dev_n, seed=7)
     train_ex = [smart_truncate(ex, max_len) for ex in train_ex]
     dev_ex = [smart_truncate(ex, max_len) for ex in dev_ex]
     _event_and_print(
@@ -645,8 +676,6 @@ def run(
     layers = int(getattr(cfg, "num_hidden_layers", 32) or 32)
     hidden = int(getattr(cfg, "hidden_size", 2048) or 2048)
     use_liger = _liger_ok(model)
-    _dm = getattr(model, "hf_device_map", None) or {}
-    sharded = len({str(v) for v in _dm.values()}) > 1
     if sharded:
         # device_map model parallel (Round-2 32B on 4xH100): Triton fused kernels
         # raised on cross-device tensors during the probe (2026-09-12 dry-2v), so
@@ -661,10 +690,6 @@ def run(
         except Exception as exc:  # fused kernels are an optimisation, never a requirement
             _event_and_print("liger_apply_failed", error=f"{type(exc).__name__}: {exc}")
             use_liger = False
-    strategy = strategy_override or strategy_for(params_b, str(getattr(getattr(model, "config", None), "model_type", "") or "")) or "full"
-    # the field geometry applies only when the dispatcher chose the field route (family, rows,
-    # size gates); the legacy v2 full path (tiny models by size) keeps its previous behaviour
-    field = field_route and strategy == "full" and not sharded
     # adapters train at production's proven effective batch 16 (LFM: 875 updates/epoch at
     # batch 16 beat 178 at batch 76); full weights follow the champion's batch 64, or
     # the champion's size bucket on the field route
@@ -748,13 +773,14 @@ def run(
     )
 
     collator = tokenize.PadCollator(tokenizer.pad_token_id)
+    # training rows carry per-token loss weights while the hygiene prompt-loss weight is active; dev
+    # evaluation, the timing probe and the dev pass keep the plain collator (plain CE, validator statistic)
+    train_collator = hygiene.PromptWeightCollator(tokenizer.pad_token_id, hyg["plw"]) if (field_hygiene and hyg["plw"] > 0) else collator
     from forge.model import median_weight_rms
 
+    # BaselineSummary.gradient_noise_scale (validator training statistic) feeds only the gated NEFTune
+    # escalation (_neftune_alpha, field hygiene); the analytic LR law's noise term stays inert as before
     gns = None
-    try:
-        gns = getattr(baseline_summary, "gradient_noise_scale", None)
-    except Exception:
-        gns = None
     if strategy == "lora":
         # production trains the adapter at 1.5e-4 with effective batch 16; the prior
         # sits just above it and scales with sqrt(batch) (the Smol sweep chose
@@ -823,7 +849,7 @@ def run(
             gradient_checkpointing=False,  # enabled on the model directly above
             logging_steps=5, save_strategy="no", eval_strategy="no", report_to=[], remove_unused_columns=False,
             dataloader_num_workers=2, disable_tqdm=True, seed=seed, train_sampling_strategy="group_by_length", length_column_name="length",
-            neftune_noise_alpha=_neftune_alpha(baseline_summary, strategy),
+            neftune_noise_alpha=_neftune_alpha(baseline_summary, strategy, escalate=field_hygiene),
         )
         return TrainingArguments(**compatible_dataclass_kwargs(TrainingArguments, kwargs, allow_removed={"overwrite_output_dir"}))
 
@@ -953,6 +979,24 @@ def run(
     gc.collect()
     _free_cuda()
 
+    # ---- field hygiene: Gaussian difficulty core once the measured coverage is known ----
+    if field_hygiene:
+        cov = hygiene.coverage(rows=len(train_ex), eff_batch=geo.eff_batch, t_per_step=t_per_step, budget_s=hours_total * 3600.0)
+        kept_n = None
+        try:
+            kept, target = hygiene.difficulty_subsample(train_ex, coverage=cov, seed=7)
+            if target is not None and len(kept) < len(train_ex):
+                train_ex = kept
+                train_ds = with_lengths(train_ex)
+                kept_n = len(train_ex)
+                telemetry.set_meta(train_n=len(train_ex))
+        except Exception as exc:
+            _event_and_print("sft_v2_hygiene_failed", stage="subsample", error=f"{type(exc).__name__}: {exc}"[:200])
+        _event_and_print("sft_v2_hygiene", dedup_removed=hyg["dedup_removed"], groups=hyg["groups"], grouped_rows=hyg["grouped_rows"],
+                         dedup=hyg["dedup"], subsample_kept=kept_n, plw=hyg["plw"], prompt_completion_ratio=hyg["ratio"],
+                         neftune_alpha=_neftune_alpha(baseline_summary, strategy, escalate=field_hygiene), coverage=cov,
+                         train_n=len(train_ex))
+
     # ---- planning constants ----
     dev_eval_est = _estimate_eval_seconds(len(dev_ex), t_per_step, geo)
     export_reserve = 60.0 if strategy == "lora" else EXPORT_RESERVE_S
@@ -1046,6 +1090,9 @@ def run(
     TrainerCls = RowLossTrainer if row_loss else (LoraPlusTrainer if (_lora_plus > 1.0 and strategy == "lora") else Trainer)
     if row_loss:
         _event_and_print("sft_v2_row_loss", enabled=True, fused=use_liger)
+    elif train_collator is not collator:
+        TrainerCls = make_prompt_weight_trainer(Trainer, use_fused=use_liger)
+        _event_and_print("sft_v2_prompt_loss_weight", plw=hyg["plw"], ratio=hyg["ratio"], fused=use_liger)
 
     try:
         _ema_frac = float(os.environ.get("FORGE_V2_TAIL_EMA", "0") or 0)  # fraction of the phase averaged (0 = off)
@@ -1255,7 +1302,7 @@ def run(
         trainer = TrainerCls(
             model=model, args=make_args(epochs, phase_lr, warmup, geo.micro_batch, geo.grad_accum,
                                         seed=_seed_base + (1000 if seed_b_active else phase)),
-            train_dataset=train_ds, data_collator=collator, callbacks=[cb, telemetry.make_trainer_callback(spec.output_dir)],
+            train_dataset=train_ds, data_collator=train_collator, callbacks=[cb, telemetry.make_trainer_callback(spec.output_dir)],
         )
         t_phase0 = time.monotonic()
         eval0, pers0 = state["eval_secs"], state["persist_secs"]
@@ -1581,12 +1628,14 @@ def _min_lr_rate(default: float = 0.1) -> float:
         return default
 
 
-def _neftune_alpha(summary: Any, strategy: str = "full") -> float | None:
+def _neftune_alpha(summary: Any, strategy: str = "full", *, escalate: bool = False) -> float | None:
     """NEFTune alpha for the trainer. Adapters train without it (2026-09-11: on
     Qwen2.5-3B-Instruct/ru-AAQG, NEFTune off at the 2e-4 prior scores 0.559766
     vs 0.561–0.563 with it, and 0.517658 vs full FT 0.523538 at 52k rows; unpacked
     ~300-token rows carry ~3.7x the field's packed-4096 noise at the same alpha).
-    Full weights keep alpha 1 (tested). FORGE_V2_NEFTUNE overrides (0 = off)."""
+    Full weights keep alpha 1 (tested); with ``escalate`` (field hygiene) alpha 5 when
+    the validator's gradient_noise_scale exceeds 1.0, as in the reference stack.
+    FORGE_V2_NEFTUNE overrides (0 = off)."""
     forced = os.environ.get("FORGE_V2_NEFTUNE", "").strip()
     if forced:
         try:
@@ -1596,13 +1645,32 @@ def _neftune_alpha(summary: Any, strategy: str = "full") -> float | None:
             pass
     if strategy == "lora":
         return None
-    try:
-        gns = getattr(summary, "gradient_noise_scale", None)
-        if gns is not None and float(gns) > 1.0:
-            return 5.0
-    except Exception:
-        pass
+    if escalate:
+        try:
+            gns = getattr(summary, "gradient_noise_scale", None)
+            if gns is not None and float(gns) > 1.0:
+                return 5.0
+        except Exception:
+            pass
     return 1.0
+
+
+def make_prompt_weight_trainer(trainer_cls: Any, *, use_fused: bool) -> Any:
+    """Trainer subclass for the hygiene prompt-loss weight: the collator's per-token
+    ``loss_weights`` drive a weighted token cross-entropy normalised by the weight sum
+    (forge.data.hygiene.weighted_token_loss). Labels stay masked, so dev evaluation and
+    the dev pass keep the plain objective."""
+
+    class PromptWeightTrainer(trainer_cls):
+        def __init__(self, *a: Any, **k: Any) -> None:
+            super().__init__(*a, **k)
+            self.model_accepts_loss_kwargs = False  # the trainer then divides by the accumulation steps
+
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):  # noqa: ANN001
+            loss = hygiene.weighted_token_loss(model, inputs, use_fused=use_fused)
+            return (loss, None) if return_outputs else loss
+
+    return PromptWeightTrainer
 
 
 def _flat(d: dict[str, Any], prefix: str = "") -> dict[str, Any]:

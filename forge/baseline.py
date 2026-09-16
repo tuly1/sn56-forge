@@ -36,6 +36,8 @@ class BaselineSummary:
     total_tokens: int
     num_records: int
     tokens_per_sec: float | None
+    # validator training statistic (McCandlish gradient noise scale); optional, advisory
+    gradient_noise_scale: float | None = None
 
 
 def load_baseline_summary(
@@ -72,7 +74,7 @@ def load_baseline_summary(
     # consumes dataset/throughput fields.  A partial payload must not be mistaken
     # for a production model-prep record.
     _mapping(raw, "weights")
-    _mapping(raw, "training")
+    training = _mapping(raw, "training")
     seq = _mapping(dataset, "seq_length_distribution")
     p95 = _nonnegative_int(seq, "p95")
     p99 = _nonnegative_int(seq, "p99")
@@ -97,6 +99,8 @@ def load_baseline_summary(
             if tokens_per_sec <= 0:
                 raise ValueError("throughput.tokens_per_sec must be positive")
 
+    gradient_noise_scale = _optional_nonnegative_float(training, "gradient_noise_scale")
+
     canonical = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
     return BaselineSummary(
         task_type=task_type,
@@ -108,6 +112,7 @@ def load_baseline_summary(
         total_tokens=total_tokens,
         num_records=num_records,
         tokens_per_sec=tokens_per_sec,
+        gradient_noise_scale=gradient_noise_scale,
     )
 
 
@@ -143,6 +148,7 @@ def telemetry_fields(summary: BaselineSummary) -> dict[str, Any]:
         "baseline_num_records": summary.num_records,
         "baseline_total_tokens": summary.total_tokens,
         "baseline_tokens_per_sec": summary.tokens_per_sec,
+        "baseline_gradient_noise_scale": summary.gradient_noise_scale,
     }
 
 
@@ -198,6 +204,21 @@ def _finite_float(mapping: dict[str, Any], key: str) -> float:
     if key not in mapping:
         raise ValueError(f"baseline is missing {key!r}")
     return _as_finite_float(mapping[key], key)
+
+
+def _optional_nonnegative_float(mapping: dict[str, Any], key: str) -> float | None:
+    """Advisory statistic: absent, null, or malformed values read as None instead of
+    rejecting the whole record (the mandatory fields above stay strict)."""
+    value = mapping.get(key)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0:
+        return None
+    return parsed
 
 
 def _as_finite_float(value: Any, label: str) -> float:

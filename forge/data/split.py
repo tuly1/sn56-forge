@@ -84,6 +84,68 @@ def stratified_split(
     return train, dev
 
 
+def grouped_stratified_split(
+    examples: list[dict[str, Any]],
+    dev_size: int,
+    groups: list[list[int]] | None,
+    *,
+    seed: int = 7,
+    n_bins: int = 4,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Group-aware stratified_split (field hygiene): every group -- a near-duplicate
+    cluster from forge.data.hygiene -- lands entirely in train or entirely in dev, so a
+    near-copy of a training row never scores the dev set. Strata are computed from each
+    group's first member on the same total-length x completion-length grid; groups are
+    drawn atomically and may overshoot dev_size by at most max(5, dev_size // 10)."""
+    n = len(examples)
+    if dev_size <= 0 or n < 2:
+        return list(examples), []
+    dev_size = min(dev_size, n - 1)
+    if not groups:
+        groups = [[i] for i in range(n)]
+    reps = [g[0] for g in groups]
+    total_len = [float(len(examples[i]["input_ids"])) for i in reps]
+    comp_len = [float(sum(1 for t in examples[i]["labels"] if t != -100)) for i in reps]
+    lb = _quantile_bins(total_len, n_bins)
+    cb = _quantile_bins(comp_len, n_bins)
+    strata: dict[tuple[int, int], list[int]] = {}
+    for gi in range(len(groups)):
+        strata.setdefault((lb[gi], cb[gi]), []).append(gi)
+    rng = random.Random(seed)
+    cap = min(n - 1, dev_size + max(5, dev_size // 10))
+    dev_groups: set[int] = set()
+    dev_count = 0
+    for members in strata.values():
+        rng.shuffle(members)
+        stratum_rows = sum(len(groups[gi]) for gi in members)
+        target = max(1, round(dev_size * stratum_rows / n))
+        taken = 0
+        for gi in members:
+            if dev_count >= dev_size or taken >= target:
+                break
+            size = len(groups[gi])
+            if dev_count + size > cap:
+                continue
+            dev_groups.add(gi)
+            taken += size
+            dev_count += size
+    if dev_count < dev_size:
+        rest = [gi for gi in range(len(groups)) if gi not in dev_groups]
+        rng.shuffle(rest)
+        for gi in rest:
+            if dev_count >= dev_size:
+                break
+            size = len(groups[gi])
+            if dev_count + size > cap:
+                continue
+            dev_groups.add(gi)
+            dev_count += size
+    dev_idx = {i for gi in dev_groups for i in groups[gi]}
+    train = [ex for i, ex in enumerate(examples) if i not in dev_idx]
+    dev = [examples[i] for i in sorted(dev_idx)]
+    return train, dev
+
+
 def smart_truncate(ex: dict[str, list[int]], max_len: int) -> dict[str, list[int]]:
     """Trim from the prompt side so completion tokens (the scored part) survive."""
     ids = ex["input_ids"]
