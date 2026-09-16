@@ -23,7 +23,7 @@ def routed_headroom(field, strategy, fp32):
     env = dict(memory_probe=lambda *a, **kw: kw.get("headroom", 0.07),
                model=object(), micro_c=8, geo=NS(max_len=256, optim="adamw_torch", fp32_master=fp32),
                vocab=32, autocast=False, optimizer_state_bytes=lambda *a: 8,
-               field=field, strategy=strategy)
+               field=field, strategy=strategy, pack=None)
     return eval(compile(ast.Expression(CALL), str(SOURCE), "eval"), env)
 
 
