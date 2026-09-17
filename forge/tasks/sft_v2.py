@@ -137,6 +137,22 @@ def _field_identical_base() -> bool:
     return os.environ.get("FORGE_V2_FIELD_IDENTICAL_BASE", "0") == "1"
 
 
+# Row-length scope of the identical-base admission. "long" (default): only tasks whose median row is above the v2 row gate
+# (>= 256 tokens), where production otherwise runs the throughput-starved v2 full strategy (UltraChat-20k: field −5.2%,
+# 98% of rows). Short-row tasks keep the legacy adapter (Sept-14-shaped fixture: field +1.3% worse). "all" admits both.
+FIELD_IDENTICAL_BASE_ROWS_DEFAULT = "long"
+
+
+def _field_identical_rows_policy() -> str:
+    v = os.environ.get("FORGE_V2_FIELD_IDENTICAL_ROWS", FIELD_IDENTICAL_BASE_ROWS_DEFAULT).strip().lower()
+    return v if v in ("long", "all") else FIELD_IDENTICAL_BASE_ROWS_DEFAULT
+
+
+def identical_base_applies(is_long: bool) -> bool:
+    """Whether the identical-base admission is even considered for a task of this row length."""
+    return _field_identical_rows_policy() == "all" or bool(is_long)
+
+
 def _field_identical_base_max_b() -> float:
     try:
         return float(os.environ.get("FORGE_V2_FIELD_IDENTICAL_MAX_PARAMS_B", str(FIELD_IDENTICAL_BASE_MAX_PARAMS_B)))

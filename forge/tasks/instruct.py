@@ -817,6 +817,10 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             _total_tokens = int(median_len) * len(rows)
         _base_identity = None
         if (_mt in sft_v2.FIELD_IDENTICAL_BASE_TYPES and sft_v2._field_identical_base()
+                and not pinned_route and not falcon_legacy_route and n_gpus == 1 and not is_kl
+                and not sft_v2.identical_base_applies(is_long)):
+            telemetry.event("base_identity_skipped", reason="short_rows", median_tokens=median_len)
+        elif (_mt in sft_v2.FIELD_IDENTICAL_BASE_TYPES and sft_v2._field_identical_base()
                 and not pinned_route and not falcon_legacy_route and n_gpus == 1 and not is_kl):
             # exact per-tensor comparison with the shipped public tables; any doubt keeps the adapter route
             from forge.routing import base_identity as _bid
