@@ -239,15 +239,21 @@ def _eligibility(model: Any, *, field_route: bool, field_hygiene: bool) -> str |
         return "row_loss_objective"
     import transformers
     from transformers.models.llama.modeling_llama import LlamaForCausalLM, LlamaModel, LlamaAttention
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2ForCausalLM, Qwen2Model, Qwen2Attention
 
     if transformers.__version__ != QUALIFIED_TRANSFORMERS:
         return "transformers_version_unqualified:" + transformers.__version__
     cfg = getattr(model, "config", None)
-    if (type(model) is not LlamaForCausalLM or type(getattr(model, "model", None)) is not LlamaModel
-            or any(type(layer.self_attn) is not LlamaAttention for layer in model.model.layers)):
-        return "not_native_llama"
-    if cfg.model_type != "llama" or cfg.vocab_size != 128256:
-        return "llama_scope_unqualified"
+    # native families: the block-diagonal isolation comes from transformers' position-id based packed-sequence
+    # masks, which Llama and Qwen2 share; each family is scoped to its validated vocabulary
+    native = {LlamaForCausalLM: (LlamaModel, LlamaAttention, "llama", 128256),
+              Qwen2ForCausalLM: (Qwen2Model, Qwen2Attention, "qwen2", 151936)}
+    spec = native.get(type(model))
+    if (spec is None or type(getattr(model, "model", None)) is not spec[0]
+            or any(type(layer.self_attn) is not spec[1] for layer in model.model.layers)):
+        return "not_native_llama"  # historical reason string: "not a native Llama/Qwen2 implementation"
+    if cfg.model_type != spec[2] or cfg.vocab_size != spec[3]:
+        return "llama_scope_unqualified"  # historical reason string: family/vocabulary outside the validated scope
     if cfg.use_cache:
         return "cache_must_be_disabled"
     return None

@@ -10,7 +10,7 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 import transformers
-from transformers import LlamaConfig, LlamaForCausalLM, Trainer, TrainingArguments
+from transformers import LlamaConfig, LlamaForCausalLM, Qwen2Config, Qwen2ForCausalLM, Trainer, TrainingArguments
 
 from forge.data import packing, tokenize
 from forge.tasks import sft_v2
@@ -19,6 +19,15 @@ from forge.tasks import sft_v2
 def llama(attn="sdpa", vocab=128256):
     torch.manual_seed(17)
     return LlamaForCausalLM(LlamaConfig(
+        vocab_size=vocab, hidden_size=16, intermediate_size=32, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=1, max_position_embeddings=256,
+        bos_token_id=1, eos_token_id=2, pad_token_id=0, use_cache=False,
+        attn_implementation=attn)).eval()
+
+
+def qwen2(attn="sdpa", vocab=151936):
+    torch.manual_seed(17)
+    return Qwen2ForCausalLM(Qwen2Config(
         vocab_size=vocab, hidden_size=16, intermediate_size=32, num_hidden_layers=1,
         num_attention_heads=2, num_key_value_heads=1, max_position_embeddings=256,
         bos_token_id=1, eos_token_id=2, pad_token_id=0, use_cache=False,
@@ -259,3 +268,14 @@ def test_no_extra_modules_or_changed_experimental_defaults():
                     and n.value.func.id=="make_prompt_weight_trainer")
     parent=next(n for n in ast.walk(tree) if isinstance(n,ast.If) and assignment in n.body)
     assert ast.unparse(parent.test)=="field_hygiene and hyg['plw'] > 0"
+
+
+def test_native_qwen2_qualifies_with_its_own_vocabulary(monkeypatch):
+    """2026-09-17: packing extends to native Qwen2 (same position-id based block-diagonal masks); Qwen2 with a
+    foreign vocabulary or a Llama with Qwen2's vocabulary stays out of scope."""
+    monkeypatch.setenv(packing.ENV_MODE, "sdpa")
+    assert packing._eligibility(qwen2(), field_route=True, field_hygiene=False) is None
+    assert packing._eligibility(qwen2(vocab=128256), field_route=True, field_hygiene=False) == "llama_scope_unqualified"
+    assert packing._eligibility(llama(vocab=151936), field_route=True, field_hygiene=False) == "llama_scope_unqualified"
+    p = packing.plan_field_packing(qwen2(), rows(), max_len=64, pad_token_id=0, model_cap=256, field_route=True)
+    assert p is not None and p.mode == "sdpa" and p.stats["rows"] == 8
