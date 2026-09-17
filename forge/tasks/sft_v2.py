@@ -121,25 +121,51 @@ def field_full_min_tokens() -> int:
 
 # validated vocabulary per family: Llama-3.x 128256 (TinyLlama 32000 / SmolLM2 49152 share model_type "llama" but are
 # unvalidated); LFM2.5 128000. Family-specific on purpose: a llama with 128000 or an lfm2 with 128256 is not the validated model.
-FIELD_FULL_VOCABS: dict[str, frozenset[int]] = {"llama": frozenset({128256}), "lfm2": frozenset({128000})}
+FIELD_FULL_VOCABS: dict[str, frozenset[int]] = {"llama": frozenset({128256}), "lfm2": frozenset({128000}),
+                                                 "qwen2": frozenset({151936})}
+# Families admitted to the field route ONLY when the delivered base is byte-identical to a known public checkpoint
+# (forge.routing.base_identity). Qwen2.5 (2026-09-16/17, Qwen2.5-0.5B): on clean bases full weights scored −0.33%
+# (Alpaca-20k), −1.65% (ru-AAQG-29k) and +0.16% (long-tail-29k) against the production adapter, but on every
+# validator-damaged base (scaling / noise / re-init) the adapter won by 1.3–2.9%. Off unless FORGE_V2_FIELD_IDENTICAL_BASE=1.
+FIELD_IDENTICAL_BASE_TYPES = frozenset({"qwen2"})
+# the identical-base admission is validated on Qwen2.5-0.5B only; at 3B full weights lost to the adapter on
+# ru-AAQG (−1.5%), so larger Qwen models keep the adapter (FORGE_V2_FIELD_IDENTICAL_MAX_PARAMS_B overrides)
+FIELD_IDENTICAL_BASE_MAX_PARAMS_B = 1.0
+
+
+def _field_identical_base() -> bool:
+    return os.environ.get("FORGE_V2_FIELD_IDENTICAL_BASE", "0") == "1"
+
+
+def _field_identical_base_max_b() -> float:
+    try:
+        return float(os.environ.get("FORGE_V2_FIELD_IDENTICAL_MAX_PARAMS_B", str(FIELD_IDENTICAL_BASE_MAX_PARAMS_B)))
+    except ValueError:
+        return FIELD_IDENTICAL_BASE_MAX_PARAMS_B
+
 # minimum size per family where the validated configuration applies: lfm2 was validated only on LFM2.5-2.6B, which takes
 # the bf16 + paged 8-bit AdamW path (>= _field_bf16_min_b()); smaller lfm2 models would run an unvalidated fp32 path
 FIELD_FULL_MIN_PARAMS_B: dict[str, float] = {"lfm2": 2.0}
 
 
 def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: str | None = None,
-                     n_rows: int | None = None, total_tokens: int | None = None, vocab_size: int | None = None) -> bool:
+                     n_rows: int | None = None, total_tokens: int | None = None, vocab_size: int | None = None,
+                     base_identity: str | None = None) -> bool:
     """Full weights at the field geometry for single-GPU, non-KL instruct tasks up to
     FIELD_FULL_MAX_PARAMS_B (FORGE_V2_FIELD_MAX_PARAMS_B overrides) on an allow-listed
     model family (field_full_types) with at least field_full_min_rows() rows: full weights
     memorise a small corpus within a few steps (CodeFeedback 8k: best dev at step 10 at both
     1e-4 and 4.8e-5) while they keep improving for two epochs on 19.5k GossipCop rows.
-    On by default; FORGE_V2_FIELD=0 disables it."""
+    On by default; FORGE_V2_FIELD=0 disables it. ``base_identity`` (forge.routing.base_identity status) admits
+    FIELD_IDENTICAL_BASE_TYPES only when it is "identical" and FORGE_V2_FIELD_IDENTICAL_BASE=1."""
     if not _field_full() or is_kl or n_gpus != 1 or params_b <= 0:
         return False
     _mt = str(model_type).lower() if model_type is not None else None
     if _mt is not None and _mt not in field_full_types():
-        return False
+        # a family outside the allow-list is admitted only on a byte-identical public base (see FIELD_IDENTICAL_BASE_TYPES)
+        if not (_mt in FIELD_IDENTICAL_BASE_TYPES and base_identity == "identical" and _field_identical_base()
+                and params_b <= _field_identical_base_max_b()):
+            return False
     if vocab_size is not None and not os.environ.get("FORGE_V2_FIELD_TYPES"):
         # family-specific: the validated wins are Meta Llama-3.2 (128256) and LFM2.5 (128000); an unknown family
         # or a mismatched vocabulary keeps its route
@@ -160,14 +186,25 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
     return params_b <= cap
 
 
-def _field_bf16_min_b() -> float:
+FIELD_BF16_MIN_B_TYPES: dict[str, float] = {"qwen2": 0.3}  # qwen2 validated at 0.494 B with bf16 + paged 8-bit AdamW
+
+
+def _identical_base_family_defaults(model_type: str | None) -> bool:
+    """True when ``model_type`` is an identical-base family and that admission is switched on."""
+    return str(model_type or "").lower() in FIELD_IDENTICAL_BASE_TYPES and _field_identical_base()
+
+
+def _field_bf16_min_b(model_type: str | None = None) -> float:
+    default = FIELD_BF16_MIN_B_TYPES.get(str(model_type or "").lower(), 2.0) if _identical_base_family_defaults(model_type) else 2.0
     try:
-        return float(os.environ.get("FORGE_V2_FIELD_BF16_MIN_B", "2.0"))
+        return float(os.environ.get("FORGE_V2_FIELD_BF16_MIN_B", str(default)))
     except ValueError:
-        return 2.0
+        return default
 
 
 FIELD_BF16_DEFAULT_TYPES = frozenset({"lfm2"})  # families whose field win was measured with bf16 weights + paged 8-bit AdamW
+# qwen2 joins the bf16 / half-raw-LR defaults ONLY while the identical-base admission is switched on (every validated
+# Qwen2.5-0.5B full-weight arm ran FORGE_V2_FIELD_BF16=1, BF16_MIN_B=0.3, LR_MULT=0.5); with the switch off nothing changes.
 
 
 def _field_bf16_enabled(model_type: str | None) -> bool:
@@ -178,7 +215,19 @@ def _field_bf16_enabled(model_type: str | None) -> bool:
     forced = os.environ.get("FORGE_V2_FIELD_BF16", "").strip()
     if forced in ("0", "1"):
         return forced == "1"
-    return str(model_type or "").lower() in FIELD_BF16_DEFAULT_TYPES
+    return str(model_type or "").lower() in FIELD_BF16_DEFAULT_TYPES or _identical_base_family_defaults(model_type)
+
+
+FIELD_LR_MULT_TYPES: dict[str, float] = {"qwen2": 0.5}  # the validated Qwen2.5 full-weight arms ran the half-raw law
+
+
+def _field_lr_mult(model_type: str | None = None) -> float:
+    """Multiplier on the clamped raw analytic LR of the field route: FORGE_V2_FIELD_LR_MULT, else the family default."""
+    default = FIELD_LR_MULT_TYPES.get(str(model_type or "").lower(), 1.0) if _identical_base_family_defaults(model_type) else 1.0
+    try:
+        return float(os.environ.get("FORGE_V2_FIELD_LR_MULT", str(default)) or default)
+    except ValueError:
+        return default
 
 
 def _field_lr_calibration() -> bool:
@@ -726,7 +775,7 @@ def run(
         _event_and_print("sft_v2_field_route", params_b=round(params_b, 3), eff_batch=_eff_default)
     geo = choose_geometry(params_b=params_b, max_len=max_len, vocab=vocab, per_gpu_gb=per_gpu_gb, bnb_ok=_bnb_available(),
                           layers=layers, hidden=hidden, liger=use_liger, eff_default=_eff_default)
-    if field and geo.fp32_master and _field_bf16_enabled(str(getattr(getattr(model, "config", None), "model_type", "") or "")) and params_b >= _field_bf16_min_b() and os.environ.get("FORGE_V2_FP32_MASTER", "").strip() != "1":
+    if field and geo.fp32_master and _field_bf16_enabled(str(getattr(getattr(model, "config", None), "model_type", "") or "")) and params_b >= _field_bf16_min_b(str(getattr(getattr(model, "config", None), "model_type", "") or "")) and os.environ.get("FORGE_V2_FP32_MASTER", "").strip() != "1":
         # 2–4B full weights in fp32 master are throughput-bound in a tournament window
         # (Gemma-2-2B 12.4 s/step → 0.49 epoch in 45 min); bf16 weights + 8-bit AdamW
         # learned identically to fp32 on the Llama ablation at 1.4x the speed
@@ -834,10 +883,7 @@ def run(
             # scales it for experiments; no sweep (the short probe under-picks for full weights).
             _raw = lr_probe.analytic_lr(weight_rms=_layer_weight_rms(model) or median_weight_rms(model), params_b=params_b,
                                         eff_batch=geo.eff_batch, gradient_noise_scale=gns)
-            try:
-                _fm = float(os.environ.get("FORGE_V2_FIELD_LR_MULT", "1.0") or 1.0)
-            except ValueError:
-                _fm = 1.0
+            _fm = _field_lr_mult(str(getattr(getattr(model, "config", None), "model_type", "") or ""))
             prior_lr = max(2.0e-5, min(1.0e-4, _raw)) * _fm
             _event_and_print("sft_v2_field_lr", prior_lr=prior_lr, raw=_raw, mult=_fm, eff_batch=geo.eff_batch)
         else:

@@ -815,12 +815,22 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             _total_tokens = None
         if _total_tokens is None and median_len:
             _total_tokens = int(median_len) * len(rows)
+        _base_identity = None
+        if (_mt in sft_v2.FIELD_IDENTICAL_BASE_TYPES and sft_v2._field_identical_base()
+                and not pinned_route and not falcon_legacy_route and n_gpus == 1 and not is_kl):
+            # exact per-tensor comparison with the shipped public tables; any doubt keeps the adapter route
+            from forge.routing import base_identity as _bid
+            _rep = _bid.identify(spec.cached_model_dir)
+            _base_identity = _rep.get("status")
+            telemetry.event("base_identity", **{k: _rep.get(k) for k in ("status", "candidate", "n_tensors", "altered",
+                                                                       "missing", "extra", "seconds", "reason")})
         field_route = (
             (not pinned_route or lfm_pin)
             and not falcon_legacy_route
             and sft_v2.field_full_route(params_b=params_b, n_gpus=n_gpus, is_kl=is_kl, model_type=_mt, n_rows=len(rows),
                                         total_tokens=_total_tokens,
-                                        vocab_size=int(getattr(getattr(loaded.model, "config", None), "vocab_size", 0) or 0) or None)
+                                        vocab_size=int(getattr(getattr(loaded.model, "config", None), "vocab_size", 0) or 0) or None,
+                                        base_identity=_base_identity)
         )
         telemetry.event("sft_v2_field_gate", total_tokens=_total_tokens, rows=len(rows), model_type=_mt, field_route=field_route)
         if lfm_pin and field_route and _total_tokens is None:
