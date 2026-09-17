@@ -56,7 +56,7 @@ def test_lfm2_field_gate_matches_the_replayed_win(monkeypatch):
 
 
 @pytest.mark.parametrize("model_type,env,expected", [
-    ("lfm2", None, True), ("llama", None, False), ("qwen2", None, False), ("gemma2", None, False),
+    ("lfm2", None, True), ("llama", None, False), ("qwen2", None, True), ("gemma2", None, False),  # qwen2: identical-base release default ON (2026-09-17)
     ("lfm2", "0", False), ("llama", "1", True), ("LFM2", None, True), (None, None, False),
 ])
 def test_field_bf16_default_is_family_scoped(monkeypatch, model_type, env, expected):

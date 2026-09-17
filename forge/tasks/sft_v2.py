@@ -133,8 +133,13 @@ FIELD_IDENTICAL_BASE_TYPES = frozenset({"qwen2"})
 FIELD_IDENTICAL_BASE_MAX_PARAMS_B = 1.0
 
 
+# Release default ON (2026-09-17): the validator runs this repo's image with its own environment, so the switch must
+# live in code. FORGE_V2_FIELD_IDENTICAL_BASE=0 disables it (research replays of the pre-D behaviour).
+FIELD_IDENTICAL_BASE_DEFAULT = "1"
+
+
 def _field_identical_base() -> bool:
-    return os.environ.get("FORGE_V2_FIELD_IDENTICAL_BASE", "0") == "1"
+    return os.environ.get("FORGE_V2_FIELD_IDENTICAL_BASE", FIELD_IDENTICAL_BASE_DEFAULT).strip() == "1"
 
 
 # Row-length scope of the identical-base admission. "long" (default): only tasks whose median row is above the v2 row gate

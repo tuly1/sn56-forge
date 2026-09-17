@@ -96,7 +96,10 @@ def test_field_gate_admits_qwen2_only_on_an_identical_base_and_only_when_enabled
     monkeypatch.setenv("FORGE_V2_FIELD", "1")
     for k in ("FORGE_V2_FIELD_TYPES", "FORGE_V2_FIELD_MIN_ROWS", "FORGE_V2_FIELD_MIN_TOKENS", "FORGE_V2_FIELD_IDENTICAL_BASE"):
         monkeypatch.delenv(k, raising=False)
-    # inert by default: the live behaviour (qwen2 keeps the adapter) is unchanged whatever the identity says
+    # release default ON: the validator runs our image with its own environment, so the switch lives in code;
+    # FORGE_V2_FIELD_IDENTICAL_BASE=0 restores the pre-D behaviour (qwen2 keeps the adapter whatever the identity says)
+    assert sft_v2._field_identical_base() is True
+    monkeypatch.setenv("FORGE_V2_FIELD_IDENTICAL_BASE", "0")
     assert _gate(base_identity="identical") is False
     assert _gate(base_identity=None) is False
     monkeypatch.setenv("FORGE_V2_FIELD_IDENTICAL_BASE", "1")
@@ -130,7 +133,8 @@ def test_field_gate_admits_qwen2_only_on_an_identical_base_and_only_when_enabled
 def test_qwen2_field_defaults_reproduce_the_validated_arms(monkeypatch):
     for k in ("FORGE_V2_FIELD_BF16", "FORGE_V2_FIELD_BF16_MIN_B", "FORGE_V2_FIELD_LR_MULT", "FORGE_V2_FIELD_IDENTICAL_BASE"):
         monkeypatch.delenv(k, raising=False)
-    # switch off: the deployed defaults are untouched for every family, qwen2 included
+    # switch off (=0): the pre-D defaults are untouched for every family, qwen2 included
+    monkeypatch.setenv("FORGE_V2_FIELD_IDENTICAL_BASE", "0")
     assert sft_v2._field_bf16_enabled("qwen2") is False and sft_v2._field_bf16_min_b("qwen2") == 2.0
     assert sft_v2._field_lr_mult("qwen2") == 1.0
     monkeypatch.setenv("FORGE_V2_FIELD_IDENTICAL_BASE", "1")
