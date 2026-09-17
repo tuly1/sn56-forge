@@ -157,7 +157,11 @@ def _field_identical_base() -> bool:
 # Row-length scope of the identical-base admission. "long" (default): only tasks whose median row is above the v2 row gate
 # (>= 256 tokens), where production otherwise runs the throughput-starved v2 full strategy (UltraChat-20k: field −5.2%,
 # 98% of rows). Short-row tasks keep the legacy adapter (Sept-14-shaped fixture: field +1.3% worse). "all" admits both.
-FIELD_IDENTICAL_BASE_ROWS_DEFAULT = "long"
+# 2026-09-17 owner decision: every tournament winner on Qwen submits full weights, and offline adapter wins have not
+# transferred live (Sept 14: 7/9 with an adapter on a short-row task). Short rows join on identical bases with the
+# best full-weight recipe measured under Sept-14-like step cost (field + packing: parity with the adapter, ahead of
+# the unpacked field route and the champion tree). FORGE_V2_FIELD_IDENTICAL_ROWS=long restores the long-row scope.
+FIELD_IDENTICAL_BASE_ROWS_DEFAULT = "all"
 
 
 def _field_identical_rows_policy() -> str:

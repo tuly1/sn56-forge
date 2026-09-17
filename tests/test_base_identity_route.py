@@ -152,16 +152,14 @@ def test_qwen2_field_defaults_reproduce_the_validated_arms(monkeypatch):
     assert sft_v2._field_bf16_enabled("qwen2") is False
 
 
-def test_identical_base_admission_is_long_rows_only_by_default(monkeypatch):
+def test_identical_base_admission_covers_all_row_lengths_by_default(monkeypatch):
+    """2026-09-17 owner decision: short-row Qwen tasks take full weights too (the field uses full fine-tunes)."""
     monkeypatch.delenv("FORGE_V2_FIELD_IDENTICAL_ROWS", raising=False)
-    # long-row tasks (median >= 256 tokens) are where production runs the v2 full strategy that lost 5.2% to the field route
-    assert sft_v2.identical_base_applies(True) is True
-    # short-row tasks keep the legacy adapter (field route +1.3% worse on the Sept-14-shaped fixture)
-    assert sft_v2.identical_base_applies(False) is False
-    monkeypatch.setenv("FORGE_V2_FIELD_IDENTICAL_ROWS", "all")
-    assert sft_v2.identical_base_applies(False) is True
+    assert sft_v2.identical_base_applies(True) is True and sft_v2.identical_base_applies(False) is True
+    monkeypatch.setenv("FORGE_V2_FIELD_IDENTICAL_ROWS", "long")
+    assert sft_v2.identical_base_applies(True) is True and sft_v2.identical_base_applies(False) is False
     monkeypatch.setenv("FORGE_V2_FIELD_IDENTICAL_ROWS", "bogus")
-    assert sft_v2._field_identical_rows_policy() == "long" and sft_v2.identical_base_applies(False) is False
+    assert sft_v2._field_identical_rows_policy() == "all" and sft_v2.identical_base_applies(False) is True
 
 
 def test_only_the_tested_checkpoint_is_admitted():
