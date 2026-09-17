@@ -162,3 +162,14 @@ def test_identical_base_admission_is_long_rows_only_by_default(monkeypatch):
     assert sft_v2.identical_base_applies(False) is True
     monkeypatch.setenv("FORGE_V2_FIELD_IDENTICAL_ROWS", "bogus")
     assert sft_v2._field_identical_rows_policy() == "long" and sft_v2.identical_base_applies(False) is False
+
+
+def test_only_the_tested_checkpoint_is_admitted():
+    # the 1.5B / 3B tables ship for telemetry, but only the checkpoint whose field win was measured may switch routes
+    assert sft_v2.FIELD_IDENTICAL_BASE_CANDIDATES == frozenset({"Qwen__Qwen2.5-0.5B-Instruct"})
+    for key in ("Qwen__Qwen2.5-1.5B-Instruct", "Qwen__Qwen2.5-3B-Instruct"):
+        assert (bid.TABLES_DIR / f"{key}.json").exists() and key not in sft_v2.FIELD_IDENTICAL_BASE_CANDIDATES
+    # the dispatcher maps an identical-but-untested candidate to a non-admitting status
+    src = (Path(__file__).resolve().parents[1] / "forge" / "tasks" / "instruct.py").read_text()
+    assert "identical_untested" in src and "FIELD_IDENTICAL_BASE_CANDIDATES" in src
+    assert _gate(base_identity="identical_untested") is False

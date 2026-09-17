@@ -826,6 +826,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             from forge.routing import base_identity as _bid
             _rep = _bid.identify(spec.cached_model_dir)
             _base_identity = _rep.get("status")
+            if _base_identity == "identical" and _rep.get("candidate") not in sft_v2.FIELD_IDENTICAL_BASE_CANDIDATES:
+                _base_identity = "identical_untested"  # a public base we never validated the field route on: keep the route
             telemetry.event("base_identity", **{k: _rep.get(k) for k in ("status", "candidate", "n_tensors", "altered",
                                                                        "missing", "extra", "seconds", "reason")})
         field_route = (

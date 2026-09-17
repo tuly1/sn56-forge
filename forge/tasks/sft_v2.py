@@ -131,6 +131,9 @@ FIELD_IDENTICAL_BASE_TYPES = frozenset({"qwen2"})
 # the identical-base admission is validated on Qwen2.5-0.5B only; at 3B full weights lost to the adapter on
 # ru-AAQG (−1.5%), so larger Qwen models keep the adapter (FORGE_V2_FIELD_IDENTICAL_MAX_PARAMS_B overrides)
 FIELD_IDENTICAL_BASE_MAX_PARAMS_B = 1.0
+# Only the exact public checkpoints whose field-route win was measured may be admitted (Pro review 2026-09-17 12:46):
+# an "identical" verdict against any other shipped table is telemetry only and keeps the current route.
+FIELD_IDENTICAL_BASE_CANDIDATES = frozenset({"Qwen__Qwen2.5-0.5B-Instruct"})
 
 
 # Release default ON (2026-09-17): the validator runs this repo's image with its own environment, so the switch must
