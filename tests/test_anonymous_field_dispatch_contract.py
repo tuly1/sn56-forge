@@ -136,7 +136,7 @@ def test_short_qwen_anonymous_contract_uses_legacy_adapter(monkeypatch, tmp_path
 
 
 def test_below_threshold_llama_does_not_silently_enter_field(monkeypatch, tmp_path):
-    args, seen, stats = prepare(monkeypatch, tmp_path, "llama", n_rows=14999)
+    args, seen, stats = prepare(monkeypatch, tmp_path, "llama", n_rows=9999)  # just below the llama row gate (10k since 2026-09-17)
     assert cli.main(args) == 0
     assert len(seen["routes"]) == 1
     assert (seen["routes"][0]["field"], seen["routes"][0]["strategy"]) == (False, "lora")

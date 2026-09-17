@@ -102,21 +102,30 @@ def field_full_types() -> frozenset[str]:
 FIELD_FULL_MIN_ROWS = 15000  # below this the adapter won (CodeFeedback 8k: adapter 0.822 vs full 0.843–0.893)
 
 
-def field_full_min_rows() -> int:
+# family-specific lower gates (2026-09-17): Llama-3.2-1B on GossipCop subsampled to 10k rows / 6.0M tokens — the exact
+# Sept 14 dataset below the generic gates — is validated in research/20260916-package (field vs the production v2 adapter);
+# CodeFeedback 8k rows / 3.9M tokens still says adapter, so the llama gates sit between the two.
+FIELD_FULL_MIN_ROWS_TYPES: dict[str, int] = {"llama": 10000}
+FIELD_FULL_MIN_TOKENS_TYPES: dict[str, int] = {"llama": 5_000_000}
+
+
+def field_full_min_rows(model_type: str | None = None) -> int:
+    default = FIELD_FULL_MIN_ROWS_TYPES.get(str(model_type or "").lower(), FIELD_FULL_MIN_ROWS)
     try:
-        return int(os.environ.get("FORGE_V2_FIELD_MIN_ROWS", str(FIELD_FULL_MIN_ROWS)))
+        return int(os.environ.get("FORGE_V2_FIELD_MIN_ROWS", str(default)))
     except ValueError:
-        return FIELD_FULL_MIN_ROWS
+        return default
 
 
 FIELD_FULL_MIN_TOKENS = 8_000_000  # GossipCop 11.8M tokens won; Alpaca-20k 1.2M and CodeFeedback 3.9M lost (2026-09-16)
 
 
-def field_full_min_tokens() -> int:
+def field_full_min_tokens(model_type: str | None = None) -> int:
+    default = FIELD_FULL_MIN_TOKENS_TYPES.get(str(model_type or "").lower(), FIELD_FULL_MIN_TOKENS)
     try:
-        return int(float(os.environ.get("FORGE_V2_FIELD_MIN_TOKENS", str(FIELD_FULL_MIN_TOKENS))))
+        return int(float(os.environ.get("FORGE_V2_FIELD_MIN_TOKENS", str(default))))
     except ValueError:
-        return FIELD_FULL_MIN_TOKENS
+        return default
 
 
 # validated vocabulary per family: Llama-3.x 128256 (TinyLlama 32000 / SmolLM2 49152 share model_type "llama" but are
@@ -197,9 +206,9 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
             return False
     if _mt is not None and not os.environ.get("FORGE_V2_FIELD_TYPES") and params_b < FIELD_FULL_MIN_PARAMS_B.get(_mt, 0.0):
         return False  # below the size where the family's validated configuration applies
-    if n_rows is not None and n_rows < field_full_min_rows():
+    if n_rows is not None and n_rows < field_full_min_rows(_mt):
         return False
-    if total_tokens is not None and total_tokens < field_full_min_tokens():
+    if total_tokens is not None and total_tokens < field_full_min_tokens(_mt):
         # data volume, not row count, separates the wins from the losses: full weights
         # overfit small token budgets within an epoch at every tested LR
         return False
