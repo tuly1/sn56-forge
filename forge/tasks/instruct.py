@@ -1661,6 +1661,46 @@ def _discard(value: Any, *, trainer: bool = False) -> None:
     _free_cuda()
 
 
+LEGACY_NEFTUNE_ALPHA = 5.0
+# NEFTune adds uniform noise of magnitude alpha/sqrt(L*d) to the input embeddings while training; HF's hook takes L from
+# the PADDED micro-batch. Measured 2026-09-18 (official evaluator; identical fixture bytes and image apart from the
+# switch; decision rule logged before the result): unsloth/tinyllama on qa-news-2016 (median 79 / p99 157 tokens) scored
+# 3.77165 with alpha 5 (held-out loss 3.6 at a quarter epoch while train loss fell) and 1.64690 with NEFTune off.
+# What is NOT known: why only this case collapsed. Noise/embedding-RMS is the same for TinyLlama (0.43) and
+# Qwen2.5-0.5B (0.45), and this path with alpha 5 was healthy on Qwen2.5-0.5B/indic (Sept 14), SmolLM2-360M/indic, and
+# placed 2nd live on LFM2.5/indic (Sept 7) - indic has a short median (199) but a long tail (p99 3.7k), qa-news is short
+# everywhere. One failure cannot separate "this model" from "uniformly short corpus". The gate below covers the measured
+# failure; LEGACY_NEFTUNE_GATE_PERCENTILE decides how far it reaches onto short-median/long-tail corpora and is PENDING
+# the exact-row adapter pair (NEFTune on vs off on the Sept 14 Qwen task). FORGE_LEGACY_NEFTUNE_ALPHA overrides for the
+# harness (<=0 disables, >0 forces). The BloomZ promotion and the timing probe are untouched.
+LEGACY_NEFTUNE_MIN_TOKENS = 256
+LEGACY_NEFTUNE_GATE_PERCENTILE = 0.5  # 0.5 = median gate; 0.95 would restrict the change to uniformly short corpora
+
+
+def legacy_neftune_alpha(train_ex: list, *, is_kl: bool) -> float | None:
+    """NEFTune alpha for the production adapter path: None on KL tasks and on short-row corpora, else 5.0."""
+    if is_kl:
+        return None
+    forced = os.environ.get("FORGE_LEGACY_NEFTUNE_ALPHA", "").strip()
+    if forced:
+        try:
+            value = float(forced)
+        except ValueError:
+            value = LEGACY_NEFTUNE_ALPHA
+        alpha = value if value > 0 else None
+        telemetry.event("legacy_neftune", alpha=alpha, median_tokens=None, reason="env")
+        print(f"[forge] legacy_neftune alpha={alpha} reason=env", flush=True)
+        return alpha
+    lengths = sorted(len(ex.get("input_ids") or ()) for ex in (train_ex or []))
+    gate_len = lengths[min(len(lengths) - 1, int(LEGACY_NEFTUNE_GATE_PERCENTILE * len(lengths)))] if lengths else None
+    short = gate_len is not None and gate_len < LEGACY_NEFTUNE_MIN_TOKENS
+    alpha = None if short else LEGACY_NEFTUNE_ALPHA
+    telemetry.event("legacy_neftune", alpha=alpha, gate_tokens=gate_len, percentile=LEGACY_NEFTUNE_GATE_PERCENTILE,
+                    reason="short_rows" if short else "default")
+    print(f"[forge] legacy_neftune alpha={alpha} gate_tokens={gate_len} percentile={LEGACY_NEFTUNE_GATE_PERCENTILE}", flush=True)
+    return alpha
+
+
 def _make_trainer(
     spec: TaskSpec, deadline: Deadline, plan: TrainPlan, model: Any,
     tokenizer: Any, train_ex: list, val_ex: list, collator: Any,
@@ -1672,7 +1712,7 @@ def _make_trainer(
     from datasets import Dataset
     from transformers import Trainer, TrainingArguments
 
-    kwargs = build_training_kwargs(spec, plan, neftune_alpha=None if is_kl else 5.0)
+    kwargs = build_training_kwargs(spec, plan, neftune_alpha=legacy_neftune_alpha(train_ex, is_kl=is_kl))
     if probe:
         kwargs["max_steps"] = 1
     elif epochs is not None:
