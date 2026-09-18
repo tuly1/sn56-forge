@@ -138,9 +138,10 @@ def test_qwen2_field_defaults_reproduce_the_validated_arms(monkeypatch):
     assert sft_v2._field_bf16_enabled("qwen2") is False and sft_v2._field_bf16_min_b("qwen2") == 2.0
     assert sft_v2._field_lr_mult("qwen2") == 1.0
     monkeypatch.setenv("FORGE_V2_FIELD_IDENTICAL_BASE", "1")
-    # every validated Qwen2.5-0.5B full-weight arm ran bf16 + paged 8-bit AdamW from 0.3 B at half the raw law
+    # Qwen2.5-0.5B field arms run bf16 + paged 8-bit AdamW from 0.3 B
     assert sft_v2._field_bf16_enabled("qwen2") is True and sft_v2._field_bf16_min_b("qwen2") == 0.3
-    assert sft_v2._field_lr_mult("qwen2") == 0.5
+    # 1.0 since 2026-09-18: exact Sept 14 replay, matched seeds (see FIELD_LR_MULT_TYPES); was 0.5
+    assert sft_v2._field_lr_mult("qwen2") == 1.0
     # other families keep their deployed defaults
     assert sft_v2._field_bf16_enabled("llama") is False and sft_v2._field_bf16_min_b("llama") == 2.0
     assert sft_v2._field_lr_mult("llama") == 1.0 and sft_v2._field_bf16_min_b() == 2.0

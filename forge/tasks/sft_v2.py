@@ -255,7 +255,12 @@ def _field_bf16_enabled(model_type: str | None) -> bool:
     return str(model_type or "").lower() in FIELD_BF16_DEFAULT_TYPES or _identical_base_family_defaults(model_type)
 
 
-FIELD_LR_MULT_TYPES: dict[str, float] = {"qwen2": 0.5}  # the validated Qwen2.5 full-weight arms ran the half-raw law
+# qwen2 (Qwen2.5-0.5B): 0.5 until 2026-09-18, chosen on a chat-style stand-in fixture (x1.0 lost 2.2% there, one seed each).
+# On the EXACT Sept 14 live task (validator train + test rows, official evaluator, matched seeds 7/11) the raw law wins:
+# x0.5 1.29943/1.30013 (mean 1.29978) vs x1.0 1.28701/1.29211 (mean 1.28956), -0.0102 nats, same order on both seeds,
+# against a rule fixed before the second seed (>= 0.005). Same bf16 path and 16-minute schedule, so no window risk.
+# Limits: one task, first selected on those rows. research/20260918-exact-replays, SCIENCE-LEDGER 2026-09-18 15:25 UTC.
+FIELD_LR_MULT_TYPES: dict[str, float] = {"qwen2": 1.0}
 
 
 def _field_lr_mult(model_type: str | None = None) -> float:
