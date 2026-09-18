@@ -1669,12 +1669,15 @@ LEGACY_NEFTUNE_ALPHA = 5.0
 # What is NOT known: why only this case collapsed. Noise/embedding-RMS is the same for TinyLlama (0.43) and
 # Qwen2.5-0.5B (0.45), and this path with alpha 5 was healthy on Qwen2.5-0.5B/indic (Sept 14), SmolLM2-360M/indic, and
 # placed 2nd live on LFM2.5/indic (Sept 7) - indic has a short median (199) but a long tail (p99 3.7k), qa-news is short
-# everywhere. One failure cannot separate "this model" from "uniformly short corpus". The gate below covers the measured
-# failure; LEGACY_NEFTUNE_GATE_PERCENTILE decides how far it reaches onto short-median/long-tail corpora and is PENDING
-# the exact-row adapter pair (NEFTune on vs off on the Sept 14 Qwen task). FORGE_LEGACY_NEFTUNE_ALPHA overrides for the
-# harness (<=0 disables, >0 forces). The BloomZ promotion and the timing probe are untouched.
+# everywhere. One failure cannot separate "this model" from "uniformly short corpus".
+# Reach of the gate, decided by a rule logged before the result: the same legacy arm on the EXACT Sept 14 Qwen task
+# (indic: short median, long tail), full H100 speed, NEFTune on 1.28374 vs off 1.27869 -> off - on = -0.00506 nats,
+# ci99 [-0.0124, +0.0028], off better on 59% of rows: better-or-neutral, never worse -> the MEDIAN gate (0.5).
+# Long-row work on this path (pinned routes) keeps alpha 5: its cost there is unmeasured and it has won live.
+# FORGE_LEGACY_NEFTUNE_ALPHA overrides for the harness (<=0 disables, >0 forces). The BloomZ promotion and the timing
+# probe are untouched.
 LEGACY_NEFTUNE_MIN_TOKENS = 256
-LEGACY_NEFTUNE_GATE_PERCENTILE = 0.5  # 0.5 = median gate; 0.95 would restrict the change to uniformly short corpora
+LEGACY_NEFTUNE_GATE_PERCENTILE = 0.5  # median gate (see above); 0.95 would restrict the change to uniformly short corpora
 
 
 def legacy_neftune_alpha(train_ex: list, *, is_kl: bool) -> float | None:
