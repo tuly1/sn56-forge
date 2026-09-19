@@ -74,14 +74,18 @@ def test_identical_altered_and_unknown_bases(tmp_path):
 
 
 def test_shipped_qwen_tables_are_complete_and_keyed_by_public_configs():
-    keys = {"Qwen__Qwen2.5-0.5B-Instruct": 290, "Qwen__Qwen2.5-1.5B-Instruct": 338, "Qwen__Qwen2.5-3B-Instruct": 434}
+    keys = {"Qwen__Qwen2.5-0.5B-Instruct": 290, "Qwen__Qwen2.5-1.5B-Instruct": 338, "Qwen__Qwen2.5-3B-Instruct": 434,
+            "Qwen__Qwen2-1.5B-Instruct": 338}
+    # Qwen2-1.5B and Qwen2.5-1.5B share every shortlist key (same shape), so both tables are candidates for either
+    # model; identify() tries each and admits only a full byte match (see the same-shape test below)
+    same_shape = ["Qwen__Qwen2-1.5B-Instruct", "Qwen__Qwen2.5-1.5B-Instruct"]
     for key, n in keys.items():
         table = json.load(open(bid.TABLES_DIR / f"{key}.json"))
         assert table["n_tensors"] == n == len(table["tensors"])
         assert all(len(v["sha256"]) == 64 for v in table["tensors"].values())
         cfg = json.load(open(bid.TABLES_DIR / f"{key}.config.json"))
         assert cfg["model_type"] == "qwen2" and cfg["vocab_size"] == 151936
-        assert bid.candidate_keys(cfg) == [key]
+        assert bid.candidate_keys(cfg) == (same_shape if key in same_shape else [key])
     assert bid.candidate_keys(dict(Q05_CONFIG, model_type="llama")) == []
 
 
@@ -164,11 +168,50 @@ def test_identical_base_admission_covers_all_row_lengths_by_default(monkeypatch)
 
 
 def test_only_the_tested_checkpoint_is_admitted():
-    # the 1.5B / 3B tables ship for telemetry, but only the checkpoint whose field win was measured may switch routes
-    assert sft_v2.FIELD_IDENTICAL_BASE_CANDIDATES == frozenset({"Qwen__Qwen2.5-0.5B-Instruct"})
+    # the Qwen2.5-1.5B / 3B tables ship for telemetry, but only checkpoints whose field win was measured may switch
+    # routes: Qwen2.5-0.5B-Instruct (Sept 14 exact task) and Qwen2-1.5B-Instruct (grammar, clinical notes; 2026-09-19)
+    assert sft_v2.FIELD_IDENTICAL_BASE_CANDIDATES == frozenset({"Qwen__Qwen2.5-0.5B-Instruct", "Qwen__Qwen2-1.5B-Instruct"})
     for key in ("Qwen__Qwen2.5-1.5B-Instruct", "Qwen__Qwen2.5-3B-Instruct"):
         assert (bid.TABLES_DIR / f"{key}.json").exists() and key not in sft_v2.FIELD_IDENTICAL_BASE_CANDIDATES
     # the dispatcher maps an identical-but-untested candidate to a non-admitting status
     src = (Path(__file__).resolve().parents[1] / "forge" / "tasks" / "instruct.py").read_text()
     assert "identical_untested" in src and "FIELD_IDENTICAL_BASE_CANDIDATES" in src
     assert _gate(base_identity="identical_untested") is False
+
+
+def test_identity_picks_the_matching_table_among_same_shape_checkpoints(tmp_path):
+    # Qwen2-1.5B and Qwen2.5-1.5B have identical shapes; a clean Qwen2-1.5B must not read "altered" against the 2.5 table
+    cfg = dict(Q05_CONFIG)
+    q2 = _model_dir(tmp_path, "q2", cfg, {"w": _f32(1, 2, 3, 4)})
+    q25 = _model_dir(tmp_path, "q25", cfg, {"w": _f32(5, 6, 7, 8)})
+    tables = _tables(tmp_path, "Qwen__Qwen2-1.5B-Instruct", q2, cfg)
+    _tables(tmp_path, "Qwen__Qwen2.5-1.5B-Instruct", q25, cfg)
+    for model, key in ((q2, "Qwen__Qwen2-1.5B-Instruct"), (q25, "Qwen__Qwen2.5-1.5B-Instruct")):
+        rep = bid.identify(model, tables_dir=tables)
+        assert rep["status"] == "identical" and rep["candidate"] == key
+    damaged = _model_dir(tmp_path, "damaged", cfg, {"w": _f32(1, 2, 3, 5)})
+    assert bid.identify(damaged, tables_dir=tables)["status"] == "altered"
+
+
+def test_qwen2_15b_instruct_admitted_on_an_identical_base_above_the_token_floor(monkeypatch):
+    monkeypatch.setenv("FORGE_V2_FIELD", "1")
+    for k in ("FORGE_V2_FIELD_TYPES", "FORGE_V2_FIELD_MIN_ROWS", "FORGE_V2_FIELD_MIN_TOKENS",
+              "FORGE_V2_FIELD_IDENTICAL_BASE", "FORGE_V2_FIELD_IDENTICAL_MAX_PARAMS_B"):
+        monkeypatch.delenv(k, raising=False)
+    q2 = dict(params_b=1.544, base_identity="identical", base_candidate="Qwen__Qwen2-1.5B-Instruct")
+    # measured wins: clinical notes 58M tokens (-2.5% full speed, -1.4% at validator speed), grammar 21M (-1.3%, 2 seeds)
+    assert _gate(**q2, n_rows=29000, total_tokens=58_280_508) is True
+    assert _gate(**q2, n_rows=70052, total_tokens=21_339_784) is True
+    # ru-AAQG volume (9.7M tokens): the adapter won at 1.5B and 3B -> below the floor the route stays
+    assert _gate(**q2, n_rows=29000, total_tokens=9_707_580) is False
+    assert _gate(**q2, total_tokens=None) is False  # unknown volume keeps the route
+    assert _gate(**q2, n_rows=8000, total_tokens=58_000_000) is False  # family row gate still applies
+    assert _gate(**dict(q2, params_b=3.09), total_tokens=58_000_000) is False  # per-checkpoint size cap (2.0 B)
+    # a damaged Qwen2-1.5B keeps the adapter; an identical Qwen2.5-1.5B has no measured win at any volume
+    assert _gate(**dict(q2, base_identity="altered"), total_tokens=58_000_000) is False
+    assert _gate(**dict(q2, base_candidate="Qwen__Qwen2.5-1.5B-Instruct"), total_tokens=58_000_000) is False
+    # the 0.5B admission is unchanged: no floor beyond the family gates
+    assert _gate(base_identity="identical", base_candidate="Qwen__Qwen2.5-0.5B-Instruct") is True
+    # research override of the floor, like the family gates
+    monkeypatch.setenv("FORGE_V2_FIELD_MIN_TOKENS", "0")
+    assert _gate(**q2, n_rows=29000, total_tokens=9_707_580) is True

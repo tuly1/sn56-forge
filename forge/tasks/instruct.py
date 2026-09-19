@@ -816,6 +816,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         if _total_tokens is None and median_len:
             _total_tokens = int(median_len) * len(rows)
         _base_identity = None
+        _base_candidate = None
         if (_mt in sft_v2.FIELD_IDENTICAL_BASE_TYPES and sft_v2._field_identical_base()
                 and not pinned_route and not falcon_legacy_route and n_gpus == 1 and not is_kl
                 and not sft_v2.identical_base_applies(is_long)):
@@ -826,6 +827,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             from forge.routing import base_identity as _bid
             _rep = _bid.identify(spec.cached_model_dir)
             _base_identity = _rep.get("status")
+            _base_candidate = _rep.get("candidate")
             if _base_identity == "identical" and _rep.get("candidate") not in sft_v2.FIELD_IDENTICAL_BASE_CANDIDATES:
                 _base_identity = "identical_untested"  # a public base we never validated the field route on: keep the route
             telemetry.event("base_identity", **{k: _rep.get(k) for k in ("status", "candidate", "n_tensors", "altered",
@@ -836,7 +838,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             and sft_v2.field_full_route(params_b=params_b, n_gpus=n_gpus, is_kl=is_kl, model_type=_mt, n_rows=len(rows),
                                         total_tokens=_total_tokens,
                                         vocab_size=int(getattr(getattr(loaded.model, "config", None), "vocab_size", 0) or 0) or None,
-                                        base_identity=_base_identity)
+                                        base_identity=_base_identity, base_candidate=_base_candidate)
         )
         telemetry.event("sft_v2_field_gate", total_tokens=_total_tokens, rows=len(rows), model_type=_mt, field_route=field_route)
         if lfm_pin and field_route and _total_tokens is None:

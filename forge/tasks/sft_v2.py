@@ -137,12 +137,21 @@ FIELD_FULL_VOCABS: dict[str, frozenset[int]] = {"llama": frozenset({128256}), "l
 # (Alpaca-20k), −1.65% (ru-AAQG-29k) and +0.16% (long-tail-29k) against the production adapter, but on every
 # validator-damaged base (scaling / noise / re-init) the adapter won by 1.3–2.9%. Off unless FORGE_V2_FIELD_IDENTICAL_BASE=1.
 FIELD_IDENTICAL_BASE_TYPES = frozenset({"qwen2"})
-# the identical-base admission is validated on Qwen2.5-0.5B only; at 3B full weights lost to the adapter on
-# ru-AAQG (−1.5%), so larger Qwen models keep the adapter (FORGE_V2_FIELD_IDENTICAL_MAX_PARAMS_B overrides)
-FIELD_IDENTICAL_BASE_MAX_PARAMS_B = 1.0
-# Only the exact public checkpoints whose field-route win was measured may be admitted (Pro review 2026-09-17 12:46):
-# an "identical" verdict against any other shipped table is telemetry only and keeps the current route.
-FIELD_IDENTICAL_BASE_CANDIDATES = frozenset({"Qwen__Qwen2.5-0.5B-Instruct"})
+# Identical-base admission, per exact public checkpoint (an "identical" verdict against any other shipped table is
+# telemetry only and keeps the current route - Pro review 2026-09-17 12:46). Each entry carries its own size cap and
+# data-volume floor, set by where the field route was measured to win:
+#  * Qwen2.5-0.5B-Instruct: family gates (>=15k rows, >=8M tokens). Exact Sept 14 task, matched seeds.
+#  * Qwen2-1.5B-Instruct (2026-09-19): field wins on grammar 21M tokens (-1.3%, two seeds) and clinical notes 58M tokens
+#    (-2.5% at full speed; -1.4% with the GPU clocked to validator speed, per-row ci99 excludes 0, rule fixed beforehand).
+#    Below that the adapter wins (Qwen2.5-1.5B/3B-Instruct on ru-AAQG 9.7M tokens: +0.8...+1.5%) -> floor 20M tokens.
+#    3B has no positive evidence and stays on the adapter. Damaged bases keep the adapter: the 1.5B damaged-base pairs
+#    ran fp32 x0.5, not the bf16 x1.0 that ships, and at 0.5B bf16 full weights lost 3% on a scaled base.
+FIELD_IDENTICAL_BASE_MAX_PARAMS_B = 1.0  # default cap for an admitted candidate without its own rule
+FIELD_IDENTICAL_BASE_RULES: dict[str, dict[str, float | int | None]] = {
+    "Qwen__Qwen2.5-0.5B-Instruct": {"max_params_b": 1.0, "min_tokens": None},
+    "Qwen__Qwen2-1.5B-Instruct": {"max_params_b": 2.0, "min_tokens": 20_000_000},
+}
+FIELD_IDENTICAL_BASE_CANDIDATES = frozenset(FIELD_IDENTICAL_BASE_RULES)
 
 
 # Release default ON (2026-09-17): the validator runs this repo's image with its own environment, so the switch must
@@ -187,7 +196,7 @@ FIELD_FULL_MIN_PARAMS_B: dict[str, float] = {"lfm2": 2.0}
 
 def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: str | None = None,
                      n_rows: int | None = None, total_tokens: int | None = None, vocab_size: int | None = None,
-                     base_identity: str | None = None) -> bool:
+                     base_identity: str | None = None, base_candidate: str | None = None) -> bool:
     """Full weights at the field geometry for single-GPU, non-KL instruct tasks up to
     FIELD_FULL_MAX_PARAMS_B (FORGE_V2_FIELD_MAX_PARAMS_B overrides) on an allow-listed
     model family (field_full_types) with at least field_full_min_rows() rows: full weights
@@ -200,9 +209,17 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
     _mt = str(model_type).lower() if model_type is not None else None
     if _mt is not None and _mt not in field_full_types():
         # a family outside the allow-list is admitted only on a byte-identical public base (see FIELD_IDENTICAL_BASE_TYPES)
-        if not (_mt in FIELD_IDENTICAL_BASE_TYPES and base_identity == "identical" and _field_identical_base()
-                and params_b <= _field_identical_base_max_b()):
+        if not (_mt in FIELD_IDENTICAL_BASE_TYPES and base_identity == "identical" and _field_identical_base()):
             return False
+        _rule = FIELD_IDENTICAL_BASE_RULES.get(base_candidate or "", {})
+        # FORGE_V2_FIELD_IDENTICAL_MAX_PARAMS_B (research) overrides every per-candidate cap
+        _cap = (_field_identical_base_max_b() if os.environ.get("FORGE_V2_FIELD_IDENTICAL_MAX_PARAMS_B")
+                else float(_rule.get("max_params_b") or FIELD_IDENTICAL_BASE_MAX_PARAMS_B))
+        if params_b > _cap:
+            return False
+        _floor = _rule.get("min_tokens")
+        if _floor and not os.environ.get("FORGE_V2_FIELD_MIN_TOKENS") and (total_tokens is None or total_tokens < int(_floor)):
+            return False  # this checkpoint's win was measured on large corpora only; unknown volume keeps the route
     if vocab_size is not None and not os.environ.get("FORGE_V2_FIELD_TYPES"):
         # family-specific: the validated wins are Meta Llama-3.2 (128256) and LFM2.5 (128000); an unknown family
         # or a mismatched vocabulary keeps its route
