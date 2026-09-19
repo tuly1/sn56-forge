@@ -146,10 +146,15 @@ FIELD_IDENTICAL_BASE_TYPES = frozenset({"qwen2"})
 #    Below that the adapter wins (Qwen2.5-1.5B/3B-Instruct on ru-AAQG 9.7M tokens: +0.8...+1.5%) -> floor 20M tokens.
 #    3B has no positive evidence and stays on the adapter. Damaged bases keep the adapter: the 1.5B damaged-base pairs
 #    ran fp32 x0.5, not the bf16 x1.0 that ships, and at 0.5B bf16 full weights lost 3% on a scaled base.
+#  * Qwen2.5-Math-1.5B-Instruct (2026-09-19): WritingPrompts (Aug 17 pool task) 65k rows / 59M tokens, 2.75 h: field
+#    bf16 x1.0 packed 3.19983 vs the live v2 adapter 3.56264 (-10.2%, 99.9% of rows; one seed, full speed). The field
+#    arm lands inside the live board (5th 3.157 / 6th 3.204) while the adapter sits above the whole visible top 7.
+#    Same rule as Qwen2-1.5B. Qwen2.5-1.5B-Instruct (non-Math) has no measured win at any volume and stays out.
 FIELD_IDENTICAL_BASE_MAX_PARAMS_B = 1.0  # default cap for an admitted candidate without its own rule
 FIELD_IDENTICAL_BASE_RULES: dict[str, dict[str, float | int | None]] = {
     "Qwen__Qwen2.5-0.5B-Instruct": {"max_params_b": 1.0, "min_tokens": None},
     "Qwen__Qwen2-1.5B-Instruct": {"max_params_b": 2.0, "min_tokens": 20_000_000},
+    "Qwen__Qwen2.5-Math-1.5B-Instruct": {"max_params_b": 2.0, "min_tokens": 20_000_000},
 }
 FIELD_IDENTICAL_BASE_CANDIDATES = frozenset(FIELD_IDENTICAL_BASE_RULES)
 

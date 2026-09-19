@@ -75,10 +75,10 @@ def test_identical_altered_and_unknown_bases(tmp_path):
 
 def test_shipped_qwen_tables_are_complete_and_keyed_by_public_configs():
     keys = {"Qwen__Qwen2.5-0.5B-Instruct": 290, "Qwen__Qwen2.5-1.5B-Instruct": 338, "Qwen__Qwen2.5-3B-Instruct": 434,
-            "Qwen__Qwen2-1.5B-Instruct": 338}
+            "Qwen__Qwen2-1.5B-Instruct": 338, "Qwen__Qwen2.5-Math-1.5B-Instruct": 338}
     # Qwen2-1.5B and Qwen2.5-1.5B share every shortlist key (same shape), so both tables are candidates for either
     # model; identify() tries each and admits only a full byte match (see the same-shape test below)
-    same_shape = ["Qwen__Qwen2-1.5B-Instruct", "Qwen__Qwen2.5-1.5B-Instruct"]
+    same_shape = ["Qwen__Qwen2-1.5B-Instruct", "Qwen__Qwen2.5-1.5B-Instruct", "Qwen__Qwen2.5-Math-1.5B-Instruct"]
     for key, n in keys.items():
         table = json.load(open(bid.TABLES_DIR / f"{key}.json"))
         assert table["n_tensors"] == n == len(table["tensors"])
@@ -170,7 +170,8 @@ def test_identical_base_admission_covers_all_row_lengths_by_default(monkeypatch)
 def test_only_the_tested_checkpoint_is_admitted():
     # the Qwen2.5-1.5B / 3B tables ship for telemetry, but only checkpoints whose field win was measured may switch
     # routes: Qwen2.5-0.5B-Instruct (Sept 14 exact task) and Qwen2-1.5B-Instruct (grammar, clinical notes; 2026-09-19)
-    assert sft_v2.FIELD_IDENTICAL_BASE_CANDIDATES == frozenset({"Qwen__Qwen2.5-0.5B-Instruct", "Qwen__Qwen2-1.5B-Instruct"})
+    assert sft_v2.FIELD_IDENTICAL_BASE_CANDIDATES == frozenset({"Qwen__Qwen2.5-0.5B-Instruct", "Qwen__Qwen2-1.5B-Instruct",
+                                                             "Qwen__Qwen2.5-Math-1.5B-Instruct"})
     for key in ("Qwen__Qwen2.5-1.5B-Instruct", "Qwen__Qwen2.5-3B-Instruct"):
         assert (bid.TABLES_DIR / f"{key}.json").exists() and key not in sft_v2.FIELD_IDENTICAL_BASE_CANDIDATES
     # the dispatcher maps an identical-but-untested candidate to a non-admitting status
@@ -210,6 +211,11 @@ def test_qwen2_15b_instruct_admitted_on_an_identical_base_above_the_token_floor(
     # a damaged Qwen2-1.5B keeps the adapter; an identical Qwen2.5-1.5B has no measured win at any volume
     assert _gate(**dict(q2, base_identity="altered"), total_tokens=58_000_000) is False
     assert _gate(**dict(q2, base_candidate="Qwen__Qwen2.5-1.5B-Instruct"), total_tokens=58_000_000) is False
+    # Qwen2.5-Math-1.5B-Instruct: same rule (WritingPrompts 59M tokens: field -10.2% vs the live v2 adapter)
+    qm = dict(q2, base_candidate="Qwen__Qwen2.5-Math-1.5B-Instruct")
+    assert _gate(**qm, n_rows=65332, total_tokens=59_003_478) is True
+    assert _gate(**qm, n_rows=29000, total_tokens=9_707_580) is False
+    assert _gate(**dict(qm, base_identity="altered"), total_tokens=59_003_478) is False
     # the 0.5B admission is unchanged: no floor beyond the family gates
     assert _gate(base_identity="identical", base_candidate="Qwen__Qwen2.5-0.5B-Instruct") is True
     # research override of the floor, like the family gates
