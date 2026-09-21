@@ -57,6 +57,13 @@ the output path continuously so a kill always leaves a scoreable model.
 
 ## Testing
 
+Clean Gemma-2-2B native LoRA training uses effective batch 10 when its tensor and
+config identity matches the bundled public reference and the native geometry is
+5×4 or 10×2. The recipe halves accumulation, scales the learning rate with batch,
+and adjusts Adam's second-moment decay. Unknown or altered bases and other routes
+retain their existing behavior. Set `FORGE_V2_GEMMA_ADAPTER_SMALL_BATCH=0` to disable
+this change; production can also repin the previous source commit.
+
 - `pytest` — ML-free unit tests over parsing, prompt assembly, loading, reward
   materialisation, and pacing math.
 - `ops/docker/standalone-text-trainer.cpu.dockerfile` — a CPU image that runs the

@@ -1,0 +1,15 @@
+{
+  "config_sha256": "e7fd1f5621e3956cc2795c3e69d775da31b04a5aae436fa892ab2fe75285aa11",
+  "identity_helper": "/root/research/gemma-clean-identity-20260920/code-v1/base_identity.py",
+  "identity_helper_sha256": "012de809ea09ff4bfa656d1253deda23f05636b946b6a51b57fdebaf2b1c93ea",
+  "n_tensors": 288,
+  "public_key": "unsloth__gemma-2-2b",
+  "public_model_dir": "/root/custody/gemma-overnight-20260920/shared-base",
+  "safetensors_files": [
+    "model.safetensors"
+  ],
+  "schema": 1,
+  "source_reference": "unsloth/gemma-2-2b@25319945f7fd83b8b903e12081777b7eef2ba993;weight-sha256:40f7727761523db40b475358377c9a9b0f0d8fcf7ef8b869e71ae4f0ef12a555",
+  "status": "TABLE_BUILT_FROM_OWNER_PUBLIC_BASE",
+  "table_sha256": "637879bc4e4a97913194dbb97ffd0e48afa7afd57b94cbebaa2c36985606512e"
+}

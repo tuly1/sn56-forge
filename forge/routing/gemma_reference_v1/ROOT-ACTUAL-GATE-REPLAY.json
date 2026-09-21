@@ -1,0 +1,112 @@
+{
+  "status": "ROOT_ACTUAL_PUBLIC_BASE_GATE_REPLAY_PASS",
+  "utc": "2026-09-20T19:53:29.899768+00:00",
+  "positive": {
+    "action": "qualified_gemma2_native_lora",
+    "status": "identical",
+    "reason": "exact_public_tensor_identity",
+    "identity": {
+      "status": "identical",
+      "candidate": "unsloth__gemma-2-2b",
+      "n_tensors": 288,
+      "altered": 0,
+      "missing": 0,
+      "extra": 0,
+      "seconds": 4.04,
+      "reason": null,
+      "altered_names": []
+    },
+    "public_key": "unsloth__gemma-2-2b"
+  },
+  "tampered_anchor": {
+    "action": "incumbent",
+    "status": "skipped",
+    "reason": "reference_anchor_mismatch:table_sha256"
+  },
+  "disabled": {
+    "action": "incumbent",
+    "status": "disabled",
+    "reason": "opt_in_required"
+  },
+  "gate_wall_seconds": 8.057577080093324,
+  "gate_sha256": "ae987874281a8f723437f5168153503467d374a8948f329850f1a691b8472e64",
+  "helper_sha256": "012de809ea09ff4bfa656d1253deda23f05636b946b6a51b57fdebaf2b1c93ea",
+  "anchor": {
+    "public_key": "unsloth__gemma-2-2b",
+    "source_reference": "unsloth/gemma-2-2b@25319945f7fd83b8b903e12081777b7eef2ba993;weight-sha256:40f7727761523db40b475358377c9a9b0f0d8fcf7ef8b869e71ae4f0ef12a555",
+    "identity_helper_sha256": "012de809ea09ff4bfa656d1253deda23f05636b946b6a51b57fdebaf2b1c93ea",
+    "table_sha256": "637879bc4e4a97913194dbb97ffd0e48afa7afd57b94cbebaa2c36985606512e",
+    "config_sha256": "e7fd1f5621e3956cc2795c3e69d775da31b04a5aae436fa892ab2fe75285aa11",
+    "root_proof_sha256": "22e94177817a29b51712a3b6eb18959b13d6f298d45d2193bc1d6b14eb8a1aab",
+    "build_receipt_sha256": "d4bb2b57d25c94146251400e25e5eb109c7760c35edd0c42943b26d4b349b2b0"
+  },
+  "route_metadata_note": "Synthetic eligible route metadata; no CUDA or training executed. Actual public model bytes hashed.",
+  "miner_before": "MainPID=2632924\nNRestarts=0\nActiveState=active\n",
+  "miner_after": "MainPID=2632924\nNRestarts=0\nActiveState=active\n",
+  "free_bytes": 10335764480,
+  "production_changed": false,
+  "base_receipt": {
+    "status": "ROOT_SHARED_BASE_VERIFIED",
+    "utc": "2026-09-20T19:53:29.899768+00:00",
+    "files": [
+      {
+        "path": ".gitattributes",
+        "bytes": 1570,
+        "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930",
+        "mode": "0644"
+      },
+      {
+        "path": "README.md",
+        "bytes": 3584,
+        "sha256": "81d98ca1e99533f50aff5e406c9a0ca97c5eb886af7da5cca2038f2e63ed2a12",
+        "mode": "0644"
+      },
+      {
+        "path": "config.json",
+        "bytes": 891,
+        "sha256": "e7fd1f5621e3956cc2795c3e69d775da31b04a5aae436fa892ab2fe75285aa11",
+        "mode": "0644"
+      },
+      {
+        "path": "generation_config.json",
+        "bytes": 190,
+        "sha256": "4ebdb5448f194666939265b988d4e8f6437d970dcb271e6f3133ccb70df22798",
+        "mode": "0644"
+      },
+      {
+        "path": "model.safetensors",
+        "bytes": 5228717512,
+        "sha256": "40f7727761523db40b475358377c9a9b0f0d8fcf7ef8b869e71ae4f0ef12a555",
+        "mode": "0644"
+      },
+      {
+        "path": "special_tokens_map.json",
+        "bytes": 636,
+        "sha256": "baec30ea10906f16adb8c18af7a34023002c1746542612b8b41c9f09e1351351",
+        "mode": "0644"
+      },
+      {
+        "path": "tokenizer.json",
+        "bytes": 17525357,
+        "sha256": "3f289bc05132635a8bc7aca7aa21255efd5e18f3710f43e3cdb96bcd41be4922",
+        "mode": "0644"
+      },
+      {
+        "path": "tokenizer.model",
+        "bytes": 4241003,
+        "sha256": "61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2",
+        "mode": "0644"
+      },
+      {
+        "path": "tokenizer_config.json",
+        "bytes": 46405,
+        "sha256": "380c8e594ecb8ca2b219d7ef355d6f424343eb1c5bd391251b558dbf67837c69",
+        "mode": "0644"
+      }
+    ],
+    "manifest_sha256": "6c4c12cdae674e09dd9dfac3c8ba229b9375d60b83eb855b47794c5398dfa954",
+    "free_bytes": 10335764480,
+    "miner": "MainPID=2632924\nNRestarts=0\nActiveState=active\n",
+    "verification": "fresh streamed SHA256 for all nine files"
+  }
+}

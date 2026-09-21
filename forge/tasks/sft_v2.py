@@ -775,6 +775,17 @@ def run(
     # the field geometry applies only when the dispatcher chose the field route (family, rows,
     # size gates); the legacy v2 full path (tiny models by size) keeps its previous behaviour
     field = field_route and strategy == "full" and not sharded
+    model_type = str(getattr(getattr(model, "config", None), "model_type", "") or "").lower()
+    # This experiment is valid only for Gemma2, non-KL, non-FIELD, single-GPU execution.
+    _small_batch_requested = os.environ.get("FORGE_V2_GEMMA_ADAPTER_SMALL_BATCH", "1") != "0"
+    # The deployment integration sets this only after the reviewed identity
+    # gate and default-geometry check below. Unknown or altered bases keep the
+    # incumbent geometry instead of turning an opt-in flag into task failure.
+    gemma_adapter_small_batch = False
+    if _small_batch_requested and strategy == "lora" and model_type == "gemma2":
+        _event_and_print("sft_v2_small_batch_route", strategy=strategy, model_type=model_type,
+                         field=bool(field), sharded=bool(sharded), cuda_available=bool(torch.cuda.is_available()),
+                         cuda_devices=int(torch.cuda.device_count()), use_kl=bool(getattr(spec, "use_kl", False)))
     # ---- field hygiene (FORGE_V2_FIELD_HYGIENE=1, field route only): near-duplicate groups (removed when the
     # validator reports a duplicated corpus), group-aware dev split, prompt-loss weight; see forge.data.hygiene ----
     field_hygiene = field and hygiene.enabled()
@@ -850,6 +861,28 @@ def run(
         _eff_default = pack.eff_blocks(_eff_default)
     geo = choose_geometry(params_b=params_b, max_len=unit_len, vocab=vocab, per_gpu_gb=per_gpu_gb, bnb_ok=_bnb_available(),
                           layers=layers, hidden=hidden, liger=use_liger, eff_default=_eff_default)
+    if _small_batch_requested and strategy == "lora" and model_type == "gemma2":
+        try:
+            from forge.routing.gemma_small_batch_admission import qualify as _qualify_small_batch
+
+            _device = str(next(model.parameters()).device)
+            _admission = _qualify_small_batch(
+                model_dir=spec.cached_model_dir, model_type=model_type, strategy=strategy,
+                field=field, is_kl=bool(getattr(spec, "use_kl", False)),
+                cuda_available=bool(torch.cuda.is_available()), device=_device,
+                n_gpus=int(torch.cuda.device_count()), sharded=sharded,
+                micro_batch=geo.micro_batch, grad_accum=geo.grad_accum,
+                effective_batch=geo.eff_batch,
+            )
+            if not isinstance(_admission, dict):
+                raise TypeError("invalid small-batch admission result")
+        except Exception as _gate_error:
+            _admission = {"action": "incumbent", "status": "error",
+                          "reason": f"admission_exception:{type(_gate_error).__name__}"}
+        _event_and_print("sft_v2_small_batch_gate", action=_admission.get("action"),
+                         status=_admission.get("status"), reason=_admission.get("reason"),
+                         gate_reason=_admission.get("gate", {}).get("reason") if isinstance(_admission.get("gate"), dict) else None)
+        gemma_adapter_small_batch = _admission.get("action") == "enable_gemma_small_batch"
     if field and geo.fp32_master and _field_bf16_enabled(str(getattr(getattr(model, "config", None), "model_type", "") or "")) and params_b >= _field_bf16_min_b(str(getattr(getattr(model, "config", None), "model_type", "") or "")) and os.environ.get("FORGE_V2_FP32_MASTER", "").strip() != "1":
         # 2–4B full weights in fp32 master are throughput-bound in a tournament window
         # (Gemma-2-2B 12.4 s/step → 0.49 epoch in 45 min); bf16 weights + 8-bit AdamW
@@ -859,6 +892,8 @@ def run(
         geo = Geometry(micro, max(1, math.ceil(_eff_default / micro)), geo.max_len, geo.gradient_checkpointing, False,
                        "paged_adamw_8bit" if _bnb_available() else "adamw_torch")
         _event_and_print("sft_v2_field_bf16", params_b=round(params_b, 3), micro=geo.micro_batch, grad_accum=geo.grad_accum, optim=geo.optim)
+    _small_batch_default_eff = None
+    _small_batch_target_eff = None
     if strategy == "lora":
         from forge.model import attach_lora
 
@@ -877,6 +912,12 @@ def run(
             # a 32B split over 4 cards keeps ~60 GB per card for activations:
             # micro 16 x 768 tokens without checkpointing does not fit, micro 8 does
             geo = Geometry(8, max(1, geo.eff_batch // 8), geo.max_len, False, False, "adamw_torch_fused")
+        _small_batch_default_eff = geo.eff_batch
+        if gemma_adapter_small_batch:
+            if geo.grad_accum <= 1:
+                raise RuntimeError("small-batch candidate requires default accumulation > 1")
+            _small_batch_target_eff = geo.micro_batch * max(1, math.ceil(geo.grad_accum / 2))
+            geo = Geometry(geo.micro_batch, max(1, math.ceil(geo.grad_accum / 2)), geo.max_len, geo.gradient_checkpointing, False, "adamw_torch_fused")
     else:
         if geo.fp32_master:
             model = model.float()
@@ -915,6 +956,11 @@ def run(
                               headroom=0.15 if (field and geo.fp32_master and strategy == "full") else 0.07,
                               packed_mode=pack.mode if pack else "off")
             _event_and_print("sft_v2_memory_probe", micro=micro_c, gradient_checkpointing=gc_c, fits=ok)
+            if gemma_adapter_small_batch and not ok:
+                _event_and_print("sft_v2_small_batch_disabled", reason="memory_probe_failed", micro=micro_c, gradient_checkpointing=gc_c)
+                gemma_adapter_small_batch = False
+                _small_batch_target_eff = None
+                geo = Geometry(geo.micro_batch, max(1, math.ceil(_small_batch_default_eff / geo.micro_batch)), geo.max_len, geo.gradient_checkpointing, geo.fp32_master, geo.optim)
             if ok:
                 eff_target = geo.eff_batch
                 geo = Geometry(micro_c, max(1, math.ceil(eff_target / micro_c)), geo.max_len, gc_c, geo.fp32_master, geo.optim)
@@ -996,15 +1042,24 @@ def run(
     if field_calibration:
         _lr_override = prior_lr
 
+    _beta1 = 0.9
+    _beta2 = 0.999
+    if gemma_adapter_small_batch:
+        _beta2 = 0.999 ** (geo.eff_batch / max(1, _small_batch_default_eff))
+        _event_and_print("sft_v2_small_batch_optimizer", default_eff=_small_batch_default_eff,
+                         candidate_eff=geo.eff_batch, ratio=geo.eff_batch / max(1, _small_batch_default_eff),
+                         beta1=_beta1, beta2=_beta2, eps=1e-8, weight_decay=0.0)
+
     def optimizer_factory(params: list, lr: float):
-        return torch.optim.AdamW(params, lr=lr, weight_decay=0.0, betas=(0.9, 0.999), eps=1e-8)
+        return torch.optim.AdamW(params, lr=lr, weight_decay=0.0, betas=(_beta1, _beta2), eps=1e-8)
 
     def make_args(num_epochs: float, learning_rate: float, warmup_steps: int, micro: int, accum: int, seed: int = 7) -> TrainingArguments:
         kwargs = dict(
             output_dir=workdir(spec), overwrite_output_dir=True, num_train_epochs=num_epochs,
             per_device_train_batch_size=micro, gradient_accumulation_steps=accum, learning_rate=learning_rate,
             lr_scheduler_type="cosine_with_min_lr", lr_scheduler_kwargs={"min_lr_rate": _min_lr_rate(0.25 if field else 0.1)}, warmup_steps=warmup_steps,
-            weight_decay=0.0, optim=geo.optim, max_grad_norm=1.0, bf16=True, fp16=False,
+            weight_decay=0.0, adam_beta1=_beta1, adam_beta2=_beta2, adam_epsilon=1e-8,
+            optim=geo.optim, max_grad_norm=1.0, bf16=True, fp16=False,
             gradient_checkpointing=False,  # enabled on the model directly above
             logging_steps=5, save_strategy="no", eval_strategy="no", report_to=[], remove_unused_columns=False,
             dataloader_num_workers=2, disable_tqdm=True, seed=seed, train_sampling_strategy="group_by_length", length_column_name="length",
@@ -1067,6 +1122,10 @@ def run(
                 raise
             if _is_oom(exc):
                 _event_and_print("lr_probe_oom", micro=geo.micro_batch)
+                if gemma_adapter_small_batch:
+                    _event_and_print("sft_v2_small_batch_candidate_drift", reason="lr_probe_oom", micro=geo.micro_batch, grad_accum=geo.grad_accum)
+                    gemma_adapter_small_batch = False
+                    _small_batch_target_eff = None
                 _free_cuda()
                 geo = Geometry(max(1, geo.micro_batch // 2), geo.grad_accum * 2, geo.max_len, True, geo.fp32_master, geo.optim)
                 if hasattr(model, "gradient_checkpointing_enable"):
@@ -1097,8 +1156,12 @@ def run(
         except ValueError:
             min_updates = default_updates
         eff_new = int(affordable / max(1, min_updates))
-        eff_new = max(16, min(geo.eff_batch, eff_new))
-        eff_new = max(geo.micro_batch, (eff_new // geo.micro_batch) * geo.micro_batch)
+        eff_floor = _small_batch_target_eff if gemma_adapter_small_batch else 16
+        eff_new = max(eff_floor, min(geo.eff_batch, eff_new))
+        if gemma_adapter_small_batch:
+            eff_new = max(geo.micro_batch, math.ceil(eff_new / geo.micro_batch) * geo.micro_batch)
+        else:
+            eff_new = max(geo.micro_batch, (eff_new // geo.micro_batch) * geo.micro_batch)
         if eff_new != geo.eff_batch:
             scale = math.sqrt(eff_new / geo.eff_batch)
             _event_and_print("sft_v2_eff_batch", old=geo.eff_batch, new=eff_new, lr_old=lr, lr_new=lr * scale,
@@ -1224,7 +1287,7 @@ def run(
                 groups = [{"params": b_params, "lr": lr}, {"params": a_params, "lr": lr / _lora_plus}]
                 if rest:
                     groups.append({"params": rest, "lr": lr})
-                self.optimizer = _t.optim.AdamW(groups, lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.0, fused=_t.cuda.is_available())
+                self.optimizer = _t.optim.AdamW(groups, lr=lr, betas=(_beta1, _beta2), eps=1e-8, weight_decay=0.0, fused=_t.cuda.is_available())
                 _event_and_print("sft_v2_lora_plus", ratio=_lora_plus, lr_b=lr, lr_a=lr / _lora_plus, n_b=len(b_params), n_a=len(a_params))
             return super().create_optimizer()
 
@@ -1249,6 +1312,43 @@ def run(
             return (loss, None) if return_outputs else loss
 
     TrainerCls = RowLossTrainer if row_loss else (LoraPlusTrainer if (_lora_plus > 1.0 and strategy == "lora") else Trainer)
+
+    if gemma_adapter_small_batch:
+        class OptimizerTelemetryTrainer(TrainerCls):
+            """Emit the optimizer object’s actual groups and resolved betas."""
+
+            def create_optimizer(self):
+                result = super().create_optimizer()
+                opt = self.optimizer
+                if opt is None:
+                    raise RuntimeError("Trainer created no optimizer")
+                groups = list(getattr(opt, "param_groups", ()))
+                group_rows = []
+                for index, group in enumerate(groups):
+                    betas = group.get("betas")
+                    group_rows.append({
+                        "index": index,
+                        "params": len(group.get("params", ())),
+                        "numel": sum(int(p.numel()) for p in group.get("params", ())),
+                        "lr": float(group.get("lr")),
+                        "beta1": float(betas[0]) if betas is not None else None,
+                        "beta2": float(betas[1]) if betas is not None else None,
+                        "eps": float(group.get("eps")),
+                        "weight_decay": float(group.get("weight_decay")),
+                    })
+                betas = groups[0].get("betas") if groups else None
+                _event_and_print(
+                    "sft_v2_optimizer_created",
+                    groups=len(groups),
+                    trainable_params=sum(len(g.get("params", ())) for g in groups),
+                    optimizer_groups=group_rows,
+                    beta1=float(betas[0]) if betas is not None else None,
+                    beta2=float(betas[1]) if betas is not None else None,
+                    optimizer=type(opt).__name__,
+                )
+                return result
+
+        TrainerCls = OptimizerTelemetryTrainer
     if row_loss:
         _event_and_print("sft_v2_row_loss", enabled=True, fused=use_liger)
     elif field_hygiene and hyg["plw"] > 0:
@@ -1482,6 +1582,14 @@ def run(
             del trainer
             trainer = None
             _free_cuda()
+            # Preserve the incumbent native retry ladder if the candidate geometry
+            # runs out of memory. The result is explicitly marked as candidate drift
+            # and cannot be treated as a scored batch10 arm.
+            if gemma_adapter_small_batch:
+                _event_and_print("sft_v2_small_batch_candidate_drift", reason="train_oom", step=step,
+                                 micro=geo.micro_batch, grad_accum=geo.grad_accum, eff_batch=geo.eff_batch)
+                gemma_adapter_small_batch = False
+                _small_batch_target_eff = None
             # Keep whatever was trained; shrink the geometry and continue in a new phase.
             state["step_offset"] += step
             state["epochs_done"] += step / steps_per_epoch
