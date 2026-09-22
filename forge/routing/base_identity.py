@@ -98,13 +98,22 @@ def safetensors_bytes(model_dir: str | os.PathLike) -> int:
     return sum(os.path.getsize(f) for f in glob.glob(os.path.join(str(model_dir), "*.safetensors")))
 
 
+def is_protected(name: str) -> bool:
+    """Tensors the validator's augmentation never touches (norms and embeddings; pinned public source,
+    research/20260922-damaged-base-audit). A clean fine-tune of the same architecture changes them too."""
+    n = name.lower()
+    return "norm" in n or "embed" in n
+
+
 def compare(delivered: dict[str, dict[str, Any]], reference: dict[str, dict[str, Any]]) -> dict[str, Any]:
     altered = [k for k in reference if k in delivered and delivered[k]["sha256"] != reference[k]["sha256"]]
     missing = [k for k in reference if k not in delivered]
     extra = [k for k in delivered if k not in reference]
     status = IDENTICAL if not altered and not missing and not extra else ALTERED
+    protected = [k for k in reference if is_protected(k)]
     return {"status": status, "n_tensors": len(reference), "altered": len(altered), "missing": len(missing),
-            "extra": len(extra), "altered_names": altered[:8]}
+            "extra": len(extra), "altered_names": altered[:8], "protected": len(protected),
+            "protected_altered": sum(1 for k in altered if is_protected(k))}
 
 
 def identify(model_dir: str | os.PathLike, *, tables_dir: Path | None = None,
@@ -142,7 +151,8 @@ def identify(model_dir: str | os.PathLike, *, tables_dir: Path | None = None,
             if best is None or rep["altered"] + rep["missing"] + rep["extra"] < best["altered"] + best["missing"] + best["extra"]:
                 best = rep
         assert best is not None
-        out.update({k: best[k] for k in ("status", "candidate", "n_tensors", "altered", "missing", "extra")})
+        out.update({k: best[k] for k in ("status", "candidate", "n_tensors", "altered", "missing", "extra",
+                                         "protected", "protected_altered")})
         out["altered_names"] = best.get("altered_names", [])
         return out
     except Exception as exc:  # noqa: BLE001 - identity is advisory; the caller keeps its route

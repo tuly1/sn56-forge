@@ -800,6 +800,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     _mt = str(getattr(getattr(loaded.model, "config", None), "model_type", "") or "")
     _v2_strategy = sft_v2.strategy_for(params_b, _mt) if (not pinned_route or lfm_pin) else ""
     field_route = False
+    damaged_base_route = False
     if _v2_strategy in ("lora", "full"):
         # Both v2 paths are validated on long-row tasks only (Smol-jb median 392,
         # Gemma 762, ru-AAQG 302). On short-row open-ended data production's
@@ -817,33 +818,51 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             _total_tokens = int(median_len) * len(rows)
         _base_identity = None
         _base_candidate = None
-        if (_mt in sft_v2.FIELD_IDENTICAL_BASE_TYPES and sft_v2._field_identical_base()
-                and not pinned_route and not falcon_legacy_route and n_gpus == 1 and not is_kl
-                and not sft_v2.identical_base_applies(is_long)):
+        _base_damage = None
+        # damaged-base route (2026-09-22): detection runs only for enabled DAMAGED_BASE_FAMILIES, single GPU, non-KL
+        _damage_family = (sft_v2.damaged_base_family_enabled(_mt) and (not pinned_route or lfm_pin)
+                          and not falcon_legacy_route and n_gpus == 1 and not is_kl)
+        _identity_family = (_mt in sft_v2.FIELD_IDENTICAL_BASE_TYPES and sft_v2._field_identical_base()
+                            and not pinned_route and not falcon_legacy_route and n_gpus == 1 and not is_kl)
+        _identity_rows = sft_v2.identical_base_applies(is_long)
+        _rep = None
+        if _identity_family and not _identity_rows:
             telemetry.event("base_identity_skipped", reason="short_rows", median_tokens=median_len)
-        elif (_mt in sft_v2.FIELD_IDENTICAL_BASE_TYPES and sft_v2._field_identical_base()
-                and not pinned_route and not falcon_legacy_route and n_gpus == 1 and not is_kl):
+        if (_identity_family and _identity_rows) or _damage_family:
             # exact per-tensor comparison with the shipped public tables; any doubt keeps the adapter route
             from forge.routing import base_identity as _bid
             _rep = _bid.identify(spec.cached_model_dir)
+            telemetry.event("base_identity", **{k: _rep.get(k) for k in ("status", "candidate", "n_tensors", "altered",
+                                                                       "missing", "extra", "protected", "protected_altered",
+                                                                       "seconds", "reason")})
+        if _rep is not None and _identity_family and _identity_rows:
             _base_identity = _rep.get("status")
             _base_candidate = _rep.get("candidate")
             if _base_identity == "identical" and _rep.get("candidate") not in sft_v2.FIELD_IDENTICAL_BASE_CANDIDATES:
                 _base_identity = "identical_untested"  # a public base we never validated the field route on: keep the route
-            telemetry.event("base_identity", **{k: _rep.get(k) for k in ("status", "candidate", "n_tensors", "altered",
-                                                                       "missing", "extra", "seconds", "reason")})
+        if _damage_family:
+            from forge.routing import damage as _dmg
+            _drep = _dmg.assess(spec.cached_model_dir, identity=_rep, detectors=sft_v2.damage_detectors())
+            _base_damage = _drep.get("verdict")
+            telemetry.event("base_damage", verdict=_base_damage, by=_drep.get("by"), seconds=_drep.get("seconds"),
+                            detectors={k: {kk: vv for kk, vv in v.items() if kk in ("verdict", "reason", "hits", "n",
+                                                                                   "median_zero_fraction")}
+                                       for k, v in (_drep.get("detectors") or {}).items()})
         field_route = (
             (not pinned_route or lfm_pin)
             and not falcon_legacy_route
             and sft_v2.field_full_route(params_b=params_b, n_gpus=n_gpus, is_kl=is_kl, model_type=_mt, n_rows=len(rows),
                                         total_tokens=_total_tokens,
                                         vocab_size=int(getattr(getattr(loaded.model, "config", None), "vocab_size", 0) or 0) or None,
-                                        base_identity=_base_identity, base_candidate=_base_candidate)
+                                        base_identity=_base_identity, base_candidate=_base_candidate,
+                                        base_damage=_base_damage)
         )
-        telemetry.event("sft_v2_field_gate", total_tokens=_total_tokens, rows=len(rows), model_type=_mt, field_route=field_route)
+        damaged_base_route = bool(field_route and sft_v2.damaged_base_admits(_mt, _base_damage, params_b))
+        telemetry.event("sft_v2_field_gate", total_tokens=_total_tokens, rows=len(rows), model_type=_mt, field_route=field_route,
+                        base_damage=_base_damage, damaged_base_route=damaged_base_route)
         if lfm_pin and field_route and _total_tokens is None:
             # a protected pin is released only on evidence: without a known token count the gate is unproven
-            field_route = False
+            field_route = damaged_base_route = False
             telemetry.event("sft_v2_pin_release_refused", model=spec.model, model_type=_mt, reason="unknown_total_tokens")
         if lfm_pin and field_route:
             pinned_route = False
@@ -856,7 +875,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             # validated regime only (llama family, >=15k rows, >=8M tokens)
             _v2_strategy = "full"
             v2_strategy_override = "full"
-            telemetry.event("sft_v2_field_full_route", params_b=round(params_b, 3), eff_batch=sft_v2.field_eff_batch(params_b))
+            telemetry.event("sft_v2_field_full_route", params_b=round(params_b, 3), eff_batch=sft_v2.field_eff_batch(params_b),
+                            damaged_base=damaged_base_route)
         short_rows = (not is_long) and not field_route
         if _v2_strategy:
             telemetry.event("sft_v2_row_length_gate", median_tokens=median_len, long_rows=is_long, strategy=_v2_strategy)
@@ -899,6 +919,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 strategy_override=v2_strategy_override,
                 route_lr=v2_route_lr,
                 field_route=field_route,
+                damaged_base_route=damaged_base_route,
             )
             return
         except BaseException as exc:  # noqa: BLE001

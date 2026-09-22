@@ -199,20 +199,98 @@ def _field_identical_base_max_b() -> float:
 FIELD_FULL_MIN_PARAMS_B: dict[str, float] = {"lfm2": 2.0}
 
 
+# Damaged-base full route (2026-09-22). The validator damages ~half of the text bases (scaling / pruning / noise /
+# re-init; norms and embeddings untouched). There adapter entries trailed the winner by a median 21% (n=9) against 5.7%
+# for full entries (n=90); 20/21 winners shipped full weights; we never did (research/20260922-damaged-base-audit).
+# When forge.routing.damage says "damaged", an enabled family below the field size cap takes the FIELD full route with
+# the recipe of the 2026-09-22 pairs: bf16 weights + paged 8-bit AdamW from 0.3 B, raw analytic LR x1.0, and no
+# family vocabulary / minimum-size gate (the pruned LFM2.5-1.2B has vocab 65536 and 1.2 B). The row / token floors
+# apply exactly as on the field route. Clean and unknown bases keep today's routes.
+# Families are switched on only by a scored result on a real validator-damaged (or closest available) base:
+#   qwen2  ON:  Qwen2-0.5B (-1.49%, 75% rows) and Qwen2.5-3B (-0.33%, 55%) FIELD bf16 full vs deployed LoRA, clean
+#               exact bases, grammar 70k, seed 7 (research/20260922-{qwen05b,qwen3b}-exec). Real-damage Qwen pairs
+#               (Qwen2.5-3B-I scaled, Qwen2.5-1.5B pruned; seed 17) are pending. Contrary older evidence: home-made
+#               damage on Qwen2.5-0.5B, adapter won 1.3-2.9% (superseded as evidence, not refuted).
+#   lfm2   ON:  pruned tournament base augmented-a22a7e3362beba00 (LFM2.5-1.2B-Instruct): -0.64%, 58% rows, seed 7
+#               (research/20260922-lfm12-exec). Pruning is seen only by the opt-in zero_fraction detector (no table).
+#   llama, gemma2, qwen3  OFF until their real-damage pairs (Llama-3.2-1B-I re-init, gemma-2-2b re-init,
+#               Qwen3-1.7B-Base re-init) score. llama already takes the field route on its validated vocabulary.
+DAMAGED_BASE_FAMILIES: dict[str, dict[str, Any]] = {
+    "qwen2": {"enabled": True, "max_params_b": FIELD_FULL_MAX_PARAMS_B},
+    "lfm2": {"enabled": True, "max_params_b": FIELD_FULL_MAX_PARAMS_B},
+    "llama": {"enabled": False, "max_params_b": FIELD_FULL_MAX_PARAMS_B},
+    "gemma2": {"enabled": False, "max_params_b": FIELD_FULL_MAX_PARAMS_B},
+    "qwen3": {"enabled": False, "max_params_b": FIELD_FULL_MAX_PARAMS_B},
+}
+# Master switch. The validator runs this image with its own environment, so the production value lives here;
+# FORGE_V2_DAMAGED_BASE_ROUTE=0/1 overrides it for research and CPU replays.
+DAMAGED_BASE_ROUTE_DEFAULT = "1"
+# Detectors consulted (forge.routing.damage.DETECTORS). "identity" needs a shipped public table (base_hashes/);
+# "zero_fraction" (pruning only, reference-free) is opt-in via FORGE_V2_DAMAGE_DETECTORS until the executor admits it.
+DAMAGE_DETECTORS_DEFAULT: tuple[str, ...] = ("identity",)
+# The recipe the 2026-09-22 pairs ran (FORGE_V2_FIELD_BF16=1, FIELD_BF16_MIN_B=0.3, FIELD_LR_MULT=1).
+DAMAGED_BASE_BF16_MIN_B = 0.3
+DAMAGED_BASE_LR_MULT = 1.0
+
+
+def _damaged_base_route() -> bool:
+    return os.environ.get("FORGE_V2_DAMAGED_BASE_ROUTE", DAMAGED_BASE_ROUTE_DEFAULT).strip() == "1"
+
+
+def damaged_base_types() -> frozenset[str]:
+    """Families switched on for the damaged-base route. FORGE_V2_DAMAGED_BASE_TYPES (comma-separated; "none" = empty)
+    overrides the table; a family missing from DAMAGED_BASE_FAMILIES is never admitted."""
+    forced = os.environ.get("FORGE_V2_DAMAGED_BASE_TYPES", "").strip().lower()
+    if forced:
+        return frozenset(x.strip() for x in forced.split(",") if x.strip() in DAMAGED_BASE_FAMILIES)
+    return frozenset(k for k, v in DAMAGED_BASE_FAMILIES.items() if v.get("enabled"))
+
+
+def damaged_base_family_enabled(model_type: str | None) -> bool:
+    """Whether the dispatcher should run damage detection for this family at all."""
+    return _field_full() and _damaged_base_route() and str(model_type or "").lower() in damaged_base_types()
+
+
+def damage_detectors() -> tuple[str, ...]:
+    forced = os.environ.get("FORGE_V2_DAMAGE_DETECTORS", "").strip()
+    if forced:
+        return tuple(x.strip() for x in forced.split(",") if x.strip())
+    return DAMAGE_DETECTORS_DEFAULT
+
+
+def damaged_base_admits(model_type: str | None, base_damage: str | None, params_b: float) -> bool:
+    """Damage verdict + enabled family + size cap. The remaining field gates (GPUs, KL, rows, tokens) are applied by
+    field_full_route."""
+    _mt = str(model_type or "").lower()
+    if base_damage != "damaged" or not damaged_base_family_enabled(_mt):
+        return False
+    try:
+        cap = float(DAMAGED_BASE_FAMILIES[_mt].get("max_params_b") or FIELD_FULL_MAX_PARAMS_B)
+    except (TypeError, ValueError):
+        cap = FIELD_FULL_MAX_PARAMS_B
+    return 0 < params_b <= min(cap, FIELD_FULL_MAX_PARAMS_B)
+
+
 def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: str | None = None,
                      n_rows: int | None = None, total_tokens: int | None = None, vocab_size: int | None = None,
-                     base_identity: str | None = None, base_candidate: str | None = None) -> bool:
+                     base_identity: str | None = None, base_candidate: str | None = None,
+                     base_damage: str | None = None) -> bool:
     """Full weights at the field geometry for single-GPU, non-KL instruct tasks up to
     FIELD_FULL_MAX_PARAMS_B (FORGE_V2_FIELD_MAX_PARAMS_B overrides) on an allow-listed
     model family (field_full_types) with at least field_full_min_rows() rows: full weights
     memorise a small corpus within a few steps (CodeFeedback 8k: best dev at step 10 at both
     1e-4 and 4.8e-5) while they keep improving for two epochs on 19.5k GossipCop rows.
     On by default; FORGE_V2_FIELD=0 disables it. ``base_identity`` (forge.routing.base_identity status) admits
-    FIELD_IDENTICAL_BASE_TYPES only when it is "identical" and FORGE_V2_FIELD_IDENTICAL_BASE=1."""
+    FIELD_IDENTICAL_BASE_TYPES only when it is "identical" and FORGE_V2_FIELD_IDENTICAL_BASE=1. ``base_damage``
+    (forge.routing.damage verdict) admits an enabled DAMAGED_BASE_FAMILIES family on a "damaged" base without the
+    family vocabulary / minimum-size gates; the row and token floors still apply."""
     if not _field_full() or is_kl or n_gpus != 1 or params_b <= 0:
         return False
     _mt = str(model_type).lower() if model_type is not None else None
-    if _mt is not None and _mt not in field_full_types():
+    damaged = damaged_base_admits(_mt, base_damage, params_b)
+    if damaged:
+        pass  # the family, vocabulary and minimum-size gates below do not apply; rows / tokens / cap do
+    elif _mt is not None and _mt not in field_full_types():
         # a family outside the allow-list is admitted only on a byte-identical public base (see FIELD_IDENTICAL_BASE_TYPES)
         if not (_mt in FIELD_IDENTICAL_BASE_TYPES and base_identity == "identical" and _field_identical_base()):
             return False
@@ -225,12 +303,12 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
         _floor = _rule.get("min_tokens")
         if _floor and not os.environ.get("FORGE_V2_FIELD_MIN_TOKENS") and (total_tokens is None or total_tokens < int(_floor)):
             return False  # this checkpoint's win was measured on large corpora only; unknown volume keeps the route
-    if vocab_size is not None and not os.environ.get("FORGE_V2_FIELD_TYPES"):
+    if vocab_size is not None and not damaged and not os.environ.get("FORGE_V2_FIELD_TYPES"):
         # family-specific: the validated wins are Meta Llama-3.2 (128256) and LFM2.5 (128000); an unknown family
         # or a mismatched vocabulary keeps its route
         if _mt is None or int(vocab_size) not in FIELD_FULL_VOCABS.get(_mt, frozenset()):
             return False
-    if _mt is not None and not os.environ.get("FORGE_V2_FIELD_TYPES") and params_b < FIELD_FULL_MIN_PARAMS_B.get(_mt, 0.0):
+    if _mt is not None and not damaged and not os.environ.get("FORGE_V2_FIELD_TYPES") and params_b < FIELD_FULL_MIN_PARAMS_B.get(_mt, 0.0):
         return False  # below the size where the family's validated configuration applies
     if n_rows is not None and n_rows < field_full_min_rows(_mt):
         return False
@@ -253,8 +331,10 @@ def _identical_base_family_defaults(model_type: str | None) -> bool:
     return str(model_type or "").lower() in FIELD_IDENTICAL_BASE_TYPES and _field_identical_base()
 
 
-def _field_bf16_min_b(model_type: str | None = None) -> float:
+def _field_bf16_min_b(model_type: str | None = None, *, damaged_base: bool = False) -> float:
     default = FIELD_BF16_MIN_B_TYPES.get(str(model_type or "").lower(), 2.0) if _identical_base_family_defaults(model_type) else 2.0
+    if damaged_base:
+        default = DAMAGED_BASE_BF16_MIN_B
     try:
         return float(os.environ.get("FORGE_V2_FIELD_BF16_MIN_B", str(default)))
     except ValueError:
@@ -266,7 +346,7 @@ FIELD_BF16_DEFAULT_TYPES = frozenset({"lfm2"})  # families whose field win was m
 # Qwen2.5-0.5B full-weight arm ran FORGE_V2_FIELD_BF16=1, BF16_MIN_B=0.3, LR_MULT=0.5); with the switch off nothing changes.
 
 
-def _field_bf16_enabled(model_type: str | None) -> bool:
+def _field_bf16_enabled(model_type: str | None, *, damaged_base: bool = False) -> bool:
     """bf16 weights + paged 8-bit AdamW on the field route (>= _field_bf16_min_b() B). FORGE_V2_FIELD_BF16=1/0
     forces it; unset, it is on only for FIELD_BF16_DEFAULT_TYPES (lfm2: the 2026-09-16 MathFusion win ran this way,
     1.7 epochs in 2 h; fp32 master at the same size managed 0.49–2.2 partial epochs). Llama-1B never reaches the
@@ -274,7 +354,7 @@ def _field_bf16_enabled(model_type: str | None) -> bool:
     forced = os.environ.get("FORGE_V2_FIELD_BF16", "").strip()
     if forced in ("0", "1"):
         return forced == "1"
-    return str(model_type or "").lower() in FIELD_BF16_DEFAULT_TYPES or _identical_base_family_defaults(model_type)
+    return damaged_base or str(model_type or "").lower() in FIELD_BF16_DEFAULT_TYPES or _identical_base_family_defaults(model_type)
 
 
 # qwen2 (Qwen2.5-0.5B): 0.5 until 2026-09-18, chosen on a chat-style stand-in fixture (x1.0 lost 2.2% there, one seed each).
@@ -285,9 +365,11 @@ def _field_bf16_enabled(model_type: str | None) -> bool:
 FIELD_LR_MULT_TYPES: dict[str, float] = {"qwen2": 1.0}
 
 
-def _field_lr_mult(model_type: str | None = None) -> float:
+def _field_lr_mult(model_type: str | None = None, *, damaged_base: bool = False) -> float:
     """Multiplier on the clamped raw analytic LR of the field route: FORGE_V2_FIELD_LR_MULT, else the family default."""
     default = FIELD_LR_MULT_TYPES.get(str(model_type or "").lower(), 1.0) if _identical_base_family_defaults(model_type) else 1.0
+    if damaged_base:
+        default = DAMAGED_BASE_LR_MULT
     try:
         return float(os.environ.get("FORGE_V2_FIELD_LR_MULT", str(default)) or default)
     except ValueError:
@@ -741,6 +823,7 @@ def run(
     strategy_override: str | None = None,
     route_lr: float | None = None,
     field_route: bool = False,
+    damaged_base_route: bool = False,
 ) -> None:
     import torch
     from datasets import Dataset
@@ -883,7 +966,8 @@ def run(
                          status=_admission.get("status"), reason=_admission.get("reason"),
                          gate_reason=_admission.get("gate", {}).get("reason") if isinstance(_admission.get("gate"), dict) else None)
         gemma_adapter_small_batch = _admission.get("action") == "enable_gemma_small_batch"
-    if field and geo.fp32_master and _field_bf16_enabled(str(getattr(getattr(model, "config", None), "model_type", "") or "")) and params_b >= _field_bf16_min_b(str(getattr(getattr(model, "config", None), "model_type", "") or "")) and os.environ.get("FORGE_V2_FP32_MASTER", "").strip() != "1":
+    _damaged_recipe = bool(field and damaged_base_route)
+    if field and geo.fp32_master and _field_bf16_enabled(str(getattr(getattr(model, "config", None), "model_type", "") or ""), damaged_base=_damaged_recipe) and params_b >= _field_bf16_min_b(str(getattr(getattr(model, "config", None), "model_type", "") or ""), damaged_base=_damaged_recipe) and os.environ.get("FORGE_V2_FP32_MASTER", "").strip() != "1":
         # 2–4B full weights in fp32 master are throughput-bound in a tournament window
         # (Gemma-2-2B 12.4 s/step → 0.49 epoch in 45 min); bf16 weights + 8-bit AdamW
         # learned identically to fp32 on the Llama ablation at 1.4x the speed
@@ -1014,7 +1098,7 @@ def run(
             # scales it for experiments; no sweep (the short probe under-picks for full weights).
             _raw = lr_probe.analytic_lr(weight_rms=_layer_weight_rms(model) or median_weight_rms(model), params_b=params_b,
                                         eff_batch=rows_per_step(), gradient_noise_scale=gns)
-            _fm = _field_lr_mult(str(getattr(getattr(model, "config", None), "model_type", "") or ""))
+            _fm = _field_lr_mult(str(getattr(getattr(model, "config", None), "model_type", "") or ""), damaged_base=_damaged_recipe)
             prior_lr = max(2.0e-5, min(1.0e-4, _raw)) * _fm
             _event_and_print("sft_v2_field_lr", prior_lr=prior_lr, raw=_raw, mult=_fm, eff_batch=geo.eff_batch, rows_per_step=rows_per_step())
         else:
