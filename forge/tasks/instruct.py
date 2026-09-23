@@ -842,11 +842,14 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 _base_identity = "identical_untested"  # a public base we never validated the field route on: keep the route
         if _damage_family:
             from forge.routing import damage as _dmg
-            _drep = _dmg.assess(spec.cached_model_dir, identity=_rep, detectors=sft_v2.damage_detectors())
+            _drep = _dmg.assess(spec.cached_model_dir, identity=_rep, detectors=sft_v2.damage_detectors(),
+                                model_name=spec.model)
             _base_damage = _drep.get("verdict")
             telemetry.event("base_damage", verdict=_base_damage, by=_drep.get("by"), seconds=_drep.get("seconds"),
                             detectors={k: {kk: vv for kk, vv in v.items() if kk in ("verdict", "reason", "hits", "n",
-                                                                                   "median_zero_fraction")}
+                                                                                   "median_zero_fraction", "source",
+                                                                                   "source_revision", "identified_by",
+                                                                                   "bytes_read")}
                                        for k, v in (_drep.get("detectors") or {}).items()})
         field_route = (
             (not pinned_route or lfm_pin)

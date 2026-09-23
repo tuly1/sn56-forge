@@ -47,7 +47,7 @@ def test_family_table_defaults():
     assert set(sft_v2.DAMAGED_BASE_FAMILIES) == {"qwen2", "lfm2", "llama", "gemma2", "qwen3"}
     assert sft_v2.damaged_base_types() == frozenset(ENABLED)
     assert sft_v2.DAMAGED_BASE_ROUTE_DEFAULT == "1" and sft_v2._damaged_base_route() is True
-    assert sft_v2.damage_detectors() == ("identity",)  # zero_fraction is opt-in
+    assert sft_v2.damage_detectors() == ("identity", "fingerprint")  # zero_fraction is opt-in
     assert all(v["max_params_b"] <= sft_v2.FIELD_FULL_MAX_PARAMS_B for v in sft_v2.DAMAGED_BASE_FAMILIES.values())
 
 

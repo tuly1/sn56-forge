@@ -227,7 +227,11 @@ DAMAGED_BASE_FAMILIES: dict[str, dict[str, Any]] = {
 DAMAGED_BASE_ROUTE_DEFAULT = "1"
 # Detectors consulted (forge.routing.damage.DETECTORS). "identity" needs a shipped public table (base_hashes/);
 # "zero_fraction" (pruning only, reference-free) is opt-in via FORGE_V2_DAMAGE_DETECTORS until the executor admits it.
-DAMAGE_DETECTORS_DEFAULT: tuple[str, ...] = ("identity",)
+# "fingerprint" (2026-09-22) is the damage-detector README rule against the shipped offline table
+# routing/data/base_fingerprints.json.gz (norm-hash source identification + first-16 KiB prefix comparison, local
+# pruning / bf16-scaling fallback); offline validation 29/29 damaged, 0/27 false alarms
+# (research/20260922-prod-patch/FINGERPRINT-TABLE.md). FORGE_V2_DAMAGE_DETECTORS=identity restores the 681901f set.
+DAMAGE_DETECTORS_DEFAULT: tuple[str, ...] = ("identity", "fingerprint")
 # The recipe the 2026-09-22 pairs ran (FORGE_V2_FIELD_BF16=1, FIELD_BF16_MIN_B=0.3, FIELD_LR_MULT=1).
 DAMAGED_BASE_BF16_MIN_B = 0.3
 DAMAGED_BASE_LR_MULT = 1.0
