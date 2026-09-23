@@ -111,9 +111,13 @@ def compare(delivered: dict[str, dict[str, Any]], reference: dict[str, dict[str,
     extra = [k for k in delivered if k not in reference]
     status = IDENTICAL if not altered and not missing and not extra else ALTERED
     protected = [k for k in reference if is_protected(k)]
+    # dtype / shape differences on shared names (a re-export, not augmentation); tables without the fields count 0
+    structure_changed = sum(1 for k in reference if k in delivered and any(
+        f in reference[k] and f in delivered[k] and _norm(reference[k][f]) != _norm(delivered[k][f])
+        for f in ("dtype", "shape")))
     return {"status": status, "n_tensors": len(reference), "altered": len(altered), "missing": len(missing),
             "extra": len(extra), "altered_names": altered[:8], "protected": len(protected),
-            "protected_altered": sum(1 for k in altered if is_protected(k))}
+            "protected_altered": sum(1 for k in altered if is_protected(k)), "structure_changed": structure_changed}
 
 
 def identify(model_dir: str | os.PathLike, *, tables_dir: Path | None = None,

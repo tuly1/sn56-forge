@@ -215,6 +215,163 @@ def test_structurally_different_damaged_copy_is_unknown(world, case):
     assert damage.fingerprint(_save(world, f"struct-{case}-ok", base), None)["verdict"] == "damaged"
 
 
+def test_tail_only_alteration_exact_identity_outranks_prefix_clean(world):
+    """Codex review 2026-09-23: a tensor altered only after byte 16384 is prefix-identical (fingerprint "clean") but not
+    byte-identical; the exact full-tensor identity verdict "damaged" must win."""
+    from forge.routing import base_identity as bid
+
+    t = dict(world["tensors"])
+    name = "model.layers.1.mlp.down_proj.weight"            # 128 x 256 bf16 = 64 KiB
+    dt, x = t[name]
+    flat = x.copy().ravel()
+    flat[16384 // 2 + 10:] *= np.float32(0.5)                # only elements stored after byte 16384 change
+    t[name] = (dt, flat.reshape(x.shape))
+    d = _save(world, "tail-only", t)
+    fp = damage.fingerprint(d, None)
+    assert fp["verdict"] == "clean" and fp["reason"] == "prefix_identical"   # the prefix cannot see it
+    rep = bid.compare(bid.hash_safetensors(d), bid.hash_safetensors(str(world["pub"])))
+    rep["candidate"] = "org__Pub-1B"  # identify() names the matched table key
+    assert rep["status"] == "altered" and rep["altered"] == 1 and rep["protected_altered"] == 0
+    assert damage.identity_signature(d, rep)["verdict"] == "damaged"
+    out = damage.assess(d, identity=rep, detectors=("identity", "fingerprint"))
+    assert out["verdict"] == "damaged" and out["by"] == ["identity"], out
+    assert out["reason"] == "exact_identity_altered"  # exact vs org/Pub-1B supersedes the prefix "clean" vs org/Pub-1B
+    assert damage.assess(d, identity=rep, detectors=("fingerprint", "identity"))["verdict"] == "damaged"  # order-free
+    # exact identity "clean" still outranks everything; prefix "clean" stands only when nothing says "damaged"
+    same = dict(bid.compare(bid.hash_safetensors(str(world["pub"])), bid.hash_safetensors(str(world["pub"]))),
+                candidate="org__Pub-1B")
+    out = damage.assess(str(world["pub"]), identity=same, detectors=("identity", "fingerprint"))
+    assert out["verdict"] == "clean" and out["reason"] == "exact_identity"
+    assert damage.assess(d, identity=None, detectors=("identity", "fingerprint"))["verdict"] == "clean"
+
+
+def test_contradictory_references_are_unknown(world):
+    """Altered vs reference A but prefix-clean vs a different tabled checkpoint B: contradictory -> unknown."""
+    other = str(world["tmp"] / "other")  # prefix-identical to the tabled org/Other-1B
+    rep_a = {"status": "altered", "candidate": "org__Pub-1B", "n_tensors": 22, "altered": 3, "missing": 0, "extra": 0,
+             "protected": 10, "protected_altered": 0}
+    assert damage.fingerprint(other, None)["source"] == "org/Other-1B"
+    out = damage.assess(other, identity=rep_a, detectors=("identity", "fingerprint"))
+    assert out["verdict"] == "unknown" and out["reason"] == "contradictory_references", out
+    # damaged vs A by one detector and damaged vs B by another: also contradictory
+    damaged_b = _save(world, "dmg-b", _augment(dict(_model(2)), "weight_scaling", 0.62, 3))
+    assert damage.fingerprint(damaged_b, None)["source"] == "org/Other-1B"
+    out = damage.assess(damaged_b, identity=rep_a, detectors=("identity", "fingerprint"))
+    assert out["verdict"] == "unknown" and out["reason"] == "contradictory_references", out
+    # a reference-free "damaged" against a prefix "clean": contradictory
+    damage.register("rf_damaged", lambda d, i: {"verdict": "damaged", "reason": "pruning_signature"})
+    try:
+        out = damage.assess(str(world["pub"]), identity=None, detectors=("fingerprint", "rf_damaged"))
+        assert out["verdict"] == "unknown" and out["reason"] == "contradictory_reference_free"
+        # ...but alone (source not tabled, nothing says clean) it stands
+        assert damage.assess("x", identity=None, detectors=("rf_damaged",))["verdict"] == "damaged"
+    finally:
+        damage.DETECTORS.pop("rf_damaged", None)
+
+
+_X = dict(exact=True)  # an identity verdict backed by a full-tensor comparison with its reference
+
+
+@pytest.mark.parametrize("results,expected", [
+    # (1) / (6) exact clean wins over anything, including a conflicting prefix verdict about another reference
+    ({"identity": dict(_X, verdict="clean", reference="org/a"), "fingerprint": {"verdict": "damaged", "source": "org/b"}},
+     ("clean", "exact_identity")),
+    # (2) exact altered vs A supersedes a prefix clean vs A (tail-only change)
+    ({"identity": dict(_X, verdict="damaged", reference="Org__A"), "fingerprint": {"verdict": "clean", "source": "org/a"}},
+     ("damaged", "exact_identity_altered")),
+    # (3) exact unknown (protected altered) vs A supersedes a prefix damaged vs A
+    ({"identity": dict(_X, verdict="unknown", reason="norm_or_embedding_altered", reference="org__a"),
+      "fingerprint": {"verdict": "damaged", "source": "org/a"}},
+     ("unknown", "exact_identity:norm_or_embedding_altered")),
+    # (4) exact unknown (structural) vs A supersedes a prefix damaged vs A
+    ({"identity": dict(_X, verdict="unknown", reason="structure_differs", reference="org__a"),
+      "fingerprint": {"verdict": "damaged", "source": "org/a"}},
+     ("unknown", "exact_identity:structure_differs")),
+    # (5) cross-reference positive claims
+    ({"identity": dict(_X, verdict="damaged", reference="org__a"), "fingerprint": {"verdict": "clean", "source": "org/b"}},
+     ("unknown", "contradictory_references")),
+    ({"identity": dict(_X, verdict="damaged", reference="org__a"), "fingerprint": {"verdict": "damaged", "source": "org/b"}},
+     ("unknown", "contradictory_references")),
+    # an exact "not A" (protected altered) does not veto evidence about a different tabled B
+    ({"identity": dict(_X, verdict="unknown", reason="norm_or_embedding_altered", reference="qwen__qwen2.5-1.5b-instruct"),
+      "fingerprint": {"verdict": "damaged", "source": "Qwen/Qwen2.5-1.5B"}}, ("damaged", "damaged")),
+    ({"identity": dict(_X, verdict="damaged", reference="org__a"), "fingerprint": {"verdict": "damaged", "source": "org/a"}},
+     ("damaged", "exact_identity_altered")),
+    # no exact comparison (no table / not compared): prefix evidence stands
+    ({"identity": {"verdict": "unknown", "reference": None, "exact": False},
+      "fingerprint": {"verdict": "damaged", "source": "org/a"}}, ("damaged", "damaged")),
+    ({"identity": {"verdict": "unknown", "exact": False}, "fingerprint": {"verdict": "clean", "source": "org/a"}},
+     ("clean", "prefix_identity")),
+    ({"identity": {"verdict": "unknown", "exact": False}, "fingerprint": {"verdict": "unknown"}}, ("unknown", "no_verdict")),
+    # an identity verdict without the exact flag (e.g. a report from before this patch) is not authoritative
+    ({"identity": {"verdict": "clean", "reference": "org/a"}, "fingerprint": {"verdict": "damaged", "source": "org/a"}},
+     ("damaged", "damaged")),
+])
+def test_combine_precedence(results, expected):
+    assert damage.combine(results) == expected
+
+
+def _exact(world, d):
+    from forge.routing import base_identity as bid
+    return dict(bid.compare(bid.hash_safetensors(d), bid.hash_safetensors(str(world["pub"]))), candidate="org__Pub-1B")
+
+
+def _alter(t, name, *, after_prefix=False, factor=0.5):
+    dt, x = t[name]
+    flat = x.copy().ravel()
+    start = PREFIX_ELEMS + 10 if after_prefix else 0
+    flat[start:] *= np.float32(factor)
+    t[name] = (dt, flat.reshape(x.shape))
+
+
+PREFIX_ELEMS = 16384 // 2  # bf16 elements inside the fingerprint prefix
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("exact_clean", ("clean", "exact_identity")),
+    ("unprotected_in_prefix", ("damaged", "exact_identity_altered")),
+    ("unprotected_tail_only", ("damaged", "exact_identity_altered")),
+    ("embedding_tail_plus_ordinary_in_prefix", ("unknown", "exact_identity:norm_or_embedding_altered")),
+    ("missing_tensor", ("unknown", "exact_identity:tensor_set_differs")),
+    ("extra_tensor", ("unknown", "exact_identity:tensor_set_differs")),
+    ("dtype_change", ("unknown", "exact_identity:structure_differs")),
+    ("shape_change", ("unknown", "exact_identity:structure_differs")),
+])
+def test_exact_identity_is_authoritative_for_its_reference(world, case, expected):
+    """Codex regression matrix, all against the same reference org/Pub-1B."""
+    t = dict(world["tensors"])
+    if case == "unprotected_in_prefix":
+        _alter(t, "model.layers.2.self_attn.q_proj.weight")
+    elif case == "unprotected_tail_only":
+        _alter(t, "model.layers.1.mlp.down_proj.weight", after_prefix=True)
+    elif case == "embedding_tail_plus_ordinary_in_prefix":
+        _alter(t, "model.embed_tokens.weight", after_prefix=True, factor=1.5)   # 256 x 128 bf16 = 64 KiB
+        _alter(t, "model.layers.2.self_attn.q_proj.weight")
+    elif case == "missing_tensor":
+        _alter(t, "model.layers.2.self_attn.q_proj.weight")
+        t.pop("model.layers.3.self_attn.q_proj.weight")
+    elif case == "extra_tensor":
+        _alter(t, "model.layers.2.self_attn.q_proj.weight")
+        t["model.layers.3.mlp.gate_proj.weight"] = ("BF16", np.ones((128, 256), np.float32) * 0.01)
+    elif case == "dtype_change":
+        dt, x = t["model.layers.1.mlp.down_proj.weight"]
+        t["model.layers.1.mlp.down_proj.weight"] = ("F32", x)
+    elif case == "shape_change":
+        _alter(t, "model.layers.2.self_attn.q_proj.weight")
+        dt, x = t["model.layers.1.mlp.down_proj.weight"]
+        t["model.layers.1.mlp.down_proj.weight"] = (dt, x.reshape(256, 128))
+    d = str(world["pub"]) if case == "exact_clean" else _save(world, f"exact-{case}", t)
+    fp = damage.fingerprint(d, None)
+    if case == "embedding_tail_plus_ordinary_in_prefix":
+        assert fp["verdict"] == "damaged"  # the prefix alone would have routed it: the exact verdict must win
+    if case == "unprotected_tail_only":
+        assert fp["verdict"] == "clean"
+    out = damage.assess(d, identity=_exact(world, d), detectors=("identity", "fingerprint"))
+    assert (out["verdict"], out["reason"]) == expected, out
+    # detector order never matters
+    assert damage.assess(d, identity=_exact(world, d), detectors=("fingerprint", "identity"))["verdict"] == expected[0]
+
+
 def test_name_with_different_norms_is_not_trusted(world):
     rep = damage.fingerprint(str(world["tmp"] / "other"), None, model_name="org/Pub-1B")
     # the argument names Pub but the norms are Other's: identification by norms wins

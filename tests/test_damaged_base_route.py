@@ -1,7 +1,8 @@
 """Damaged-base full route (2026-09-22/23): on a validator-damaged base an enabled family takes the FIELD full route with
 the recipe its scored candidate arm ran (bf16 + paged 8-bit AdamW from the family's executed threshold, LR x1.0, tested
 vocabulary, no family minimum size); the row / token floors still apply. Clean and unknown bases keep today's routes.
-Families are data-driven (sft_v2.DAMAGED_BASE_FAMILIES): qwen2, qwen3, llama, gemma2 and lfm2 all on. The exact
+Families are data-driven (sft_v2.DAMAGED_BASE_FAMILIES): qwen2, qwen3, gemma2 and lfm2 on; llama off (its production
+route is already FIELD fp32, and fp32 vs bf16 FIELD was not the tested change). The exact
 executed env / geometry equivalence is pinned in tests/test_damaged_base_recipe.py."""
 import importlib.util
 import json
@@ -27,7 +28,7 @@ FAMILY = {
     "gemma2": (2.61, 256000),  # gemma-2-2b
     "qwen3": (1.72, 151936),   # Qwen3-1.7B-Base
 }
-ENABLED = {"qwen2", "lfm2", "llama", "gemma2", "qwen3"}
+ENABLED = {"qwen2", "lfm2", "gemma2", "qwen3"}  # llama OFF: production fp32 FIELD vs bf16 is untested
 
 
 @pytest.fixture(autouse=True)

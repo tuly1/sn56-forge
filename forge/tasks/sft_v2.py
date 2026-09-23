@@ -217,7 +217,8 @@ FIELD_FULL_MIN_PARAMS_B: dict[str, float] = {"lfm2": 2.0}
 # paired 99% interval wholly below zero; SCIENCE-LEDGER 2026-09-23 00:43-01:55 UTC; DISCOVERY_SIGNAL, one fixture):
 #   qwen2   Qwen2.5-1.5B pruned (1.54 B) s17 -1.90%; Qwen2.5-3B-Instruct scaled (3.09 B) s17 -1.25%, s7 -1.47%
 #   qwen3   Qwen3-1.7B-Base re-init (1.72 B) s17 -2.70% (needed FIELD_BF16_MIN_B=0.3)
-#   llama   Llama-3.2-1B-Instruct re-init (1.24 B) s17 -1.54% (control: the old v2 adapter, not today's fp32 FIELD)
+#   llama   Llama-3.2-1B-Instruct re-init (1.24 B) s17 -1.54% (control: the old v2 adapter, not today's fp32 FIELD;
+#           family OFF, see below)
 #   gemma2  gemma-2-2b re-init (2.61 B) s17 -3.27% (0.75 h)
 #   lfm2    LFM2.5-1.2B-Instruct pruned (1.17 B) s7 -0.64%, s17 -1.66%; LFM2.5-2.6B scaled (2.70 B) s17 -1.31%
 # Sizes tested on damaged bases: 1.17-3.09 B (clean Qwen2-0.5B, 0.49 B, two seeds). Nothing above the 3.5 B FIELD cap.
@@ -226,7 +227,10 @@ DAMAGED_BASE_FAMILIES: dict[str, dict[str, Any]] = {
               "vocabs": frozenset({151936}), "tested_params_b": (1.54, 3.09)},
     "qwen3": {"enabled": True, "max_params_b": FIELD_FULL_MAX_PARAMS_B, "bf16_min_b": 0.3, "lr_mult": 1.0,
               "vocabs": frozenset({151936}), "tested_params_b": (1.72, 1.72)},
-    "llama": {"enabled": True, "max_params_b": FIELD_FULL_MAX_PARAMS_B, "bf16_min_b": 0.3, "lr_mult": 1.0,
+    # llama OFF (executor decision 2026-09-23): production already trains Llama-3.2-1B on the FIELD route in fp32 master
+    # + AdamW; the llama pair tested the old v2 adapter vs bf16 FIELD, not production fp32 FIELD vs bf16, so switching a
+    # damaged llama to bf16 / paged 8-bit is untested. Off = damaged llama bases keep exactly the c0dc300 route.
+    "llama": {"enabled": False, "max_params_b": FIELD_FULL_MAX_PARAMS_B, "bf16_min_b": 0.3, "lr_mult": 1.0,
               "vocabs": frozenset({128256}), "tested_params_b": (1.24, 1.24)},
     "gemma2": {"enabled": True, "max_params_b": FIELD_FULL_MAX_PARAMS_B, "bf16_min_b": 2.0, "lr_mult": 1.0,
                "vocabs": frozenset({256000}), "tested_params_b": (2.61, 2.61)},
@@ -240,7 +244,8 @@ DAMAGED_BASE_ROUTE_DEFAULT = "1"
 # "zero_fraction" (pruning only, reference-free) is opt-in via FORGE_V2_DAMAGE_DETECTORS until the executor admits it.
 # "fingerprint" (2026-09-22) is the damage-detector README rule against the shipped offline table
 # routing/data/base_fingerprints.json (norm-hash source identification + first-16 KiB prefix comparison, local
-# pruning / bf16-scaling fallback); offline validation 29/29 damaged (all seven pair bases above), 0/27 false alarms
+# pruning / bf16-scaling fallback); offline validation with the strict structure rule (46ce97e+): 28/29 damaged (all
+# seven pair bases above) + 1 "unknown" (open_llama-3b-v2: the re-save drops 26 rotary inv_freq buffers), 54/54 clean
 # (research/20260922-prod-patch/FINGERPRINT-TABLE.md). FORGE_V2_DAMAGE_DETECTORS=identity restores the 681901f set.
 DAMAGE_DETECTORS_DEFAULT: tuple[str, ...] = ("identity", "fingerprint")
 

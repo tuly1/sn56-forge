@@ -6,8 +6,9 @@ adapter entries trailed the winner by a median 21% against 5.7% for full-weight 
 full weights (research/20260922-damaged-base-audit/FINDINGS.md).
 
 ``assess`` combines named detectors into one verdict and never raises:
-  "clean"    the identity check found a byte-identical public checkpoint (overrides every statistic)
-  "damaged"  otherwise, at least one enabled detector says damaged
+  "clean"    the identity check found a byte-identical public checkpoint (overrides every other verdict), or, when no
+             detector says "damaged", the fingerprint found a prefix-identical one
+  "damaged"  otherwise, at least one enabled detector says damaged (outranks a prefix-only "clean")
   "unknown"  anything else (no table, oversized, error, a different checkpoint of the same shape, no detector)
 Callers treat only "damaged" as a reason to change routes.
 
@@ -43,8 +44,24 @@ from forge.routing.base_identity import ALTERED, IDENTICAL, is_protected
 
 DAMAGED, CLEAN, UNKNOWN = "damaged", "clean", "unknown"
 
+def reference_id(name: Any) -> str | None:
+    """Canonical public-checkpoint id shared by the detectors: base_identity table keys ("Qwen__Qwen2.5-3B-Instruct")
+    and fingerprint sources ("Qwen/Qwen2.5-3B-Instruct") both map to "qwen/qwen2.5-3b-instruct"."""
+    if not name:
+        return None
+    return str(name).strip().replace("__", "/").lower() or None
+
+
 def identity_signature(model_dir: str, identity: dict[str, Any] | None) -> dict[str, Any]:
-    """Damage verdict from a forge.routing.base_identity.identify report (no extra I/O)."""
+    """Damage verdict from a forge.routing.base_identity.identify report (no extra I/O). ``exact`` marks a verdict
+    backed by a full-tensor byte comparison with ``reference``: it is authoritative for that reference (combine)."""
+    out = _identity_signature(identity)
+    out["reference"] = reference_id((identity or {}).get("candidate"))
+    out["exact"] = bool(out["reference"]) and (identity or {}).get("status") in (IDENTICAL, ALTERED)
+    return out
+
+
+def _identity_signature(identity: dict[str, Any] | None) -> dict[str, Any]:
     if not identity:
         return {"verdict": UNKNOWN, "reason": "no_identity_report"}
     status = identity.get("status")
@@ -54,6 +71,8 @@ def identity_signature(model_dir: str, identity: dict[str, Any] | None) -> dict[
         return {"verdict": UNKNOWN, "reason": f"identity_{status}"}
     if int(identity.get("missing") or 0) or int(identity.get("extra") or 0):
         return {"verdict": UNKNOWN, "reason": "tensor_set_differs"}
+    if int(identity.get("structure_changed") or 0):
+        return {"verdict": UNKNOWN, "reason": "structure_differs"}  # dtype re-save / reshape: a re-export
     if int(identity.get("altered") or 0) <= 0:
         return {"verdict": UNKNOWN, "reason": "nothing_altered"}
     if identity.get("protected") is None or int(identity.get("protected") or 0) <= 0:
@@ -127,7 +146,8 @@ def zero_fraction(model_dir: str, identity: dict[str, Any] | None = None, *, sam
 # of every 1-D tensor (norms / biases: the source-identification key) and sha256(model_id)[:16]. Built by
 # research/20260922-prod-patch/fingerprints/build_fingerprints.py with HTTP range reads; no network at task time.
 #
-# Rule (validated offline on the 29 validator-damaged / 27 clean public pairs: 29/29 damaged, 0/27 false alarms):
+# Rule (offline on 29 validator-damaged / 27 clean public bases, anonymous and name-hash arguments: 28/29 damaged +
+# 1 "unknown" - open_llama-3b-v2, whose re-save drops 26 rotary inv_freq buffers (structure differs) - and 54/54 clean):
 #   1. candidate source: the model argument (literal id or its unsalted name hash) and/or every validator-protected
 #      1-D tensor (name contains "norm"; the validator never touches norms) byte-identical to one table entry.
 #   2. compare the first 16 KiB of every tensor with that entry. The tensor set, dtypes and shapes must match exactly
@@ -438,6 +458,7 @@ def fingerprint(model_dir: str, identity: dict[str, Any] | None = None, model_na
 DETECTORS: dict[str, Callable[..., dict[str, Any]]] = {"identity": identity_signature, "zero_fraction": zero_fraction,
                                                        "fingerprint": fingerprint}
 _NAME_AWARE = {"fingerprint"}
+EXACT_DETECTORS = frozenset({"identity"})  # verdicts from full-tensor byte hashes (strongest evidence)
 
 
 def register(name: str, fn: Callable[..., dict[str, Any]]) -> None:
@@ -461,12 +482,44 @@ def assess(model_dir: str, *, identity: dict[str, Any] | None, detectors: Sequen
             results[name] = rep if isinstance(rep, dict) else {"verdict": UNKNOWN, "reason": "bad_result"}
         except Exception as exc:  # noqa: BLE001 - detection is advisory; the caller keeps its route
             results[name] = {"verdict": UNKNOWN, "reason": f"{type(exc).__name__}: {exc}"}
-    verdicts = [r.get("verdict") for r in results.values()]
-    if CLEAN in verdicts:  # a byte-identical public checkpoint is proof; no statistic overrides it
-        verdict = CLEAN
-    elif DAMAGED in verdicts:
-        verdict = DAMAGED
-    else:
-        verdict = UNKNOWN
+    verdict, reason = combine(results)
     by = [n for n, r in results.items() if r.get("verdict") == verdict] if verdict != UNKNOWN else []
-    return {"verdict": verdict, "by": by, "detectors": results, "seconds": round(time.monotonic() - t0, 2)}
+    return {"verdict": verdict, "reason": reason, "by": by, "detectors": results,
+            "seconds": round(time.monotonic() - t0, 2)}
+
+
+def _ref(result: dict[str, Any]) -> str | None:
+    return reference_id(result.get("reference") or result.get("source"))
+
+
+def combine(results: dict[str, dict[str, Any]]) -> tuple[str, str]:
+    """Evidence precedence over detector verdicts (Codex review 2026-09-23). Each verdict names the public reference it
+    was judged against (None = reference-free statistic); ``exact`` verdicts come from full-tensor byte hashes.
+      1. an exact verdict "clean" (the base IS reference A, byte for byte) -> "clean";
+      2. an exact verdict about reference A is authoritative for A: any prefix / statistic verdict about the same A is
+         discarded (tail-only alteration -> exact "damaged"; embedding altered after byte 16384 -> exact "unknown";
+         dtype / shape / tensor-set change -> exact "unknown");
+      3. the remaining positive verdicts ("damaged" / "clean": "this is a copy of X") must agree on one reference;
+         different references -> "unknown". A "clean" against a reference-free "damaged" -> "unknown";
+      4. then "damaged" if any, else "clean" if any, else "unknown".
+    An exact "unknown" about A is not a positive claim: it does not veto a prefix verdict about a different tabled
+    reference B (e.g. a damaged Qwen/Qwen2.5-1.5B read against the Qwen2.5-1.5B-Instruct identity table)."""
+    exact = {n: r for n, r in results.items() if n in EXACT_DETECTORS and r.get("exact")}
+    if any(r.get("verdict") == CLEAN for r in exact.values()):
+        return CLEAN, "exact_identity"
+    exact_refs = {_ref(r) for r in exact.values()} - {None}
+    kept = {n: r for n, r in results.items() if n in exact or _ref(r) is None or _ref(r) not in exact_refs}
+    damaged = [r for r in kept.values() if r.get("verdict") == DAMAGED]
+    clean = [r for r in kept.values() if r.get("verdict") == CLEAN]
+    named = {_ref(r) for r in damaged + clean} - {None}
+    if len(named) > 1:
+        return UNKNOWN, "contradictory_references"
+    if not damaged:
+        if clean:
+            return CLEAN, "prefix_identity"
+        ex = [r for r in exact.values() if r.get("verdict") == UNKNOWN]
+        return UNKNOWN, (f"exact_identity:{ex[0].get('reason')}" if ex else "no_verdict")
+    if clean and any(_ref(r) is None for r in damaged + clean):
+        return UNKNOWN, "contradictory_reference_free"
+    return DAMAGED, ("exact_identity_altered" if any(n in exact for n, r in kept.items() if r.get("verdict") == DAMAGED)
+                     else "damaged")

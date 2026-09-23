@@ -49,6 +49,9 @@ EXECUTED = {
                          dict(eff=48, unit=1472, packed=False, micro=33, accum=2)),
 }
 GATE_DATA = dict(n_gpus=1, is_kl=False, n_rows=70052, total_tokens=21_339_784)  # closed q2-grammar fixture
+# llama is OFF for this release (executor decision 2026-09-23): production already runs Llama-3.2-1B on FIELD fp32 +
+# AdamW and the llama arm's control was the old adapter, so bf16 vs production fp32 FIELD is untested
+ENABLED_ARMS = sorted(n for n, v in EXECUTED.items() if v[0] != "llama")
 
 
 @pytest.fixture(autouse=True)
@@ -63,7 +66,7 @@ def _knobs(mt, params_b, *, damaged):
     return {k: r[k] for k in ("bf16", "lr_mult", "eff_batch", "strategy")}
 
 
-@pytest.mark.parametrize("name", sorted(EXECUTED))
+@pytest.mark.parametrize("name", ENABLED_ARMS)
 def test_damaged_route_equals_the_executed_env(monkeypatch, name):
     mt, params_b, vocab, env, ex = EXECUTED[name]
     gate = dict(GATE_DATA, params_b=params_b, model_type=mt, vocab_size=vocab)
@@ -94,7 +97,8 @@ def test_damaged_route_equals_the_executed_env(monkeypatch, name):
 
 def test_family_table_matches_the_executed_thresholds():
     fam = sft_v2.DAMAGED_BASE_FAMILIES
-    assert {k for k, v in fam.items() if v["enabled"]} == {"qwen2", "qwen3", "llama", "gemma2", "lfm2"}
+    assert {k for k, v in fam.items() if v["enabled"]} == {"qwen2", "qwen3", "gemma2", "lfm2"}
+    assert fam["llama"]["enabled"] is False
     assert {k: v["bf16_min_b"] for k, v in fam.items()} == {"qwen2": 0.3, "qwen3": 0.3, "llama": 0.3, "gemma2": 2.0,
                                                             "lfm2": 0.3}
     assert all(v["lr_mult"] == 1.0 for v in fam.values())
@@ -106,7 +110,7 @@ def test_family_table_matches_the_executed_thresholds():
         assert fam[mt]["vocabs"] is None or vocab in fam[mt]["vocabs"], name
 
 
-@pytest.mark.parametrize("mt", ["qwen2", "qwen3", "llama", "gemma2", "lfm2"])
+@pytest.mark.parametrize("mt", ["qwen2", "qwen3", "gemma2", "lfm2"])
 def test_size_cap_is_the_field_cap(mt):
     vocab = {"qwen2": 151936, "qwen3": 151936, "llama": 128256, "gemma2": 256000, "lfm2": 128000}[mt]
     gate = dict(GATE_DATA, model_type=mt, vocab_size=vocab, base_damage="damaged")
@@ -199,7 +203,7 @@ TODAY = {"qwen2-1.5b-pruned": (False, "lora"), "qwen2-3b-scaled": (False, "lora"
          "lfm2-2.6b-scaled": (True, "full")}
 
 
-@pytest.mark.parametrize("name", sorted(EXECUTED))
+@pytest.mark.parametrize("name", ENABLED_ARMS)
 def test_dispatch_damaged_clean_unknown(monkeypatch, tmp_path, name):
     mt, params_b, vocab, _, ex = EXECUTED[name]
     routes, ev, calls = _dispatch(monkeypatch, tmp_path / "damaged", mt, params_b, vocab, "damaged")
@@ -215,8 +219,28 @@ def test_dispatch_damaged_clean_unknown(monkeypatch, tmp_path, name):
         assert (routes[0]["field"], routes[0]["strategy"], routes[0]["damaged"]) == (field, strategy, False)
         if field:  # today's field recipe on a clean base (llama-1B stays fp32 master; LFM-2.6B bf16)
             assert routes[0]["recipe"] == _knobs(mt, params_b, damaged=False)
-    if name == "llama-1b-reinit":
-        assert _knobs(mt, params_b, damaged=False)["bf16"] is False  # clean Llama-3.2-1B keeps its fp32 master
+
+
+@pytest.mark.parametrize("vocab", [128256, 32000])
+def test_damaged_llama_keeps_the_exact_production_route(monkeypatch, tmp_path, vocab):
+    """Family OFF: a damaged Llama-3.2-1B(-shaped) base takes exactly the c0dc300 route - FIELD full, fp32 master +
+    AdamW (no bf16 / paged 8-bit), LR x1.0, champion bucket 100 - and damage detection does not even run."""
+    mt, params_b, _, _, ex = EXECUTED["llama-1b-reinit"]
+    assert sft_v2.damaged_base_admits(mt, "damaged", params_b, vocab) is False
+    gate = dict(GATE_DATA, params_b=params_b, model_type=mt, vocab_size=vocab)
+    assert sft_v2.field_full_route(**gate, base_damage="damaged") is sft_v2.field_full_route(**gate) is (vocab == 128256)
+    # c0dc300's recipe helpers, called exactly as c0dc300 called them (no damaged flag)
+    c0dc300 = {"bf16": sft_v2._field_bf16_enabled(mt) and params_b >= sft_v2._field_bf16_min_b(mt),
+               "lr_mult": sft_v2._field_lr_mult(mt), "eff_batch": sft_v2.field_eff_batch(params_b), "strategy": "full"}
+    assert c0dc300 == {"bf16": False, "lr_mult": 1.0, "eff_batch": 100, "strategy": "full"}
+    for verdict in ("damaged", "clean", "unknown"):
+        routes, ev, calls = _dispatch(monkeypatch, tmp_path / f"{vocab}-{verdict}", mt, params_b, vocab, verdict)
+        assert calls == [] and "base_damage" not in ev
+        if vocab == 128256:
+            assert routes == [{"handler": "sft_v2", "field": True, "damaged": False, "clean_small_qwen": False,
+                               "strategy": "full", "recipe": c0dc300}]
+        else:  # TinyLlama-shaped vocabulary: not the validated Llama-3.2, today's adapter route
+            assert (routes[0]["field"], routes[0]["damaged"]) == (False, False)
 
 
 def test_dispatch_family_switch_off_restores_today(monkeypatch, tmp_path):
