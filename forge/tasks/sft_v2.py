@@ -276,6 +276,32 @@ def damaged_base_family_enabled(model_type: str | None) -> bool:
     return _field_full() and _damaged_base_route() and str(model_type or "").lower() in damaged_base_types()
 
 
+# Window-aware eval governor: OFF in production until validated (research/20260923-replay-bench/phase-f).
+EVAL_SLACK_DEFAULT = "0"
+
+
+def _eval_slack() -> bool:
+    return os.environ.get("FORGE_V2_EVAL_SLACK", EVAL_SLACK_DEFAULT).strip() == "1"
+
+
+def governed_eval_every(eval_every: int, per_eval_s: float, t_step: float, total_steps: int,
+                        window_s: float | None) -> tuple[int, dict | None]:
+    """Dev-eval interval after the first eval. Flat rule: keep evaluation under ~6% of training time. Window-aware
+    rule (window_s given, i.e. FORGE_V2_EVAL_SLACK=1): when the planned phase leaves wall-clock slack, spend up to half
+    of it on denser evals; short full-weight runs (Qwen2-0.5B trdpo: 4 epochs in ~5 of 45 min) otherwise select from
+    ~3 dev points. Never denser than the planned interval, never sparser than the flat rule. Returns (interval, info)."""
+    widened = int(math.ceil(per_eval_s / (0.06 * max(t_step, 1e-3))))
+    info = None
+    if window_s:
+        slack = window_s - total_steps * t_step
+        if slack > 0:
+            slack_every = max(eval_every, int(math.ceil(total_steps * per_eval_s / (0.5 * slack))))
+            if slack_every < widened:
+                info = {"flat_rule": widened, "slack_s": round(slack, 1), "per_eval_s": round(per_eval_s, 1)}
+                widened = slack_every
+    return widened, info
+
+
 def _clean_small_qwen() -> bool:
     return os.environ.get("FORGE_V2_CLEAN_SMALL_QWEN", CLEAN_SMALL_QWEN_FIELD_ROUTE_DEFAULT).strip() == "1"
 
@@ -1539,9 +1565,10 @@ def run(
     ema: dict[str, Any] = {}
 
     class SelectCallback(TrainerCallback):
-        def __init__(self, eval_every: int, total_steps: int) -> None:
+        def __init__(self, eval_every: int, total_steps: int, window_s: float | None = None) -> None:
             self.eval_every = eval_every
             self.total_steps = total_steps
+            self.window_s = window_s
             self.governed = False
             self.ema_start = int(total_steps * (1.0 - _ema_frac)) if _ema_frac > 0 else None
             self.ema_n = 0
@@ -1608,7 +1635,10 @@ def run(
                 # keep evaluation (incl. persistence) under ~6% of training time
                 self.governed = True
                 per_eval = dt + 0.5 * (state["persist_secs"] / max(1, state["eval_count"]))
-                widened = int(math.ceil(per_eval / (0.06 * max(t_step, 1e-3))))
+                widened, slack_info = governed_eval_every(self.eval_every, per_eval, t_step, self.total_steps,
+                                                          self.window_s if _eval_slack() else None)
+                if slack_info:
+                    _event_and_print("sft_v2_eval_governor_slack", eval_every=widened, **slack_info)
                 if widened > self.eval_every:
                     _event_and_print("sft_v2_eval_governor", eval_every=widened, eval_s=round(dt, 1))
                     self.eval_every = widened
@@ -1726,7 +1756,7 @@ def run(
         state["phase_evals"] = 0
         _event_and_print("sft_v2_plan", phase=phase, lr=phase_lr, t_per_step=t_step, epochs=epochs, total_steps=total_steps,
                          warmup=warmup, eval_every=eval_every, window_s=round(window, 1), epochs_done=round(state["epochs_done"], 3))
-        cb = SelectCallback(eval_every, total_steps)
+        cb = SelectCallback(eval_every, total_steps, window_s=window)
         trainer = TrainerCls(
             model=model, args=make_args(epochs, phase_lr, warmup, geo.micro_batch, geo.grad_accum,
                                         seed=_seed_base + (1000 if seed_b_active else phase)),
