@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from forge.routing import base_identity as bid
+from forge.routing import identity_report as idr
 from forge.routing import damage
 from forge.tasks import sft_v2
 
@@ -168,13 +169,13 @@ def test_shipped_same_shape_checkpoints_are_not_mistaken_for_damage():
     # other's table is "altered" but not "damaged"
     a = json.loads((bid.TABLES_DIR / "Qwen__Qwen2-1.5B-Instruct.json").read_text())["tensors"]
     b = json.loads((bid.TABLES_DIR / "Qwen__Qwen2.5-1.5B-Instruct.json").read_text())["tensors"]
-    rep = bid.compare(a, b)
+    rep = idr.compare(a, b)
     assert rep["status"] == "altered" and rep["protected"] > 0 and rep["protected_altered"] > 0
     assert damage.identity_signature("", rep)["verdict"] == "unknown"
     # a validator-style augmentation of b (weights changed, norms / embeddings untouched) is "damaged"
-    damaged = {k: (dict(v, sha256="0" * 64) if not bid.is_protected(k) and k.endswith("proj.weight") else v)
+    damaged = {k: (dict(v, sha256="0" * 64) if not idr.is_protected(k) and k.endswith("proj.weight") else v)
                for k, v in b.items()}
-    rep = bid.compare(damaged, b)
+    rep = idr.compare(damaged, b)
     assert rep["protected_altered"] == 0 and rep["altered"] > 0
     assert damage.identity_signature("", rep)["verdict"] == "damaged"
 
@@ -254,7 +255,7 @@ def _dispatch(monkeypatch, tmp_path, model_type, *, identity=None, params_b=None
         calls["identify"] += 1
         return dict(identity or {"status": "unknown", "reason": "no_matching_table"})
 
-    monkeypatch.setattr(bid, "identify", identify)
+    monkeypatch.setattr(idr, "identify", identify)
     if zero is not None:
         monkeypatch.setitem(damage.DETECTORS, "zero_fraction", lambda d, i: {"verdict": zero})
 

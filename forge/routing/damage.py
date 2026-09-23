@@ -40,7 +40,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
-from forge.routing.base_identity import ALTERED, IDENTICAL, is_protected
+from forge.routing.identity_report import ALTERED, IDENTICAL, is_protected
 
 DAMAGED, CLEAN, UNKNOWN = "damaged", "clean", "unknown"
 
@@ -53,18 +53,19 @@ def reference_id(name: Any) -> str | None:
 
 
 def identity_signature(model_dir: str, identity: dict[str, Any] | None) -> dict[str, Any]:
-    """Damage verdict from a forge.routing.base_identity.identify report (no extra I/O). ``exact`` marks a verdict
+    """Damage verdict from a forge.routing.identity_report.identify report (no extra I/O). ``exact`` marks a verdict
     backed by a full-tensor byte comparison with ``reference``: it is authoritative for that reference (combine)."""
     out = _identity_signature(identity)
     out["reference"] = reference_id((identity or {}).get("candidate"))
-    out["exact"] = bool(out["reference"]) and (identity or {}).get("status") in (IDENTICAL, ALTERED)
+    rep = identity or {}
+    out["exact"] = bool(out["reference"]) and rep.get("exact_status", rep.get("status")) in (IDENTICAL, ALTERED)
     return out
 
 
 def _identity_signature(identity: dict[str, Any] | None) -> dict[str, Any]:
     if not identity:
         return {"verdict": UNKNOWN, "reason": "no_identity_report"}
-    status = identity.get("status")
+    status = identity.get("exact_status", identity.get("status"))  # strict: dtype / shape changes are not identical
     if status == IDENTICAL:
         return {"verdict": CLEAN, "reason": "identical"}
     if status != ALTERED:

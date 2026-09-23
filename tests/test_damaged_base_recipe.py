@@ -161,7 +161,7 @@ _spec.loader.exec_module(contract)
 
 def _dispatch(monkeypatch, tmp_path, mt, params_b, vocab, verdict, env=None):
     from forge import cli
-    from forge.routing import base_identity as bid
+    from forge.routing import identity_report as idr
     from forge.tasks import instruct
 
     tmp_path.mkdir(parents=True, exist_ok=True)
@@ -172,7 +172,7 @@ def _dispatch(monkeypatch, tmp_path, mt, params_b, vocab, verdict, env=None):
     seen["model_paths"].clear()
     loaded.model.config.vocab_size = vocab
     monkeypatch.setattr(instruct, "model_param_billions", lambda m: params_b)
-    monkeypatch.setattr(bid, "identify", lambda d, **kw: {"status": "unknown", "reason": "no_matching_table"})
+    monkeypatch.setattr(idr, "identify", lambda d, **kw: {"status": "unknown", "reason": "no_matching_table"})
     calls = []
 
     def assess(model_dir, *, identity, detectors, model_name=None):

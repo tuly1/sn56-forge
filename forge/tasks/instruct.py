@@ -833,11 +833,14 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             telemetry.event("base_identity_skipped", reason="short_rows", median_tokens=median_len)
         if (_identity_family and _identity_rows) or _damage_family:
             # exact per-tensor comparison with the shipped public tables; any doubt keeps the adapter route
-            from forge.routing import base_identity as _bid
-            _rep = _bid.identify(spec.cached_model_dir)
+            # identity_report.identify = base_identity.identify (same candidate / status, one hash pass) + the exact
+            # fields damage detection needs; base_identity.py itself is byte-pinned by the Gemma admission
+            from forge.routing import identity_report as _idr
+            _rep = _idr.identify(spec.cached_model_dir)
             telemetry.event("base_identity", **{k: _rep.get(k) for k in ("status", "candidate", "n_tensors", "altered",
                                                                        "missing", "extra", "protected", "protected_altered",
-                                                                       "seconds", "reason")})
+                                                                       "structure_changed", "exact_status", "seconds",
+                                                                       "reason")})
         if _rep is not None and _identity_family and _identity_rows:
             _base_identity = _rep.get("status")
             _base_candidate = _rep.get("candidate")

@@ -219,6 +219,7 @@ def test_tail_only_alteration_exact_identity_outranks_prefix_clean(world):
     """Codex review 2026-09-23: a tensor altered only after byte 16384 is prefix-identical (fingerprint "clean") but not
     byte-identical; the exact full-tensor identity verdict "damaged" must win."""
     from forge.routing import base_identity as bid
+    from forge.routing import identity_report as idr
 
     t = dict(world["tensors"])
     name = "model.layers.1.mlp.down_proj.weight"            # 128 x 256 bf16 = 64 KiB
@@ -229,7 +230,7 @@ def test_tail_only_alteration_exact_identity_outranks_prefix_clean(world):
     d = _save(world, "tail-only", t)
     fp = damage.fingerprint(d, None)
     assert fp["verdict"] == "clean" and fp["reason"] == "prefix_identical"   # the prefix cannot see it
-    rep = bid.compare(bid.hash_safetensors(d), bid.hash_safetensors(str(world["pub"])))
+    rep = idr.compare(bid.hash_safetensors(d), bid.hash_safetensors(str(world["pub"])))
     rep["candidate"] = "org__Pub-1B"  # identify() names the matched table key
     assert rep["status"] == "altered" and rep["altered"] == 1 and rep["protected_altered"] == 0
     assert damage.identity_signature(d, rep)["verdict"] == "damaged"
@@ -238,7 +239,7 @@ def test_tail_only_alteration_exact_identity_outranks_prefix_clean(world):
     assert out["reason"] == "exact_identity_altered"  # exact vs org/Pub-1B supersedes the prefix "clean" vs org/Pub-1B
     assert damage.assess(d, identity=rep, detectors=("fingerprint", "identity"))["verdict"] == "damaged"  # order-free
     # exact identity "clean" still outranks everything; prefix "clean" stands only when nothing says "damaged"
-    same = dict(bid.compare(bid.hash_safetensors(str(world["pub"])), bid.hash_safetensors(str(world["pub"]))),
+    same = dict(idr.compare(bid.hash_safetensors(str(world["pub"])), bid.hash_safetensors(str(world["pub"]))),
                 candidate="org__Pub-1B")
     out = damage.assess(str(world["pub"]), identity=same, detectors=("identity", "fingerprint"))
     assert out["verdict"] == "clean" and out["reason"] == "exact_identity"
@@ -313,7 +314,8 @@ def test_combine_precedence(results, expected):
 
 def _exact(world, d):
     from forge.routing import base_identity as bid
-    return dict(bid.compare(bid.hash_safetensors(d), bid.hash_safetensors(str(world["pub"]))), candidate="org__Pub-1B")
+    from forge.routing import identity_report as idr
+    return dict(idr.compare(bid.hash_safetensors(d), bid.hash_safetensors(str(world["pub"]))), candidate="org__Pub-1B")
 
 
 def _alter(t, name, *, after_prefix=False, factor=0.5):
