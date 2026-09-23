@@ -166,7 +166,53 @@ def test_dtype_resave_and_embedding_change_are_unknown(world):
     dt, x = t["model.layers.0.self_attn.q_proj.weight"]
     t["model.layers.0.self_attn.q_proj.weight"] = (dt, x + np.float32(0.01))
     rep = damage.fingerprint(_save(world, "emb", t), None)
-    assert rep["verdict"] == "unknown" and rep["reason"].startswith("protected_tensor_differs:"), rep
+    assert rep["verdict"] == "unknown" and rep["reason"] == "protected_tensor_differs", rep  # final: no fallback
+
+
+# ---- structural mismatch is never "damaged" (Codex review 2026-09-23) ------------------------------------------------
+_CMP = dict(same=10, differ=3, differ_protected=0, dtype_or_shape_changed=0, missing=0, extra=0, n_ref=13)
+
+
+@pytest.mark.parametrize("kw,verdict,reason", [
+    ({}, "damaged", "prefix_mismatch"),
+    (dict(missing=1), "unknown", "structure_differs"),
+    (dict(extra=2), "unknown", "structure_differs"),
+    (dict(dtype_or_shape_changed=1), "unknown", "structure_differs"),
+    (dict(missing=1, extra=1, dtype_or_shape_changed=4), "unknown", "structure_differs"),
+    (dict(missing=1, differ=0), "unknown", "structure_differs"),          # nothing differs but the set is incomplete
+    (dict(differ=0), "clean", "prefix_identical"),
+    (dict(differ_protected=1), "unknown", "protected_tensor_differs"),
+    (dict(same=0), "unknown", "nothing_identical"),
+])
+def test_verdict_from_compare_structure(kw, verdict, reason):
+    assert damage._verdict_from_compare(dict(_CMP, **kw)) == (verdict, reason)
+
+
+
+@pytest.mark.parametrize("case", ["missing", "extra", "dtype", "shape", "combined", "pruned_missing"])
+def test_structurally_different_damaged_copy_is_unknown(world, case):
+    t = _augment(world["tensors"], "magnitude_pruning", 0.4, 5, "all_layers") if case == "pruned_missing" \
+        else _augment(world["tensors"], "weight_scaling", 0.62, 3)
+    if case in ("missing", "combined", "pruned_missing"):
+        t.pop("model.layers.2.self_attn.q_proj.weight")
+    if case in ("extra", "combined"):
+        t["model.layers.3.mlp.gate_proj.weight"] = ("BF16", np.ones((128, 256), np.float32) * 0.01)
+    if case in ("dtype", "combined"):
+        dt, x = t["model.layers.1.mlp.down_proj.weight"]
+        t["model.layers.1.mlp.down_proj.weight"] = ("F32", x)
+    if case == "shape":
+        dt, x = t["model.layers.1.mlp.down_proj.weight"]
+        t["model.layers.1.mlp.down_proj.weight"] = (dt, x.reshape(256, 128))
+    d = _save(world, f"struct-{case}", t)
+    rep = damage.fingerprint(d, None, model_name="a1b2c3d4e5f60718")
+    assert rep["source"] == "org/Pub-1B" and rep["identified_by"] == "norms"  # norms still name the public source
+    assert rep["verdict"] == "unknown" and rep["reason"] == "structure_differs", rep
+    assert "reference_free" not in rep  # an identified source is final: pruning statistics cannot override it
+    assert damage.assess(d, identity=None, detectors=("identity", "fingerprint"))["verdict"] == "unknown"
+    # the same damage without the structural change is "damaged"
+    base = _augment(world["tensors"], "magnitude_pruning", 0.4, 5, "all_layers") if case == "pruned_missing" \
+        else _augment(world["tensors"], "weight_scaling", 0.62, 3)
+    assert damage.fingerprint(_save(world, f"struct-{case}-ok", base), None)["verdict"] == "damaged"
 
 
 def test_name_with_different_norms_is_not_trusted(world):

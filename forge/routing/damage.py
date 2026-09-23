@@ -130,8 +130,10 @@ def zero_fraction(model_dir: str, identity: dict[str, Any] | None = None, *, sam
 # Rule (validated offline on the 29 validator-damaged / 27 clean public pairs: 29/29 damaged, 0/27 false alarms):
 #   1. candidate source: the model argument (literal id or its unsalted name hash) and/or every validator-protected
 #      1-D tensor (name contains "norm"; the validator never touches norms) byte-identical to one table entry.
-#   2. compare the first 16 KiB of every tensor with that entry: any differing tensor -> "damaged"; every tensor
-#      present and identical -> "clean" (prefix-identical); dtype re-save / missing tensors -> "unknown".
+#   2. compare the first 16 KiB of every tensor with that entry. The tensor set, dtypes and shapes must match exactly
+#      (missing / extra tensors, dtype re-save or shape change -> "unknown"); then every tensor identical -> "clean"
+#      (prefix-identical); a norm / embedding differs -> "unknown"; otherwise >= 1 other tensor differs -> "damaged".
+#      An identified source's comparison is final (no reference-free fallback).
 #   3. source not in the table: local reference-free checks on the first 32 KiB of each per-layer matrix:
 #      magnitude pruning (>= 2 matrices with >= 10% exact zeros) or bf16 weight scaling (>= 3 matrices with >= 2%
 #      empty mantissa codes, unless >= 75% of the tested matrices are gapped) -> "damaged".
@@ -301,13 +303,19 @@ def compare_prefixes(fp: dict[str, Any], ref: dict[str, Any]) -> dict[str, Any]:
 
 
 def _verdict_from_compare(c: dict[str, Any]) -> tuple[str, str]:
-    if c["differ"] == 0 and c["dtype_or_shape_changed"] == 0 and c["missing"] == 0 and c["extra"] == 0:
+    """"damaged" only for the validator's augmentation signature: the tensor set, every dtype and every shape match the
+    fingerprint exactly, every norm / embedding prefix matches (the validator never touches them) and at least one
+    other tensor prefix differs. Any structural mismatch (missing / extra tensors, dtype re-save, shape change) is a
+    different or re-exported checkpoint -> "unknown" (the caller keeps its route), whatever the prefixes say."""
+    if c["missing"] or c["extra"] or c["dtype_or_shape_changed"]:
+        return UNKNOWN, "structure_differs"
+    if c["differ"] == 0:
         return CLEAN, "prefix_identical"
-    if c["differ"] > 0 and c["differ_protected"] == 0 and c["same"] > 0:
+    if c["differ_protected"] > 0:
+        return UNKNOWN, "protected_tensor_differs"  # a norm / embedding changed: another checkpoint, not augmentation
+    if c["same"] > 0:
         return DAMAGED, "prefix_mismatch"
-    if c["differ"] > 0:
-        return UNKNOWN, "protected_tensor_differs"  # an embedding changed: another checkpoint, not augmentation
-    return UNKNOWN, "not_comparable"  # dtype re-save, shape change or missing tensors with nothing differing
+    return UNKNOWN, "nothing_identical"
 
 
 def _mantissa_gap(u16: Any) -> float | None:
@@ -404,8 +412,9 @@ def fingerprint_assess(files: Sequence[Any], read: Callable[[Any, int, int], byt
             _, key, c = best
             verdict, table_reason = _verdict_from_compare(c)
             out.update(source=key, source_revision=table["models"][key].get("revision"), compare=c)
-            if verdict != UNKNOWN:
-                return {"verdict": verdict, "reason": table_reason, **out}
+            # a tabled source was identified: its comparison is final. A structurally different or norm-altered copy
+            # is "unknown"; the reference-free statistics are only for sources missing from the table.
+            return {"verdict": verdict, "reason": table_reason, **out}
     else:
         out["identified_by"] = "no_table"
     if not fallback:
