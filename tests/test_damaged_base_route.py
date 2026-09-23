@@ -1,7 +1,8 @@
-"""Damaged-base full route (2026-09-22): on a validator-damaged base an enabled family takes the FIELD full route with
-the recipe of the 2026-09-22 pairs (bf16 + paged 8-bit AdamW from 0.3 B, LR x1.0, no family vocabulary / minimum-size
-gate); the row / token floors still apply. Clean and unknown bases keep today's routes. Families are data-driven
-(sft_v2.DAMAGED_BASE_FAMILIES): qwen2 and lfm2 on, llama / gemma2 / qwen3 off."""
+"""Damaged-base full route (2026-09-22/23): on a validator-damaged base an enabled family takes the FIELD full route with
+the recipe its scored candidate arm ran (bf16 + paged 8-bit AdamW from the family's executed threshold, LR x1.0, tested
+vocabulary, no family minimum size); the row / token floors still apply. Clean and unknown bases keep today's routes.
+Families are data-driven (sft_v2.DAMAGED_BASE_FAMILIES): qwen2, qwen3, llama, gemma2 and lfm2 all on. The exact
+executed env / geometry equivalence is pinned in tests/test_damaged_base_recipe.py."""
 import importlib.util
 import json
 import struct
@@ -16,7 +17,7 @@ from forge.tasks import sft_v2
 ENV = ("FORGE_V2_FIELD", "FORGE_V2_FIELD_TYPES", "FORGE_V2_FIELD_MIN_ROWS", "FORGE_V2_FIELD_MIN_TOKENS",
        "FORGE_V2_FIELD_MAX_PARAMS_B", "FORGE_V2_FIELD_IDENTICAL_BASE", "FORGE_V2_FIELD_IDENTICAL_MAX_PARAMS_B",
        "FORGE_V2_FIELD_BF16", "FORGE_V2_FIELD_BF16_MIN_B", "FORGE_V2_FIELD_LR_MULT", "FORGE_V2_DAMAGED_BASE_ROUTE",
-       "FORGE_V2_DAMAGED_BASE_TYPES", "FORGE_V2_DAMAGE_DETECTORS")
+       "FORGE_V2_DAMAGED_BASE_TYPES", "FORGE_V2_DAMAGE_DETECTORS", "FORGE_V2_CLEAN_SMALL_QWEN", "FORGE_V2_STRATEGY")
 
 # (model_type, params_b, vocab) of the checkpoints behind each family's evidence or planned confirmation
 FAMILY = {
@@ -26,7 +27,7 @@ FAMILY = {
     "gemma2": (2.61, 256000),  # gemma-2-2b
     "qwen3": (1.72, 151936),   # Qwen3-1.7B-Base
 }
-ENABLED = {"qwen2", "lfm2"}
+ENABLED = {"qwen2", "lfm2", "llama", "gemma2", "qwen3"}
 
 
 @pytest.fixture(autouse=True)
@@ -67,15 +68,20 @@ def test_todays_routes_on_these_shapes_are_unchanged():
     # Llama-3.2-1B is already on the field route (deployed default since 2026-09-15), damaged or not
     assert {mt: _gate(mt) for mt in FAMILY} == {"qwen2": False, "lfm2": False, "llama": True, "gemma2": False,
                                                 "qwen3": False}
-    # a damaged llama outside its validated vocabulary stays off while llama is disabled
+    # a damaged llama outside its tested vocabulary (TinyLlama-shaped 32000) keeps today's route
     assert _gate("llama", vocab_size=32000, base_damage="damaged") is False
+    assert _gate("qwen3", vocab_size=152064, base_damage="damaged") is False
+    assert _gate("lfm2", vocab_size=12345, base_damage="damaged") is True  # lfm2: vocabulary gate bypassed, as executed
 
 
 @pytest.mark.parametrize("mt", sorted(ENABLED))
 def test_floors_and_hard_gates_still_apply_on_a_damaged_base(mt, monkeypatch):
     d = dict(base_damage="damaged")
-    assert _gate(mt, **d, n_rows=14999) is False                    # FIELD_FULL_MIN_ROWS 15000
-    assert _gate(mt, **d, total_tokens=7_999_999) is False          # FIELD_FULL_MIN_TOKENS 8M
+    rows, toks = sft_v2.field_full_min_rows(mt), sft_v2.field_full_min_tokens(mt)
+    assert (rows, toks) == ((10000, 5_000_000) if mt == "llama" else (15000, 8_000_000))
+    assert _gate(mt, **d, n_rows=rows - 1) is False                 # FIELD_FULL_MIN_ROWS (llama 10k)
+    assert _gate(mt, **d, total_tokens=toks - 1) is False           # FIELD_FULL_MIN_TOKENS (llama 5M)
+    assert _gate(mt, **d, n_rows=rows, total_tokens=toks) is True
     assert _gate(mt, **d, total_tokens=None, n_rows=None) is True   # unknown volume: same as the field route today
     assert _gate(mt, **d, params_b=3.51) is False                   # FIELD size cap
     assert _gate(mt, **d, params_b=7.6) is False
@@ -117,9 +123,11 @@ def test_identical_base_admission_is_untouched():
 
 
 def test_damaged_recipe_defaults(monkeypatch):
+    executed_min_b = {"qwen2": 0.3, "qwen3": 0.3, "llama": 0.3, "lfm2": 0.3, "gemma2": 2.0}
     for mt in FAMILY:
         assert sft_v2._field_bf16_enabled(mt, damaged_base=True) is True
-        assert sft_v2._field_bf16_min_b(mt, damaged_base=True) == 0.3
+        assert sft_v2._field_bf16_min_b(mt, damaged_base=True) == executed_min_b[mt]
+        assert FAMILY[mt][0] >= executed_min_b[mt]  # every tested base took the bf16 path
         assert sft_v2._field_lr_mult(mt, damaged_base=True) == 1.0
     # without the damaged flag the deployed defaults stand
     assert sft_v2._field_bf16_enabled("llama") is False and sft_v2._field_bf16_min_b("llama") == 2.0
@@ -304,6 +312,7 @@ def test_dispatch_lfm2_pruned_needs_a_detector(monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("mt", ["gemma2", "qwen3", "llama"])
 def test_dispatch_disabled_families_do_not_run_detection(monkeypatch, tmp_path, mt):
+    monkeypatch.setitem(sft_v2.DAMAGED_BASE_FAMILIES, mt, dict(sft_v2.DAMAGED_BASE_FAMILIES[mt], enabled=False))
     routes, ev, calls = _dispatch(monkeypatch, tmp_path, mt, identity=_report())
     assert "base_damage" not in ev and calls["identify"] == 0
     assert routes and routes[0].get("damaged", False) is False

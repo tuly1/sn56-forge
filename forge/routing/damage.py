@@ -20,7 +20,7 @@ research/20260922-damage-detector/):
                  fraction of exact zeros (validator pruning zeroes 25-50%; trained bf16 weights carry almost none).
                  Opt-in: it detects pruning only.
   fingerprint    (default ON since 2026-09-22) the research/20260922-damage-detector rule against the shipped offline
-                 table data/base_fingerprints.json.gz (73 pool models): source by norm hashes (+ model argument), first
+                 table data/base_fingerprints.json (73 pool models): source by norm hashes (+ model argument), first
                  16 KiB of every tensor compared; local pruning / bf16-scaling fallback when the source is not tabled.
                  Reads ~2-5 MB locally, < 0.1 s. See the section below and research/20260922-prod-patch/FINGERPRINT-TABLE.md.
 """
@@ -122,7 +122,7 @@ def zero_fraction(model_dir: str, identity: dict[str, Any] | None = None, *, sam
 # ---------------------------------------------------------------------------------------------------------------------
 # fingerprint (2026-09-22): research/20260922-damage-detector recommended rule against a shipped, offline table
 # ---------------------------------------------------------------------------------------------------------------------
-# data/base_fingerprints.json.gz holds, for every public model seen in the tournament pool (<= 35 B; the validator
+# data/base_fingerprints.json holds, for every public model seen in the tournament pool (<= 35 B; the validator
 # never augments larger ones), per-tensor {dtype, shape, sha256 of the first 16 KiB of stored bytes}, the full sha256
 # of every 1-D tensor (norms / biases: the source-identification key) and sha256(model_id)[:16]. Built by
 # research/20260922-prod-patch/fingerprints/build_fingerprints.py with HTTP range reads; no network at task time.
@@ -137,7 +137,9 @@ def zero_fraction(model_dir: str, identity: dict[str, Any] | None = None, *, sam
 #      empty mantissa codes, unless >= 75% of the tested matrices are gapped) -> "damaged".
 #   4. anything else -> "unknown" (the caller keeps its route). A name-hash miss alone is never evidence
 #      (MODEL_HASH_SALT would turn every task into a miss).
-FINGERPRINT_TABLE = Path(__file__).resolve().parent / "data" / "base_fingerprints.json.gz"
+# Shipped as plain, line-per-tensor JSON (readable source; no compressed blob in the submitted tree). load_table also
+# reads a gzip copy (.gz suffix) for research builds.
+FINGERPRINT_TABLE = Path(__file__).resolve().parent / "data" / "base_fingerprints.json"
 FINGERPRINT_SCHEMA = "sn56.base_fingerprints"
 FINGERPRINT_VERSION = 1
 PREFIX_BYTES = 16384          # bytes hashed per tensor (first 16 KiB of the stored data range)
@@ -237,7 +239,8 @@ def load_table(path: str | os.PathLike | None = None) -> dict[str, Any] | None:
     p = str(path or FINGERPRINT_TABLE)
     if p not in _TABLE_CACHE:
         try:
-            with gzip.open(p, "rt", encoding="utf-8") as fh:
+            opener = gzip.open if p.endswith(".gz") else open
+            with opener(p, "rt", encoding="utf-8") as fh:
                 t = json.load(fh)
             if t.get("schema") != FINGERPRINT_SCHEMA or int(t.get("version", 0)) != FINGERPRINT_VERSION:
                 return None

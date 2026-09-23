@@ -35,7 +35,7 @@ include = ["forge*"]
 
 [tool.setuptools.package-data]
 "forge.data" = ["chat_templates/*.jinja", "chat_templates/README.md"]
-"forge.routing" = ["base_hashes/*.json", "data/*.json.gz"]
+"forge.routing" = ["base_hashes/*.json", "data/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
