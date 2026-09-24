@@ -40,3 +40,50 @@ def test_switch_reads_env(monkeypatch):
     assert sft_v2._eval_slack()
     monkeypatch.setenv("FORGE_V2_EVAL_SLACK", "0")
     assert not sft_v2._eval_slack()
+
+
+class _Clock:
+    """Deadline stand-in whose remaining time falls as work (the seed-A soup) spends wall clock."""
+
+    def __init__(self, remaining):
+        self.remaining = remaining
+
+    def spend(self, s):
+        self.remaining -= s
+
+    def remaining_hard(self):
+        return self.remaining
+
+
+def test_seed_b_window_refresh_after_seed_a_soup():
+    # Codex review of 6912643 (P2): 1300 s window before the seed-A soup, soup spends 250 s, 800 steps at 1 s, 50 s/eval.
+    finish_reserve = 100.0
+    clock = _Clock(1300.0 + finish_reserve)
+    stale_window = clock.remaining_hard() - finish_reserve
+    clock.spend(250.0)                                   # greedy_soup + _reinit_lora
+    window, fits = sft_v2.seed_b_window(clock, finish_reserve, min_window=240.0)
+    assert window == 1050.0 and fits
+    assert sft_v2.governed_eval_every(100, 50.0, 1.0, 800, stale_window)[0] == 160   # stale: too dense
+    assert sft_v2.governed_eval_every(100, 50.0, 1.0, 800, window)[0] == 320         # refreshed
+
+
+def test_seed_b_window_no_fit_after_soup():
+    clock = _Clock(500.0)
+    clock.spend(300.0)
+    window, fits = sft_v2.seed_b_window(clock, finish_reserve=100.0, min_window=240.0)
+    assert window == 100.0 and not fits
+
+
+def test_refresh_is_gated_and_placed_after_seed_a_soup():
+    import inspect
+    src = inspect.getsource(sft_v2.run)
+    soup = src.index("loss_a, state_a, members_a = selection.greedy_soup(")
+    reinit = src.index("_reinit_lora(model, _seed_base + 1000)")
+    refresh = src.index("window, fits = seed_b_window(deadline, finish_reserve, min_window)")
+    plan = src.index('_event_and_print("sft_v2_plan"')
+    cb = src.index("cb = SelectCallback(eval_every, total_steps, window_s=window)")
+    assert soup < reinit < refresh < plan < cb
+    gate = src.rindex("if _eval_slack():", 0, refresh)
+    assert refresh - gate < 400                           # the refresh only runs with FORGE_V2_EVAL_SLACK=1
+    tail = src[refresh:refresh + 1200]
+    assert 'selection.load_state(model, seed_a["state"])' in tail and "two_seed = False" in tail and "break" in tail

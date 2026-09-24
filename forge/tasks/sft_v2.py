@@ -302,6 +302,13 @@ def governed_eval_every(eval_every: int, per_eval_s: float, t_step: float, total
     return widened, info
 
 
+def seed_b_window(deadline: Any, finish_reserve: float, min_window: float) -> tuple[float, bool]:
+    """Window for the seed-B plan, re-read after the seed-A greedy soup and adapter re-init (which spend wall clock:
+    Codex review of 6912643). Returns (window_s, fits)."""
+    window = deadline.remaining_hard() - finish_reserve
+    return window, window >= min_window
+
+
 def _clean_small_qwen() -> bool:
     return os.environ.get("FORGE_V2_CLEAN_SMALL_QWEN", CLEAN_SMALL_QWEN_FIELD_ROUTE_DEFAULT).strip() == "1"
 
@@ -1703,6 +1710,18 @@ def run(
                     state.update(best=float("inf"), best_step=0, overfit=0, stopped_overfit=False, last_eval_step=-1, phase_evals=0)
                     seed_b_active = True
                     _event_and_print("sft_v2_two_seed_a", dev_loss=round(loss_a, 6), members=members_a, need_s=round(need, 1), window_s=round(window, 1))
+                    if _eval_slack():
+                        # the soup and re-init spent part of `window`: plan seed B (and size the eval governor's slack)
+                        # from the live deadline; if seed B no longer fits, keep seed A exactly as the stage-b failure path does
+                        window, fits = seed_b_window(deadline, finish_reserve, min_window)
+                        if not fits:
+                            _event_and_print("sft_v2_two_seed_b_no_fit", window_s=round(window, 1), min_window_s=round(min_window, 1))
+                            selection.load_state(model, seed_a["state"])
+                            pool.items = [{"loss": seed_a["loss"], "step": seed_a["step"], "state": seed_a["state"]}]
+                            state["best"], state["best_step"] = seed_a["loss"], seed_a["step"]
+                            seed_b_active = False
+                            two_seed = False
+                            break
                 except Exception as exc:
                     _event_and_print("sft_v2_two_seed_failed", stage="a", error=f"{type(exc).__name__}: {exc}")
                     two_seed = False
