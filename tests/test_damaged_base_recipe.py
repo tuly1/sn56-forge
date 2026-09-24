@@ -252,15 +252,59 @@ def test_dispatch_family_switch_off_restores_today(monkeypatch, tmp_path):
     assert (routes[0]["field"], routes[0]["strategy"]) == (False, "lora")
 
 
-# ---- clean small-Qwen: a named constant, default OFF --------------------------------------------------------------
+# ---- clean small-Qwen: default ON (2026-09-24), with its own data floors ---------------------------------------------
 
-def test_clean_small_qwen_is_off_by_default(monkeypatch, tmp_path):
-    assert sft_v2.CLEAN_SMALL_QWEN_FIELD_ROUTE_DEFAULT == "0"
-    gate = dict(GATE_DATA, params_b=0.494, model_type="qwen2", vocab_size=151936)
-    assert sft_v2.field_full_route(**gate, base_damage="clean") is False
-    assert sft_v2.clean_small_qwen_admits("qwen2", "clean", 0.494, 151936) is False
+TRDPO = dict(n_gpus=1, is_kl=False, n_rows=9282, total_tokens=2_812_952)      # replay r-q2-05b-trdpo (below generic floors)
+DOLLY_TR = dict(n_gpus=1, is_kl=False, n_rows=13976, total_tokens=3_682_451)  # Phase G analogue a-q2-05b-dollytr
+
+
+def test_clean_small_qwen_is_on_by_default(monkeypatch, tmp_path):
+    assert sft_v2.CLEAN_SMALL_QWEN_FIELD_ROUTE_DEFAULT == "1"
+    assert (sft_v2.CLEAN_SMALL_QWEN_MIN_ROWS, sft_v2.CLEAN_SMALL_QWEN_MIN_TOKENS) == (5000, 2_000_000)
+    q = dict(params_b=0.494, model_type="qwen2", vocab_size=151936)
+    assert sft_v2.clean_small_qwen_admits("qwen2", "clean", 0.494, 151936) is True
+    for data in (GATE_DATA, TRDPO, DOLLY_TR):
+        assert sft_v2.field_full_route(**data, **q, base_damage="clean") is True
+    # its own floors, not the generic 15k rows / 8M tokens
+    assert sft_v2.field_full_route(**dict(TRDPO, n_rows=4999), **q, base_damage="clean") is False
+    assert sft_v2.field_full_route(**dict(TRDPO, total_tokens=1_999_999), **q, base_damage="clean") is False
+    # scope: clean verdict only, qwen2 only, <= 1.0 B only
+    for verdict in ("unknown", None):
+        assert sft_v2.field_full_route(**TRDPO, **q, base_damage=verdict) is False
+    assert sft_v2.field_full_route(**TRDPO, **dict(q, params_b=1.5), base_damage="clean") is False
+    assert sft_v2.field_full_route(**TRDPO, **dict(q, model_type="qwen3"), base_damage="clean") is False
+    # the damaged-base qwen2 route keeps the generic floors (untested below them)
+    assert sft_v2.damaged_base_admits("qwen2", "damaged", 0.494, 151936) is True
+    assert sft_v2.field_full_route(**TRDPO, **q, base_damage="damaged") is False
+    assert sft_v2.field_full_route(**GATE_DATA, **q, base_damage="damaged") is True
+    # research overrides still work
+    monkeypatch.setenv("FORGE_V2_CLEAN_SMALL_QWEN", "0")
+    assert sft_v2.field_full_route(**TRDPO, **q, base_damage="clean") is False
+    monkeypatch.delenv("FORGE_V2_CLEAN_SMALL_QWEN")
+    monkeypatch.setenv("FORGE_V2_FIELD_MIN_ROWS", "10000")
+    assert sft_v2.field_full_route(**TRDPO, **q, base_damage="clean") is False
+    monkeypatch.delenv("FORGE_V2_FIELD_MIN_ROWS")
     routes, _, _ = _dispatch(monkeypatch, tmp_path, "qwen2", 0.494, 151936, "clean")
+    assert (routes[0]["field"], routes[0]["clean_small_qwen"], routes[0]["damaged"]) == (True, True, False)
+    assert routes[0]["recipe"] == {"bf16": True, "lr_mult": 1.0, "eff_batch": 140, "strategy": "full"}
+    routes, _, _ = _dispatch(monkeypatch, tmp_path / "u", "qwen2", 0.494, 151936, "unknown")
     assert (routes[0]["field"], routes[0]["clean_small_qwen"]) == (False, False)
+
+
+def test_eval_slack_on_only_for_the_clean_small_qwen_route(monkeypatch):
+    monkeypatch.delenv("FORGE_V2_EVAL_SLACK", raising=False)
+    assert sft_v2.EVAL_SLACK_DEFAULT == "0"
+    assert sft_v2._eval_slack() is False and sft_v2._eval_slack(True) is True
+    monkeypatch.setenv("FORGE_V2_EVAL_SLACK", "0")
+    assert sft_v2._eval_slack(True) is False
+    monkeypatch.setenv("FORGE_V2_EVAL_SLACK", "1")
+    assert sft_v2._eval_slack(False) is True
+    import inspect
+    src = inspect.getsource(sft_v2.run)
+    assert "_csq_field = bool(field and clean_small_qwen_route)" in src
+    assert "self.window_s if _eval_slack(_csq_field) else None" in src
+    # the two-seed (LoRA-only) refresh keeps the switch-only gate
+    assert src.count("if _eval_slack():") == 1
 
 
 def test_clean_small_qwen_switch_reproduces_the_clean_05b_arm(monkeypatch, tmp_path):

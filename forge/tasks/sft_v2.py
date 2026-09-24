@@ -254,8 +254,15 @@ DAMAGE_DETECTORS_DEFAULT: tuple[str, ...] = ("identity", "fingerprint")
 # fixture; research/20260922-{qwen05b,clean-qwen2-05b-s17}-exec). When switched on, a qwen2 base the detectors read
 # "clean" up to CLEAN_SMALL_QWEN_MAX_PARAMS_B takes the field route with the recipe that arm ran (= the qwen2 row of
 # DAMAGED_BASE_FAMILIES: bf16 from 0.3 B, LR x1.0). FORGE_V2_CLEAN_SMALL_QWEN=0/1 overrides it for research.
-CLEAN_SMALL_QWEN_FIELD_ROUTE_DEFAULT = "0"
+CLEAN_SMALL_QWEN_FIELD_ROUTE_DEFAULT = "1"
 CLEAN_SMALL_QWEN_MAX_PARAMS_B = 1.0
+# Data floors for the clean small-Qwen admission only (the generic FIELD floors 15k rows / 8M tokens and the damaged/identical
+# qwen2 routes are unchanged). Replay evidence 2026-09-23/24 (research/20260923-replay-bench, SCIENCE-LEDGER): below the
+# generic floors today's route trained clean Qwen2-0.5B slower (full FP32 unpacked, or the legacy LoRA handler); the
+# FIELD bf16 route won on trdpo (9.3k rows / 2.8M tok: -2.3%, -2.6% over 2 seeds) and on the Dolly-TR analogue
+# (14k rows / 3.7M tok: -5.8%). FORGE_V2_FIELD_MIN_ROWS / FORGE_V2_FIELD_MIN_TOKENS still override for research.
+CLEAN_SMALL_QWEN_MIN_ROWS = 5000
+CLEAN_SMALL_QWEN_MIN_TOKENS = 2_000_000
 
 
 def _damaged_base_route() -> bool:
@@ -276,12 +283,16 @@ def damaged_base_family_enabled(model_type: str | None) -> bool:
     return _field_full() and _damaged_base_route() and str(model_type or "").lower() in damaged_base_types()
 
 
-# Window-aware eval governor: OFF in production until validated (research/20260923-replay-bench/phase-f).
+# Window-aware eval governor: OFF by default, ON for the clean small-Qwen FIELD route (the only route with replay
+# evidence: research/20260923-replay-bench phase-f/phase-g). FORGE_V2_EVAL_SLACK=0/1 overrides both.
 EVAL_SLACK_DEFAULT = "0"
 
 
-def _eval_slack() -> bool:
-    return os.environ.get("FORGE_V2_EVAL_SLACK", EVAL_SLACK_DEFAULT).strip() == "1"
+def _eval_slack(route_default: bool = False) -> bool:
+    forced = os.environ.get("FORGE_V2_EVAL_SLACK", "").strip()
+    if forced:
+        return forced == "1"
+    return route_default or EVAL_SLACK_DEFAULT == "1"
 
 
 def governed_eval_every(eval_every: int, per_eval_s: float, t_step: float, total_steps: int,
@@ -368,9 +379,23 @@ def damaged_base_admits(model_type: str | None, base_damage: str | None, params_
     return 0 < params_b <= min(cap, FIELD_FULL_MAX_PARAMS_B)
 
 
+def clean_small_qwen_min_rows() -> int:
+    try:
+        return int(os.environ.get("FORGE_V2_FIELD_MIN_ROWS", str(CLEAN_SMALL_QWEN_MIN_ROWS)))
+    except ValueError:
+        return CLEAN_SMALL_QWEN_MIN_ROWS
+
+
+def clean_small_qwen_min_tokens() -> int:
+    try:
+        return int(float(os.environ.get("FORGE_V2_FIELD_MIN_TOKENS", str(CLEAN_SMALL_QWEN_MIN_TOKENS))))
+    except ValueError:
+        return CLEAN_SMALL_QWEN_MIN_TOKENS
+
+
 def clean_small_qwen_admits(model_type: str | None, base_damage: str | None, params_b: float,
                             vocab_size: int | None = None) -> bool:
-    """Clean small-Qwen field admission (default OFF; see CLEAN_SMALL_QWEN_FIELD_ROUTE_DEFAULT)."""
+    """Clean small-Qwen field admission (default ON since 2026-09-24; see CLEAN_SMALL_QWEN_FIELD_ROUTE_DEFAULT)."""
     if base_damage != "clean" or not clean_small_qwen_enabled(model_type):
         return False
     if vocab_size is not None and int(vocab_size) not in DAMAGED_BASE_FAMILIES["qwen2"]["vocabs"]:
@@ -395,8 +420,9 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
     if not _field_full() or is_kl or n_gpus != 1 or params_b <= 0:
         return False
     _mt = str(model_type).lower() if model_type is not None else None
-    damaged = (damaged_base_admits(_mt, base_damage, params_b, vocab_size)
-               or clean_small_qwen_admits(_mt, base_damage, params_b, vocab_size))
+    damaged_admit = damaged_base_admits(_mt, base_damage, params_b, vocab_size)
+    csq_admit = not damaged_admit and clean_small_qwen_admits(_mt, base_damage, params_b, vocab_size)
+    damaged = damaged_admit or csq_admit
     if damaged:
         pass  # the family allow-list, FIELD_FULL_VOCABS and minimum-size gates below do not apply; rows / tokens / cap do
     elif _mt is not None and _mt not in field_full_types():
@@ -419,9 +445,11 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
             return False
     if _mt is not None and not damaged and not os.environ.get("FORGE_V2_FIELD_TYPES") and params_b < FIELD_FULL_MIN_PARAMS_B.get(_mt, 0.0):
         return False  # below the size where the family's validated configuration applies
-    if n_rows is not None and n_rows < field_full_min_rows(_mt):
+    min_rows = clean_small_qwen_min_rows() if csq_admit else field_full_min_rows(_mt)
+    min_tokens = clean_small_qwen_min_tokens() if csq_admit else field_full_min_tokens(_mt)
+    if n_rows is not None and n_rows < min_rows:
         return False
-    if total_tokens is not None and total_tokens < field_full_min_tokens(_mt):
+    if total_tokens is not None and total_tokens < min_tokens:
         # data volume, not row count, separates the wins from the losses: full weights
         # overfit small token budgets within an epoch at every tested LR
         return False
@@ -1096,6 +1124,7 @@ def run(
         gemma_adapter_small_batch = _admission.get("action") == "enable_gemma_small_batch"
     # damaged-base (and, when switched on, clean small-Qwen) field route: the family's executed recipe
     _damaged_recipe = bool(field and (damaged_base_route or clean_small_qwen_route))
+    _csq_field = bool(field and clean_small_qwen_route)  # clean small-Qwen FIELD run: window-aware eval governor on
     _recipe = field_recipe(str(getattr(getattr(model, "config", None), "model_type", "") or ""), params_b,
                            damaged_base=_damaged_recipe)
     if field:
@@ -1660,7 +1689,7 @@ def run(
                 self.governed = True
                 per_eval = dt + 0.5 * (state["persist_secs"] / max(1, state["eval_count"]))
                 widened, slack_info = governed_eval_every(self.eval_every, per_eval, t_step, self.total_steps,
-                                                          self.window_s if _eval_slack() else None)
+                                                          self.window_s if _eval_slack(_csq_field) else None)
                 if slack_info:
                     _event_and_print("sft_v2_eval_governor_slack", eval_every=widened, **slack_info)
                 if widened > self.eval_every:

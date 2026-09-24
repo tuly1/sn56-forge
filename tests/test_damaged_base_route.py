@@ -294,7 +294,10 @@ def test_dispatch_qwen2_damaged_short_rows_takes_the_field_route(monkeypatch, tm
 
 
 def test_dispatch_switches_off(monkeypatch, tmp_path):
+    # the clean small-Qwen switch (default ON since 2026-09-24) also runs qwen2 detection; hold it off here so this test
+    # keeps isolating the damaged-base switches
     for i, env in enumerate(({"FORGE_V2_DAMAGED_BASE_ROUTE": "0"}, {"FORGE_V2_DAMAGED_BASE_TYPES": "lfm2"})):
+        env = dict(env, FORGE_V2_CLEAN_SMALL_QWEN="0")
         routes, ev, _ = _dispatch(monkeypatch, tmp_path / str(i), "qwen2", identity=_report(), env=env)
         assert routes == [{"handler": "sft_v2", "field": False, "damaged": False, "strategy": "lora"}]
         assert "base_damage" not in ev
