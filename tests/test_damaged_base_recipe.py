@@ -39,9 +39,12 @@ EXECUTED = {
     "gemma2-2b-reinit": ("gemma2", 2.614, 256000, dict(_BASE_ENV, FORGE_V2_FIELD_TYPES="gemma2"),
                          dict(eff=48, unit=1472, packed=False, micro=25, accum=2)),
     # 20260922-dmg-lfm12-s17-exec / 20260922-lfm12-exec (LFM2.5-1.2B-Instruct pruned, augmented-a22a7e3362beba00)
+    # 2026-09-24: the lfm2 <= 1.5 B recipe is now the replay-bench Phase H arm (FORGE_V2_FP32_MASTER=1 + FIELD_LR_MULT=2 on
+    # the damaged route). In recipe terms that is bf16 off (min 1.5 B) + LR x2: _recipe["bf16"] is read only by the bf16
+    # switch (sft_v2.py field bf16 block), so both leave the geometry's fp32 master + fused AdamW in place.
     "lfm2-1.2b-pruned": ("lfm2", 1.17, 65536,
-                         dict(_BASE_ENV, FORGE_V2_FIELD_TYPES="lfm2", FORGE_V2_FIELD_BF16_MIN_B="0.3",
-                              FORGE_V2_STRATEGY="full"),
+                         dict(_BASE_ENV, FORGE_V2_FIELD_TYPES="lfm2", FORGE_V2_FIELD_BF16_MIN_B="1.5",
+                              FORGE_V2_FIELD_LR_MULT="2", FORGE_V2_STRATEGY="full"),
                          dict(eff=100, unit=1536, packed=False, micro=32, accum=4)),
     # 20260922-dmg-lfm26-exec (LFM2.5-2.6B scaled, augmented-973212c10d42d89f), -1.311%
     "lfm2-2.6b-scaled": ("lfm2", 2.697, 128000,
@@ -83,6 +86,11 @@ def test_damaged_route_equals_the_executed_env(monkeypatch, name):
     assert sft_v2.damaged_base_admits(mt, "damaged", params_b, vocab) is True
     assert _knobs(mt, params_b, damaged=True) == executed_knobs
     # 3. the values the arm's train.log recorded
+    if mt == "lfm2" and params_b <= 1.5:
+        # 2026-09-24: the lfm2 <= 1.5 B recipe is the Phase H fp32-master x2 arm (geometry covered by
+        # test_lfm2_small_recipe_matches_the_phase_h_fp32_arm); the Sept 22 bf16 micro/accum pin below no longer applies
+        assert executed_knobs == {"bf16": False, "lr_mult": 2.0, "eff_batch": ex["eff"], "strategy": "full"}
+        return
     assert executed_knobs == {"bf16": True, "lr_mult": 1.0, "eff_batch": ex["eff"], "strategy": "full"}
     assert executed_strategy in ("full", "lora")  # both enter the v2 block; the field route forces "full"
     # 4. geometry: bf16 micro batch / accumulation at the executed unit length (packed runs: blocks per step)
@@ -100,8 +108,9 @@ def test_family_table_matches_the_executed_thresholds():
     assert {k for k, v in fam.items() if v["enabled"]} == {"qwen2", "qwen3", "gemma2", "lfm2"}
     assert fam["llama"]["enabled"] is False
     assert {k: v["bf16_min_b"] for k, v in fam.items()} == {"qwen2": 0.3, "qwen3": 0.3, "llama": 0.3, "gemma2": 2.0,
-                                                            "lfm2": 0.3}
+                                                            "lfm2": 1.5}
     assert all(v["lr_mult"] == 1.0 for v in fam.values())
+    assert {k: (v.get("small_max_b"), v.get("small_lr_mult")) for k, v in fam.items() if v.get("small_max_b")} == {"lfm2": (1.5, 2.0)}
     assert all(v["max_params_b"] == sft_v2.FIELD_FULL_MAX_PARAMS_B == 3.5 for v in fam.values())
     assert fam["lfm2"]["vocabs"] is None  # executed with the vocabulary gate bypassed (FIELD_TYPES=lfm2)
     for name, (mt, params_b, vocab, _, _) in EXECUTED.items():
@@ -210,7 +219,10 @@ def test_dispatch_damaged_clean_unknown(monkeypatch, tmp_path, name):
     assert calls == [("identity", "fingerprint")]
     assert routes == [{"handler": "sft_v2", "field": True, "damaged": True, "clean_small_qwen": False,
                        "strategy": "full",
-                       "recipe": {"bf16": True, "lr_mult": 1.0, "eff_batch": ex["eff"], "strategy": "full"}}]
+                       "recipe": _knobs(mt, params_b, damaged=True)}]
+    small_lfm = mt == "lfm2" and params_b <= 1.5
+    assert routes[0]["recipe"] == {"bf16": not small_lfm, "lr_mult": 2.0 if small_lfm else 1.0, "eff_batch": ex["eff"],
+                                   "strategy": "full"}
     assert ev["sft_v2_field_gate"]["damaged_base_route"] is True and ev["base_damage"]["verdict"] == "damaged"
     for verdict in ("clean", "unknown"):
         routes, ev, _ = _dispatch(monkeypatch, tmp_path / verdict, mt, params_b, vocab, verdict)
@@ -339,3 +351,21 @@ def test_shipped_table_is_plain_json():
     damage._TABLE_CACHE.clear()
     t = damage.load_table()
     assert t is not None and len(t["models"]) == 73
+
+
+def test_lfm2_small_recipe_matches_the_phase_h_fp32_arm(monkeypatch):
+    """Damaged LFM2 <= 1.5 B: bf16 off + LR x2 by default; 2.6 B unchanged (bf16, x1). The Phase H arm ran the old recipe
+    with FORGE_V2_FP32_MASTER=1 + FIELD_LR_MULT=2: same geometry because only the bf16 switch reads _recipe["bf16"]."""
+    import inspect
+    small = sft_v2.field_recipe("lfm2", 1.17, damaged_base=True)
+    big = sft_v2.field_recipe("lfm2", 2.70, damaged_base=True)
+    assert (small["bf16"], small["lr_mult"]) == (False, 2.0) and (big["bf16"], big["lr_mult"]) == (True, 1.0)
+    assert sft_v2.field_recipe("lfm2", 1.5, damaged_base=True)["lr_mult"] == 2.0          # boundary inclusive
+    assert sft_v2.field_recipe("lfm2", 1.51, damaged_base=True)["lr_mult"] == 1.0
+    assert sft_v2.field_recipe("qwen2", 1.17, damaged_base=True)["lr_mult"] == 1.0        # other families unchanged
+    assert sft_v2.choose_geometry(params_b=1.17, max_len=1536, vocab=65536, per_gpu_gb=80, bnb_ok=True).fp32_master is True
+    src = inspect.getsource(sft_v2.run)
+    assert src.count('_recipe["bf16"]') == 1 and 'if field and geo.fp32_master and _recipe["bf16"]' in src
+    monkeypatch.setenv("FORGE_V2_FIELD_LR_MULT", "1")                                      # research override still wins
+    assert sft_v2.field_recipe("lfm2", 1.17, damaged_base=True)["lr_mult"] == 1.0
+

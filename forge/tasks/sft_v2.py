@@ -234,8 +234,11 @@ DAMAGED_BASE_FAMILIES: dict[str, dict[str, Any]] = {
               "vocabs": frozenset({128256}), "tested_params_b": (1.24, 1.24)},
     "gemma2": {"enabled": True, "max_params_b": FIELD_FULL_MAX_PARAMS_B, "bf16_min_b": 2.0, "lr_mult": 1.0,
                "vocabs": frozenset({256000}), "tested_params_b": (2.61, 2.61)},
-    "lfm2": {"enabled": True, "max_params_b": FIELD_FULL_MAX_PARAMS_B, "bf16_min_b": 0.3, "lr_mult": 1.0,
-             "vocabs": None, "tested_params_b": (1.17, 2.70)},
+    # lfm2 <= 1.5 B (2026-09-24, replay-bench Phase H, LFM2.5-1.2B-Instruct pruned, cc4550ab, H100, 2 seeds): fp32 master
+    # + LR x2 beat the bf16 x1 route by -3.3% / -3.5% (paired 99% CIs wholly below 0); bf16 rounding froze small updates.
+    # bf16_min_b 1.5 keeps the geometry's fp32 master (+ fused AdamW) at 1.17 B; LFM2.5-2.6B (2.70 B) keeps bf16, LR x1.
+    "lfm2": {"enabled": True, "max_params_b": FIELD_FULL_MAX_PARAMS_B, "bf16_min_b": 1.5, "lr_mult": 1.0,
+             "small_max_b": 1.5, "small_lr_mult": 2.0, "vocabs": None, "tested_params_b": (1.17, 2.70)},
 }
 # Master switch. The validator runs this image with its own environment, so the production value lives here;
 # FORGE_V2_DAMAGED_BASE_ROUTE=0/1 overrides it for research and CPU replays.
@@ -503,11 +506,15 @@ def _field_bf16_enabled(model_type: str | None, *, damaged_base: bool = False) -
 FIELD_LR_MULT_TYPES: dict[str, float] = {"qwen2": 1.0}
 
 
-def _field_lr_mult(model_type: str | None = None, *, damaged_base: bool = False) -> float:
-    """Multiplier on the clamped raw analytic LR of the field route: FORGE_V2_FIELD_LR_MULT, else the family default."""
+def _field_lr_mult(model_type: str | None = None, *, damaged_base: bool = False, params_b: float | None = None) -> float:
+    """Multiplier on the clamped raw analytic LR of the field route: FORGE_V2_FIELD_LR_MULT, else the family default
+    (a damaged family may set a size-scoped small_lr_mult for params_b <= small_max_b)."""
     default = FIELD_LR_MULT_TYPES.get(str(model_type or "").lower(), 1.0) if _identical_base_family_defaults(model_type) else 1.0
     if damaged_base:
-        default = float(_damaged_family(model_type).get("lr_mult", 1.0))
+        fam = _damaged_family(model_type)
+        default = float(fam.get("lr_mult", 1.0))
+        if params_b is not None and fam.get("small_max_b") is not None and 0 < params_b <= float(fam["small_max_b"]):
+            default = float(fam.get("small_lr_mult", default))
     try:
         return float(os.environ.get("FORGE_V2_FIELD_LR_MULT", str(default)) or default)
     except ValueError:
@@ -520,7 +527,7 @@ def field_recipe(model_type: str | None, params_b: float, *, damaged_base: bool 
     bucket. ``damaged_base`` selects the family's DAMAGED_BASE_FAMILIES recipe."""
     min_b = _field_bf16_min_b(model_type, damaged_base=damaged_base)
     return {"bf16": bool(_field_bf16_enabled(model_type, damaged_base=damaged_base) and params_b >= min_b),
-            "bf16_min_b": min_b, "lr_mult": _field_lr_mult(model_type, damaged_base=damaged_base),
+            "bf16_min_b": min_b, "lr_mult": _field_lr_mult(model_type, damaged_base=damaged_base, params_b=params_b),
             "eff_batch": field_eff_batch(params_b), "strategy": "full"}
 
 

@@ -125,12 +125,17 @@ def test_identical_base_admission_is_untouched():
 
 
 def test_damaged_recipe_defaults(monkeypatch):
-    executed_min_b = {"qwen2": 0.3, "qwen3": 0.3, "llama": 0.3, "lfm2": 0.3, "gemma2": 2.0}
+    executed_min_b = {"qwen2": 0.3, "qwen3": 0.3, "llama": 0.3, "lfm2": 1.5, "gemma2": 2.0}   # lfm2 1.5: 2026-09-24 Phase H
     for mt in FAMILY:
         assert sft_v2._field_bf16_enabled(mt, damaged_base=True) is True
         assert sft_v2._field_bf16_min_b(mt, damaged_base=True) == executed_min_b[mt]
-        assert FAMILY[mt][0] >= executed_min_b[mt]  # every tested base took the bf16 path
-        assert sft_v2._field_lr_mult(mt, damaged_base=True) == 1.0
+        if mt == "lfm2":   # LFM2.5-1.2B (1.17 B) now keeps fp32 master + LR x2 (below the 1.5 B bf16 threshold)
+            assert FAMILY[mt][0] < executed_min_b[mt]
+            assert sft_v2._field_lr_mult(mt, damaged_base=True, params_b=FAMILY[mt][0]) == 2.0
+        else:
+            assert FAMILY[mt][0] >= executed_min_b[mt]  # every other tested base took the bf16 path
+            assert sft_v2._field_lr_mult(mt, damaged_base=True, params_b=FAMILY[mt][0]) == 1.0
+        assert sft_v2._field_lr_mult(mt, damaged_base=True) == 1.0   # without a size the family default stands
     # without the damaged flag the deployed defaults stand
     assert sft_v2._field_bf16_enabled("llama") is False and sft_v2._field_bf16_min_b("llama") == 2.0
     assert sft_v2._field_bf16_enabled("lfm2") is True and sft_v2._field_bf16_min_b("lfm2") == 2.0
