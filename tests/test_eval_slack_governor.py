@@ -77,13 +77,65 @@ def test_seed_b_window_no_fit_after_soup():
 def test_refresh_is_gated_and_placed_after_seed_a_soup():
     import inspect
     src = inspect.getsource(sft_v2.run)
+    flag = src.index("seed_b_no_fit = False")
     soup = src.index("loss_a, state_a, members_a = selection.greedy_soup(")
     reinit = src.index("_reinit_lora(model, _seed_base + 1000)")
     refresh = src.index("window, fits = seed_b_window(deadline, finish_reserve, min_window)")
+    handler = src.index('_event_and_print("sft_v2_two_seed_failed", stage="a"')
+    restore = src.index("restore_seed_a_or_fail(model, seed_a, pool, state)")
     plan = src.index('_event_and_print("sft_v2_plan"')
     cb = src.index("cb = SelectCallback(eval_every, total_steps, window_s=window)")
-    assert soup < reinit < refresh < plan < cb
+    assert flag < soup < reinit < refresh < handler < restore < plan < cb
     gate = src.rindex("if _eval_slack():", 0, refresh)
     assert refresh - gate < 400                           # the refresh only runs with FORGE_V2_EVAL_SLACK=1
-    tail = src[refresh:refresh + 1200]
-    assert 'selection.load_state(model, seed_a["state"])' in tail and "two_seed = False" in tail and "break" in tail
+    # the restore runs outside the broad stage-A handler (Codex re-review of 01a6b57): nothing in the try body restores
+    body = src[soup:handler]
+    assert "load_state(model, seed_a" not in body and "restore_seed_a_or_fail" not in body
+    tail = src[restore:restore + 300]
+    assert "seed_b_active = False" in tail and "two_seed = False" in tail and "break" in tail
+
+
+class _Pool:
+    def __init__(self):
+        self.items = []
+
+
+def _seed_a():
+    return {"loss": 1.23, "step": 130, "state": {"w": 1}, "members": 3}
+
+
+def test_restore_seed_a_success(monkeypatch):
+    loaded = []
+    monkeypatch.setattr(sft_v2.selection, "load_state", lambda m, st: loaded.append(st))
+    pool, state = _Pool(), {"best": float("inf"), "best_step": 0}
+    sft_v2.restore_seed_a_or_fail(object(), _seed_a(), pool, state)
+    assert loaded == [{"w": 1}] and pool.items == [{"loss": 1.23, "step": 130, "state": {"w": 1}}]
+    assert state == {"best": 1.23, "best_step": 130}
+
+
+def test_restore_seed_a_failure_fails_closed(monkeypatch):
+    # Codex repro: 260 s window - 50 s soup = 210 s < 240 s min window, then load_state raises. Before the fix the stage-A
+    # handler swallowed it and seed B was planned on the re-initialised adapter (empty pool, best=inf).
+    def boom(m, st):
+        raise RuntimeError("size mismatch")
+    monkeypatch.setattr(sft_v2.selection, "load_state", boom)
+    events = []
+    monkeypatch.setattr(sft_v2, "_event_and_print", lambda name, **kv: events.append(name))
+    clock = _Clock(260.0 + 100.0); clock.spend(50.0)
+    window, fits = sft_v2.seed_b_window(clock, 100.0, 240.0)
+    assert window == 210.0 and not fits
+    pool, state = _Pool(), {"best": float("inf"), "best_step": 0}
+    with pytest.raises(sft_v2.SeedARestoreError):
+        sft_v2.restore_seed_a_or_fail(object(), _seed_a(), pool, state)
+    assert pool.items == [] and state == {"best": float("inf"), "best_step": 0}   # nothing half-applied
+    assert events == ["sft_v2_two_seed_restore_failed"]
+
+
+def test_restore_failure_propagates_to_the_v2_fallback():
+    # SeedARestoreError is not caught inside run(): the caller (forge/tasks/instruct.py) keeps the persisted artifact or
+    # falls back to the validated LoRA path.
+    import inspect
+    from forge.tasks import instruct
+    assert issubclass(sft_v2.SeedARestoreError, RuntimeError)
+    src = inspect.getsource(instruct)
+    assert '"sft_v2_failed"' in src and "sft_v2.trained_artifact_present(spec)" in src

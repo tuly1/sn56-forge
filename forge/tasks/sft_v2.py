@@ -309,6 +309,23 @@ def seed_b_window(deadline: Any, finish_reserve: float, min_window: float) -> tu
     return window, window >= min_window
 
 
+class SeedARestoreError(RuntimeError):
+    """Seed B no longer fits after the seed-A soup and the seed-A weights could not be restored onto the re-initialised
+    adapter. Training must not continue: the live model is neither seed A nor a planned seed B."""
+
+
+def restore_seed_a_or_fail(model: Any, seed_a: dict[str, Any], pool: Any, state: dict[str, Any]) -> None:
+    """Put seed A back as the incumbent (as the stage-b failure path does) or fail closed with SeedARestoreError.
+    Pool and selection state change only after a successful load."""
+    try:
+        selection.load_state(model, seed_a["state"])
+    except Exception as exc:
+        _event_and_print("sft_v2_two_seed_restore_failed", error=f"{type(exc).__name__}: {exc}")
+        raise SeedARestoreError("seed-A restore failed after seed-B no-fit") from exc
+    pool.items = [{"loss": seed_a["loss"], "step": seed_a["step"], "state": seed_a["state"]}]
+    state["best"], state["best_step"] = seed_a["loss"], seed_a["step"]
+
+
 def _clean_small_qwen() -> bool:
     return os.environ.get("FORGE_V2_CLEAN_SMALL_QWEN", CLEAN_SMALL_QWEN_FIELD_ROUTE_DEFAULT).strip() == "1"
 
@@ -1698,6 +1715,7 @@ def run(
         if two_seed and phase == 1 and not seed_b_active and two_seed_result is None and state["last_phase_complete"] and t_step and pool.items:
             need = steps_per_epoch * t_step * 1.2 + 4.0 * dev_eval_est + 90.0
             if window > need:
+                seed_b_no_fit = False
                 try:
                     loss_a, state_a, members_a = selection.greedy_soup(
                         model, pool, eval_dev, time_budget_s=min(300.0, 0.2 * window), log=lambda n, d: _event_and_print(n, **_flat(d))
@@ -1712,19 +1730,18 @@ def run(
                     _event_and_print("sft_v2_two_seed_a", dev_loss=round(loss_a, 6), members=members_a, need_s=round(need, 1), window_s=round(window, 1))
                     if _eval_slack():
                         # the soup and re-init spent part of `window`: plan seed B (and size the eval governor's slack)
-                        # from the live deadline; if seed B no longer fits, keep seed A exactly as the stage-b failure path does
+                        # from the live deadline. The no-fit restore runs below, outside this handler (Codex re-review).
                         window, fits = seed_b_window(deadline, finish_reserve, min_window)
-                        if not fits:
-                            _event_and_print("sft_v2_two_seed_b_no_fit", window_s=round(window, 1), min_window_s=round(min_window, 1))
-                            selection.load_state(model, seed_a["state"])
-                            pool.items = [{"loss": seed_a["loss"], "step": seed_a["step"], "state": seed_a["state"]}]
-                            state["best"], state["best_step"] = seed_a["loss"], seed_a["step"]
-                            seed_b_active = False
-                            two_seed = False
-                            break
+                        seed_b_no_fit = not fits
                 except Exception as exc:
                     _event_and_print("sft_v2_two_seed_failed", stage="a", error=f"{type(exc).__name__}: {exc}")
                     two_seed = False
+                if seed_b_no_fit:
+                    _event_and_print("sft_v2_two_seed_b_no_fit", window_s=round(window, 1), min_window_s=round(min_window, 1))
+                    restore_seed_a_or_fail(model, seed_a, pool, state)   # raises: never plan seed B on a re-initialised adapter
+                    seed_b_active = False
+                    two_seed = False
+                    break
             else:
                 _event_and_print("sft_v2_two_seed_skipped", need_s=round(need, 1), window_s=round(window, 1))
                 two_seed = False
