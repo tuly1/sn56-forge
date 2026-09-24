@@ -260,14 +260,14 @@ DOLLY_TR = dict(n_gpus=1, is_kl=False, n_rows=13976, total_tokens=3_682_451)  # 
 
 def test_clean_small_qwen_is_on_by_default(monkeypatch, tmp_path):
     assert sft_v2.CLEAN_SMALL_QWEN_FIELD_ROUTE_DEFAULT == "1"
-    assert (sft_v2.CLEAN_SMALL_QWEN_MIN_ROWS, sft_v2.CLEAN_SMALL_QWEN_MIN_TOKENS) == (5000, 2_000_000)
+    assert (sft_v2.CLEAN_SMALL_QWEN_MIN_ROWS, sft_v2.CLEAN_SMALL_QWEN_MIN_TOKENS) == (8000, 2_500_000)
     q = dict(params_b=0.494, model_type="qwen2", vocab_size=151936)
     assert sft_v2.clean_small_qwen_admits("qwen2", "clean", 0.494, 151936) is True
     for data in (GATE_DATA, TRDPO, DOLLY_TR):
         assert sft_v2.field_full_route(**data, **q, base_damage="clean") is True
     # its own floors, not the generic 15k rows / 8M tokens
-    assert sft_v2.field_full_route(**dict(TRDPO, n_rows=4999), **q, base_damage="clean") is False
-    assert sft_v2.field_full_route(**dict(TRDPO, total_tokens=1_999_999), **q, base_damage="clean") is False
+    assert sft_v2.field_full_route(**dict(TRDPO, n_rows=7999), **q, base_damage="clean") is False
+    assert sft_v2.field_full_route(**dict(TRDPO, total_tokens=2_499_999), **q, base_damage="clean") is False
     # scope: clean verdict only, qwen2 only, <= 1.0 B only
     for verdict in ("unknown", None):
         assert sft_v2.field_full_route(**TRDPO, **q, base_damage=verdict) is False

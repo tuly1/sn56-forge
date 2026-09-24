@@ -249,9 +249,9 @@ DAMAGED_BASE_ROUTE_DEFAULT = "1"
 # (research/20260922-prod-patch/FINGERPRINT-TABLE.md). FORGE_V2_DAMAGE_DETECTORS=identity restores the 681901f set.
 DAMAGE_DETECTORS_DEFAULT: tuple[str, ...] = ("identity", "fingerprint")
 
-# Clean small-Qwen FIELD route: OFF, pending a separate owner decision. Evidence so far: clean unsloth/Qwen2-0.5B
-# (0.49 B), FIELD bf16 packed full vs the deployed legacy LoRA, grammar 70k: s7 -1.49%, s17 -1.34% (two seeds, one
-# fixture; research/20260922-{qwen05b,clean-qwen2-05b-s17}-exec). When switched on, a qwen2 base the detectors read
+# Clean small-Qwen FIELD route: ON (production candidate 2026-09-24, Codex SIGN_OFF_FOR_SMOKE on 6da9d02). First evidence:
+# clean unsloth/Qwen2-0.5B (0.49 B), FIELD bf16 packed full vs the deployed legacy LoRA, grammar 70k: s7 -1.49%, s17 -1.34%
+# (research/20260922-{qwen05b,clean-qwen2-05b-s17}-exec); replay evidence below. A qwen2 base the detectors read
 # "clean" up to CLEAN_SMALL_QWEN_MAX_PARAMS_B takes the field route with the recipe that arm ran (= the qwen2 row of
 # DAMAGED_BASE_FAMILIES: bf16 from 0.3 B, LR x1.0). FORGE_V2_CLEAN_SMALL_QWEN=0/1 overrides it for research.
 CLEAN_SMALL_QWEN_FIELD_ROUTE_DEFAULT = "1"
@@ -261,8 +261,9 @@ CLEAN_SMALL_QWEN_MAX_PARAMS_B = 1.0
 # generic floors today's route trained clean Qwen2-0.5B slower (full FP32 unpacked, or the legacy LoRA handler); the
 # FIELD bf16 route won on trdpo (9.3k rows / 2.8M tok: -2.3%, -2.6% over 2 seeds) and on the Dolly-TR analogue
 # (14k rows / 3.7M tok: -5.8%). FORGE_V2_FIELD_MIN_ROWS / FORGE_V2_FIELD_MIN_TOKENS still override for research.
-CLEAN_SMALL_QWEN_MIN_ROWS = 5000
-CLEAN_SMALL_QWEN_MIN_TOKENS = 2_000_000
+# 8000 / 2.5M (Codex review of 6da9d02): the narrower initial floor, still below both measured tasks; smaller data is extrapolation.
+CLEAN_SMALL_QWEN_MIN_ROWS = 8000
+CLEAN_SMALL_QWEN_MIN_TOKENS = 2_500_000
 
 
 def _damaged_base_route() -> bool:
