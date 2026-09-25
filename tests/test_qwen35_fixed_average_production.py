@@ -68,8 +68,7 @@ def test_route_is_inert_for_other_models_and_rejects_provenance_drift(monkeypatc
     assert fixed.eligible_route(
         spec(alias, f"/cache/models/{alias}", baseline=None), qwen35_model(), strategy="lora", n_gpus=2,
     ) is None
-    with pytest.raises(ValueError, match="identity drift"):
-        fixed.eligible_route(spec(), object(), strategy="lora", n_gpus=1)
+    assert fixed.eligible_route(spec(), object(), strategy="lora", n_gpus=1) is None
 
 
 def test_anonymous_non_qwen_families_skip_fixed_average(monkeypatch):
@@ -87,31 +86,29 @@ def test_anonymous_non_qwen_families_skip_fixed_average(monkeypatch):
     ) is None
 
 
-def test_anonymous_exact_qwen_wrong_payload_still_raises(monkeypatch):
+def test_anonymous_exact_qwen_wrong_payload_falls_back(monkeypatch):
     monkeypatch.setattr(fixed, "_exact_payload", lambda _path: False)
     alias = "0123456789abcdef"
-    with pytest.raises(ValueError, match="identity drift"):
-        fixed.eligible_route(
-            spec(alias, f"/cache/models/{alias}"),
-            qwen35_model(),
-            strategy="lora",
-            n_gpus=2,
-        )
+    assert fixed.eligible_route(
+        spec(alias, f"/cache/models/{alias}"),
+        qwen35_model(),
+        strategy="lora",
+        n_gpus=2,
+    ) is None
 
 
-def test_known_qwen_payload_with_wrong_loaded_base_still_raises(monkeypatch):
+def test_known_qwen_payload_with_wrong_loaded_base_falls_back(monkeypatch):
     monkeypatch.setattr(fixed, "_exact_payload", lambda _path: True)
     alias = "0123456789abcdef"
-    with pytest.raises(ValueError, match="identity drift"):
-        fixed.eligible_route(
-            spec(alias, f"/cache/models/{alias}"),
-            qwen35_model(hidden_size=4096, num_hidden_layers=48),
-            strategy="lora",
-            n_gpus=2,
-        )
+    assert fixed.eligible_route(
+        spec(alias, f"/cache/models/{alias}"),
+        qwen35_model(hidden_size=4096, num_hidden_layers=48),
+        strategy="lora",
+        n_gpus=2,
+    ) is None
 
 
-def test_wrapped_exact_qwen_with_wrong_payload_still_raises(monkeypatch):
+def test_wrapped_exact_qwen_with_wrong_payload_falls_back(monkeypatch):
     monkeypatch.setattr(fixed, "_exact_payload", lambda _path: False)
 
     class PeftModelForCausalLM:
@@ -120,10 +117,9 @@ def test_wrapped_exact_qwen_with_wrong_payload_still_raises(monkeypatch):
 
     alias = "0123456789abcdef"
     for endpoint, gpus in [(spec(), 1), (spec(alias, f"/cache/models/{alias}"), 2)]:
-        with pytest.raises(ValueError, match="identity drift"):
-            fixed.eligible_route(
-                endpoint, PeftModelForCausalLM(), strategy="lora", n_gpus=gpus
-            )
+        assert fixed.eligible_route(
+            endpoint, PeftModelForCausalLM(), strategy="lora", n_gpus=gpus
+        ) is None
 
 
 def test_wrapped_anonymous_lfm_skips_fixed_average(monkeypatch):
@@ -210,3 +206,25 @@ def test_instruct_integration_keeps_native_and_cap1_semantics():
     assert "before_train=capture_native_initial" in source
     assert "MIN_CAP1_SOFT_SECONDS = 2400.0" in inspect.getsource(fixed)
     assert "FORGE_QWEN35_4B_FIXED_AVERAGE" not in inspect.getsource(fixed)
+
+
+def test_damaged_resaved_qwen35_4b_trains_on_ordinary_route_not_untrained_copy(monkeypatch, tmp_path):
+    """Regression: validator-damaged bases are re-saved (config.json bytes change), so the exact loaded
+    class/shape passes while the payload hash fails. That used to raise -> cli fallback -> untrained copy."""
+    events = []
+    from forge import telemetry
+
+    monkeypatch.setattr(telemetry, "event", lambda name, **kw: events.append((name, kw)))
+    alias = "0123456789abcdef"
+    cache = tmp_path / alias
+    cache.mkdir()
+    (cache / "config.json").write_text('{"model_type": "qwen3_5_text", "resaved": true}')
+    (cache / "model.safetensors.index.json").write_text("{}")
+    anonymous = spec(alias, f"/cache/models/{alias}")
+    monkeypatch.setattr(fixed, "_exact_payload", lambda _path: fixed._sha(cache / "config.json") == fixed.EXACT_CONFIG_SHA256)
+    for endpoint, gpus in [(anonymous, 2), (spec(), 1)]:
+        assert fixed.eligible_route(endpoint, qwen35_model(), strategy="lora", n_gpus=gpus) is None
+    assert [e[0] for e in events] == ["qwen35_fixed_average_identity_drift"] * 2
+    assert events[0][1]["drift"] == ["payload"] and events[0][1]["action"] == "ordinary_route"
+    assert events[0][1]["endpoint_mode"] == "anonymous_two_gpu"
+    assert events[1][1]["endpoint_mode"] == "named_one_gpu"

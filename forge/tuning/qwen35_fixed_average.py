@@ -104,16 +104,32 @@ def eligible_route(
     exact_payload = _exact_payload(str(spec.cached_model_dir))
     if mode == "anonymous_two_gpu" and not exact_base and not exact_payload:
         return None
-    if (
-        spec.task_type != "InstructTextTask"
-        or spec.instruct is None
-        or spec.instruct.output is None
-        or spec.use_kl
-        or strategy != "lora"
-        or not exact_payload
-        or not exact_base
-    ):
-        raise ValueError("Qwen fixed-average production identity drift")
+    drift = [
+        name
+        for name, bad in (
+            ("task_type", spec.task_type != "InstructTextTask"),
+            ("instruct_output", spec.instruct is None or spec.instruct.output is None),
+            ("use_kl", bool(spec.use_kl)),
+            ("strategy", strategy != "lora"),
+            ("payload", not exact_payload),
+            ("loaded_base", not exact_base),
+        )
+        if bad
+    ]
+    if drift:
+        # Anything short of the exact endpoint trains on the ordinary route. Raising here
+        # used to reach cli's handler fallback and submit an UNTRAINED copy: the validator
+        # re-saves the config of every damaged ("augmented") base, so a damaged Qwen3.5-4B
+        # loads as the exact class/shape while its payload hash differs.
+        from forge import telemetry
+
+        telemetry.event(
+            "qwen35_fixed_average_identity_drift",
+            endpoint_mode=mode,
+            drift=drift,
+            action="ordinary_route",
+        )
+        return None
     return FixedAverageRoute(endpoint_mode=mode)
 
 
