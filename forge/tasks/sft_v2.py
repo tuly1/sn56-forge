@@ -526,7 +526,11 @@ def field_recipe(model_type: str | None, params_b: float, *, damaged_base: bool 
     the fp32 master when the geometry would choose it), its size threshold, the LR multiplier and the rows-per-step
     bucket. ``damaged_base`` selects the family's DAMAGED_BASE_FAMILIES recipe."""
     min_b = _field_bf16_min_b(model_type, damaged_base=damaged_base)
-    return {"bf16": bool(_field_bf16_enabled(model_type, damaged_base=damaged_base) and params_b >= min_b),
+    # a damaged family's small band (0 < params_b <= small_max_b) is fp32 master + small_lr_mult, boundary included,
+    # matching _field_lr_mult's <= (without this, exactly small_max_b == bf16_min_b got bf16 + the small LR)
+    small_max = _damaged_family(model_type).get("small_max_b") if damaged_base else None
+    small = small_max is not None and 0 < params_b <= float(small_max)
+    return {"bf16": bool(_field_bf16_enabled(model_type, damaged_base=damaged_base) and params_b >= min_b and not small),
             "bf16_min_b": min_b, "lr_mult": _field_lr_mult(model_type, damaged_base=damaged_base, params_b=params_b),
             "eff_batch": field_eff_batch(params_b), "strategy": "full"}
 

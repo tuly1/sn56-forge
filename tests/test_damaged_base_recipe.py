@@ -360,8 +360,13 @@ def test_lfm2_small_recipe_matches_the_phase_h_fp32_arm(monkeypatch):
     small = sft_v2.field_recipe("lfm2", 1.17, damaged_base=True)
     big = sft_v2.field_recipe("lfm2", 2.70, damaged_base=True)
     assert (small["bf16"], small["lr_mult"]) == (False, 2.0) and (big["bf16"], big["lr_mult"]) == (True, 1.0)
-    assert sft_v2.field_recipe("lfm2", 1.5, damaged_base=True)["lr_mult"] == 2.0          # boundary inclusive
-    assert sft_v2.field_recipe("lfm2", 1.51, damaged_base=True)["lr_mult"] == 1.0
+    # precision AND LR agree below / at / above the inclusive small_max_b boundary (Codex review of cae3b6c: exactly
+    # 1.5 B used to get bf16 + LR x2, because bf16 used >= bf16_min_b while the LR band used <= small_max_b)
+    for params_b, want in ((1.17, (False, 2.0)), (1.4999, (False, 2.0)), (1.5, (False, 2.0)),
+                           (1.5001, (True, 1.0)), (1.51, (True, 1.0)), (2.70, (True, 1.0))):
+        r = sft_v2.field_recipe("lfm2", params_b, damaged_base=True)
+        assert (r["bf16"], r["lr_mult"]) == want, (params_b, r)
+    assert sft_v2.field_recipe("lfm2", 1.5, damaged_base=False)["lr_mult"] == 1.0          # small band is damaged-only
     assert sft_v2.field_recipe("qwen2", 1.17, damaged_base=True)["lr_mult"] == 1.0        # other families unchanged
     assert sft_v2.choose_geometry(params_b=1.17, max_len=1536, vocab=65536, per_gpu_gb=80, bnb_ok=True).fp32_master is True
     src = inspect.getsource(sft_v2.run)
