@@ -367,6 +367,22 @@ def test_lfm2_small_recipe_matches_the_phase_h_fp32_arm(monkeypatch):
         r = sft_v2.field_recipe("lfm2", params_b, damaged_base=True)
         assert (r["bf16"], r["lr_mult"]) == want, (params_b, r)
     assert sft_v2.field_recipe("lfm2", 1.5, damaged_base=False)["lr_mult"] == 1.0          # small band is damaged-only
+    # explicit research controls keep precedence over the small-band precision default (Codex REVIEW-1041d12)
+    for env, want_bf16 in (({"FORGE_V2_FIELD_BF16": "1", "FORGE_V2_FIELD_BF16_MIN_B": "0.3"}, True),
+                           ({"FORGE_V2_FIELD_BF16_MIN_B": "0.3"}, True),
+                           ({"FORGE_V2_FIELD_BF16": "0"}, False),
+                           ({"FORGE_V2_FIELD_BF16": "1"}, False),           # 1.17 < default min 1.5: parent behaviour
+                           ({}, False)):
+        with monkeypatch.context() as m:
+            for k in ("FORGE_V2_FIELD_BF16", "FORGE_V2_FIELD_BF16_MIN_B"):
+                m.delenv(k, raising=False)
+            for k, v in env.items():
+                m.setenv(k, v)
+            r = sft_v2.field_recipe("lfm2", 1.17, damaged_base=True)
+            assert (r["bf16"], r["lr_mult"]) == (want_bf16, 2.0), (env, r)
+    with monkeypatch.context() as m:
+        m.setenv("FORGE_V2_FIELD_LR_MULT", "3")
+        assert sft_v2.field_recipe("lfm2", 1.5, damaged_base=True)["lr_mult"] == 3.0       # LR override still wins
     assert sft_v2.field_recipe("qwen2", 1.17, damaged_base=True)["lr_mult"] == 1.0        # other families unchanged
     assert sft_v2.choose_geometry(params_b=1.17, max_len=1536, vocab=65536, per_gpu_gb=80, bnb_ok=True).fp32_master is True
     src = inspect.getsource(sft_v2.run)
