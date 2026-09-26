@@ -20,6 +20,9 @@ from typing import Any, Callable
 ENV_MODE = "FORGE_V2_FIELD_PACKING"
 ENV_PACK_LEN = "FORGE_V2_FIELD_PACK_LEN"
 ENV_EFF_BLOCKS = "FORGE_V2_FIELD_PACKED_EFF_BATCH"
+# Set (True) on a model instance by sft_v2 only on the damaged Gemma2 champion route (sft_v2.GEMMA2_CHAMPION_RECIPE_DEFAULT):
+# it admits native Gemma2 (vocab 256000) to the sdpa packing below for that run; every other Gemma2 stays unpacked.
+GEMMA2_ROUTE_ATTR = "_forge_gemma2_champion_packing"
 QUALIFIED_TRANSFORMERS = "5.12.1"
 IGNORE = -100
 
@@ -248,6 +251,12 @@ def _eligibility(model: Any, *, field_route: bool, field_hygiene: bool) -> str |
     # masks, which Llama and Qwen2 share; each family is scoped to its validated vocabulary
     native = {LlamaForCausalLM: (LlamaModel, LlamaAttention, "llama", 128256),
               Qwen2ForCausalLM: (Qwen2Model, Qwen2Attention, "qwen2", 151936)}
+    if getattr(model, GEMMA2_ROUTE_ATTR, False) is True:
+        # damaged Gemma2 champion route only: Gemma2 builds its full and sliding-window masks with the same position-id
+        # packed-sequence detection (masking_utils), so rows stay isolated in both layer types
+        from transformers.models.gemma2.modeling_gemma2 import Gemma2Attention, Gemma2ForCausalLM, Gemma2Model
+
+        native[Gemma2ForCausalLM] = (Gemma2Model, Gemma2Attention, "gemma2", 256000)
     spec = native.get(type(model))
     if (spec is None or type(getattr(model, "model", None)) is not spec[0]
             or any(type(layer.self_attn) is not spec[1] for layer in model.model.layers)):

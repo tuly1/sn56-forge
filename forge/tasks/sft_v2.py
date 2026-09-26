@@ -545,6 +545,73 @@ def field_bf16_micro_accum(*, unit_len: int, vocab: int, eff_default: int) -> tu
     return micro, max(1, math.ceil(eff_default / micro))
 
 
+# Damaged Gemma2 champion recipe (RESEARCH CANDIDATE 2026-09-26, branch research-gemma-champion-port-20260926; NOT released).
+# Evidence: replay-bench Phase U2 ran the public champion tree 251011a on the damaged gemma-2-2b ctxsplit replay (task
+# 59469903, layer_reinit, 0.75 h, native TRAIN 26,980 rows, 1 x H100 PCIe, one run, seed not controllable): historical
+# all-row 0.0474835 vs our damaged route 0.053679 / 0.053774 (Phase I aab85c9 s7 / s17; paired 99% CIs wholly below 0)
+# and the winner 0.0451093. Executed recipe (phase-u2/results-extra/pu2-r-gemma2-ctxsplit-champ/EXECUTED-RECIPE.md, from
+# the retained W&B config and trainer state): bf16 full FT + paged 8-bit AdamW, 32 FA-packed blocks of 3072 tokens per
+# optimizer step (the 2_4_b bucket 48 x 2048 / pack length), searched peak LR 2.9757061485479407e-05, warmup 11, cosine to
+# 0.25 x planned over 1.3 epochs (the planner floor) and stopped by the clock at 0.83 epoch, NEFTune alpha 1, wd 0, clip 1.
+# This route ports the pieces our stack does not already share: row-isolated packing (sdpa + position-id masks here, not
+# FA varlen), the block geometry, that fixed peak LR (not the search) and the 1.3-epoch planner floor. Everything else is
+# the incumbent damaged gemma2 route (dev split, evals and best-snapshot selection, soup, dev pass, finish reserve).
+# Scope = what was tested: the damaged-base FIELD route (DAMAGED_BASE_FAMILIES "gemma2" admitted it), model_type gemma2,
+# vocabulary 256000, GEMMA2_CHAMPION_MIN_PARAMS_B < params_b <= GEMMA2_CHAMPION_MAX_PARAMS_B (the gemma-2-2b class,
+# 2.614 B). Clean / unknown gemma2 (the adapter route), other families and other sizes are unchanged. If packing does not
+# qualify on the image the whole recipe is skipped (incumbent route, event sft_v2_gemma2_champion_skipped).
+# The validator runs the image with its own environment, so the production value is this constant;
+# FORGE_V2_GEMMA2_CHAMPION_RECIPE=0/1 overrides it for research replays (0 restores the incumbent route exactly).
+GEMMA2_CHAMPION_RECIPE_DEFAULT = "1"
+GEMMA2_CHAMPION_MIN_PARAMS_B = 2.0  # exclusive
+GEMMA2_CHAMPION_MAX_PARAMS_B = 3.0  # inclusive
+GEMMA2_CHAMPION_VOCAB = 256000
+GEMMA2_CHAMPION_PEAK_LR = 2.9757061485479407e-05  # the champion's search result on 59469903 (W&B learning_rate)
+GEMMA2_CHAMPION_MIN_EPOCHS = 1.3  # train_instruct.py planner: optimal_epochs = max(1.3, min(3, 1.25 * achievable / spe))
+GEMMA2_CHAMPION_BUCKET_BLOCKS = 48  # instruct_config 2_4_b batch_size
+GEMMA2_CHAMPION_BUCKET_LEN = 2048  # blocks shrink by BUCKET_LEN / pack_len above it (instruct_config default_max)
+GEMMA2_CHAMPION_MICRO_TOKENS = 36864  # micro-batch token budget (= field_bf16_micro_accum at vocab >= 200k)
+
+
+def _gemma2_champion_recipe() -> bool:
+    return os.environ.get("FORGE_V2_GEMMA2_CHAMPION_RECIPE", GEMMA2_CHAMPION_RECIPE_DEFAULT).strip() == "1"
+
+
+def gemma2_champion_admits(model_type: str | None, params_b: float, vocab_size: int | None, *,
+                           damaged_base_route: bool) -> bool:
+    """Damaged Gemma2 champion recipe admission (see GEMMA2_CHAMPION_RECIPE_DEFAULT): a run the dispatcher already put on
+    the damaged-base FIELD route, gemma2, vocabulary 256000, the tested size class."""
+    if not (damaged_base_route and _gemma2_champion_recipe()):
+        return False
+    if str(model_type or "").lower() != "gemma2" or vocab_size is None or int(vocab_size) != GEMMA2_CHAMPION_VOCAB:
+        return False
+    return GEMMA2_CHAMPION_MIN_PARAMS_B < params_b <= GEMMA2_CHAMPION_MAX_PARAMS_B
+
+
+def gemma2_champion_blocks(pack_len: int) -> int:
+    """Packed blocks per optimizer step: the champion's 2_4_b bucket (48) scaled by 2048 / pack length when the pack
+    length exceeds 2048 (instruct_config.get_training_json): 3072 -> 32, as executed on 59469903."""
+    if pack_len <= GEMMA2_CHAMPION_BUCKET_LEN:
+        return GEMMA2_CHAMPION_BUCKET_BLOCKS
+    return max(1, int(GEMMA2_CHAMPION_BUCKET_BLOCKS * GEMMA2_CHAMPION_BUCKET_LEN / pack_len))
+
+
+def gemma2_champion_micro_accum(pack_len: int, blocks: int) -> tuple[int, int]:
+    """(micro, accumulation) for ``blocks`` packed blocks per step within the micro token budget: the product closest to
+    ``blocks`` (ties: at least ``blocks``, then fewer accumulation steps). 32 x 3072 -> 8 x 4."""
+    cap = max(1, min(64, GEMMA2_CHAMPION_MICRO_TOKENS // max(1, pack_len), blocks))
+    first = max(1, math.ceil(blocks / cap))
+    best: tuple[tuple[int, int, int], int, int] | None = None
+    for accum in range(first, first + 3):
+        for micro in {blocks // accum, math.ceil(blocks / accum)}:
+            if 1 <= micro <= cap:
+                key = (abs(micro * accum - blocks), 0 if micro * accum >= blocks else 1, accum)
+                if best is None or key < best[0]:
+                    best = (key, micro, accum)
+    assert best is not None
+    return best[1], best[2]
+
+
 def _field_lr_calibration() -> bool:
     """CPU-reviewed research integration; never enabled by default."""
     return os.environ.get("FORGE_V2_FIELD_LR_CALIBRATION", "0") == "1"
@@ -1096,6 +1163,11 @@ def run(
         except Exception as exc:  # fused kernels are an optimisation, never a requirement
             _event_and_print("liger_apply_failed", error=f"{type(exc).__name__}: {exc}")
             use_liger = False
+    # damaged Gemma2 champion recipe (GEMMA2_CHAMPION_RECIPE_DEFAULT): row-isolated packing is admitted for this model
+    # instance only (forge.data.packing.GEMMA2_ROUTE_ATTR); geometry, LR and planner floor are applied below
+    _g2c = bool(field and gemma2_champion_admits(model_type, params_b, _vocab(model), damaged_base_route=damaged_base_route))
+    if _g2c:
+        setattr(model, packing.GEMMA2_ROUTE_ATTR, True)
     if field:
         model.config.use_cache = False
     pack = packing.plan_field_packing(
@@ -1152,6 +1224,23 @@ def run(
         geo = Geometry(micro, _accum, geo.max_len, geo.gradient_checkpointing, False,
                        "paged_adamw_8bit" if _bnb_available() else "adamw_torch")
         _event_and_print("sft_v2_field_bf16", params_b=round(params_b, 3), micro=geo.micro_batch, grad_accum=geo.grad_accum, optim=geo.optim)
+    _g2c_geometry = None
+    if _g2c and (pack is None or geo.fp32_master):
+        # the recipe is packed bf16 + paged 8-bit AdamW; without either the incumbent route runs unchanged
+        _event_and_print("sft_v2_gemma2_champion_skipped", reason="packing_unavailable" if pack is None else "fp32_master")
+        _g2c = False
+    if _g2c:
+        # research geometry env keeps precedence (as on every FIELD route); otherwise the champion's blocks per step
+        _g2c_env_geo = [k for k in (packing.ENV_EFF_BLOCKS, "FORGE_V2_EFF_BATCH", "FORGE_V2_FIELD_EFF_BATCH")
+                        if os.environ.get(k, "").strip() not in ("", "0")]
+        _g2c_blocks = gemma2_champion_blocks(pack.pack_len)
+        if not _g2c_env_geo:
+            micro, _accum = gemma2_champion_micro_accum(pack.pack_len, _g2c_blocks)
+            geo = Geometry(micro, _accum, geo.max_len, geo.gradient_checkpointing, False, geo.optim)
+            _eff_default = _g2c_blocks
+        _g2c_geometry = {"pack_len": pack.pack_len, "blocks": pack.n_blocks,
+                         "mean_rows_per_block": round(pack.mean_rows_per_block, 3), "target_blocks": _g2c_blocks,
+                         "env_geometry": _g2c_env_geo, "planned_micro": geo.micro_batch, "planned_grad_accum": geo.grad_accum}
     _small_batch_default_eff = None
     _small_batch_target_eff = None
     if strategy == "lora":
@@ -1301,6 +1390,24 @@ def run(
     field_calibration = field and _field_lr_calibration()
     if field_calibration:
         _lr_override = prior_lr
+    if _g2c:
+        # damaged Gemma2 champion recipe: the executed peak LR, fixed (no clamp, multiplier or sweep). FORGE_V2_LR and the
+        # opt-in FIELD calibration experiment keep precedence.
+        try:
+            _g2c_env_lr = float(os.environ.get("FORGE_V2_LR", "") or 0.0)
+        except ValueError:
+            _g2c_env_lr = 0.0
+        _g2c_fixed = not field_calibration and _g2c_env_lr <= 0
+        _g2c_prior = prior_lr
+        if _g2c_fixed:
+            prior_lr = GEMMA2_CHAMPION_PEAK_LR
+            _lr_override = prior_lr
+        _event_and_print("sft_v2_gemma2_champion_route", params_b=round(params_b, 3), rows=len(rows), train_n=len(train_ex),
+                         dev_n=len(dev_ex), **(_g2c_geometry or {}), micro=geo.micro_batch, grad_accum=geo.grad_accum,
+                         blocks_per_step=geo.eff_batch, rows_per_step=pack.rows_per_step(geo.eff_batch),
+                         steps_per_epoch=packing.optimizer_steps(pack.n_blocks, geo.micro_batch, geo.grad_accum),
+                         lr=prior_lr, lr_source="champion_fixed" if _g2c_fixed else ("calibration" if field_calibration else "env"),
+                         prior_lr_before=_g2c_prior, min_epochs=GEMMA2_CHAMPION_MIN_EPOCHS)
 
     _beta1 = 0.9
     _beta2 = 0.999
@@ -1813,6 +1920,10 @@ def run(
                 # the window (champion planner) so the wall-clock stop lands near the
                 # LR floor; the early stop and the best-snapshot pool cover the tail
                 epochs = min(epochs_left, 1.25 * achievable / steps_per_epoch)
+                if _g2c:
+                    # damaged Gemma2 champion recipe: the champion planner's 1.3-epoch floor on the cosine horizon (on
+                    # 59469903 it planned 390 steps and the clock stopped it at 250, LR 0.48 x peak)
+                    epochs = min(epochs_left, max(GEMMA2_CHAMPION_MIN_EPOCHS, epochs))
             elif phase == 0 or state["restarts"] or seed_b_active:
                 # first cycle: one fully annealed epoch (the strongest single
                 # candidate on small data), also the timing measurement
