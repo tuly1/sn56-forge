@@ -5,8 +5,10 @@ Synthetic damage follows the validator's own semantics (trainer/model_prep/augme
 research/20260915-codex-cpu-workstreams/augmentation/official-source): target = names containing "weight" but not
 "norm" / "embed"; math in float32, cast back to the stored dtype; noise std = intensity * std; scaling x intensity;
 pruning below the |w| quantile; re-init replaces a Bernoulli(intensity) mask with N(mean, std)."""
+import copy
 import gzip
 import json
+import os
 import random
 import struct
 from pathlib import Path
@@ -485,3 +487,88 @@ def test_real_qwen2_0p5b_damaged_bytes(aug, intensity):
     rep = damage.fingerprint_assess([f], read)
     assert rep["verdict"] == "damaged" and rep["compare"]["differ"] == 1, rep
     assert rep["compare"]["differ_sample"] == ["model.layers.12.mlp.up_proj.weight"]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# 2026-09-27 addendum: 36 small public bases (research/20260927-r1-release-candidate/fingerprints-addendum), built with
+# the same builder (HTTP range reads at the pinned commit). Offline checks on the shipped entries only.
+# ---------------------------------------------------------------------------------------------------------------------
+ADDENDUM_OWNER = {  # owner request 2026-09-27: model id -> pinned HF commit
+    "Qwen/Qwen2-0.5B-Instruct": "c540970f9e29518b1d8f06ab8b24cba66ad77b6d",
+    "Qwen/Qwen2.5-0.5B": "060db6499f32faf8b98477b0a26969ef7d8b9987",
+    "Qwen/Qwen2-1.5B": "8a16abf2848eda07cc5253dec660bf1ce007ad7a",
+    "Qwen/Qwen3-0.6B": "c1899de289a04d12100db370d81485cdf75e47ca",
+    "Qwen/Qwen3-1.7B": "70d244cc86ccca08cf5af4e1e306ecf908b1ad5e",
+}
+
+
+def _entry_fp(m):
+    return {"tensors": copy.deepcopy(m["tensors"]), "one_d": dict(m["one_d"]), "bytes_read": 0}
+
+
+def test_addendum_entries_are_pinned():
+    damage._TABLE_CACHE.clear()
+    t = damage.load_table()
+    add = t["addendum"]["models"]
+    assert len(add) == 36 and set(ADDENDUM_OWNER) <= set(add)
+    for mid, rev in ADDENDUM_OWNER.items():
+        assert t["models"][mid]["revision"] == rev, mid
+    for mid in add:
+        m = t["models"][mid]
+        assert len(m["revision"]) == 40 and m["name_hash"] == damage.name_hash(mid) and m["format"] == "safetensors"
+    # the validator re-save (save_pretrained) drops a tied lm_head.weight: the two post-trained Qwen3 repos store one,
+    # so their entries hold the re-saved tensor set (a damaged copy is always a re-save)
+    dropped = {mid: t["models"][mid].get("resave_dropped") for mid in add if t["models"][mid].get("resave_dropped")}
+    assert dropped == {"Qwen/Qwen3-0.6B": ["lm_head.weight"], "Qwen/Qwen3-1.7B": ["lm_head.weight"]}
+    assert all("lm_head.weight" not in t["models"][mid]["tensors"] for mid in dropped)
+
+
+def _twins(t, mid):
+    """Entries whose tensors are identical to ``mid``'s (byte-identical re-uploads, e.g. unsloth copies)."""
+    return {k for k, m in t["models"].items() if m["tensors"] == t["models"][mid]["tensors"]}
+
+
+@pytest.mark.parametrize("mid", sorted(ADDENDUM_OWNER))
+def test_addendum_owner_entries_clean_and_damaged(mid, monkeypatch):
+    from forge.tasks import sft_v2
+    for k in list(os.environ):
+        if k.startswith("FORGE_"):
+            monkeypatch.delenv(k, raising=False)
+    damage._TABLE_CACHE.clear()
+    t = damage.load_table()
+    m = t["models"][mid]
+    for name in (None, damage.name_hash(mid)):
+        rep = damage.fingerprint_assess([], None, model_name=name, table=t, fp=_entry_fp(m))
+        assert rep["verdict"] == "clean" and rep["source"] in _twins(t, mid), (name, rep)
+    # damage one per-layer matrix (validator targets: "weight", not norm / embed) -> damaged, same source
+    target = sorted(k for k, v in m["tensors"].items() if len(v[1]) == 2 and ".layers.1." in k and "weight" in k
+                    and not damage.is_protected(k))[0]
+    fp = _entry_fp(m)
+    fp["tensors"][target][2] = "0" * damage.PREFIX_HEX
+    rep = damage.fingerprint_assess([], None, table=t, fp=fp)
+    assert rep["verdict"] == "damaged" and rep["compare"]["differ"] == 1 and rep["source"] in _twins(t, mid), rep
+    # the damaged verdict takes the damaged-base FIELD route (qwen2 / qwen3 rows: vocabulary 151936, <= 3.5 B)
+    mt, vocab = m["config"]["model_type"], m["config"]["vocab_size"]
+    params_b = sum(int(np.prod(v[1])) for v in m["tensors"].values()) / 1e9
+    kw = dict(params_b=params_b, n_gpus=1, is_kl=False, model_type=mt, vocab_size=vocab, n_rows=26000,
+              total_tokens=13_000_000)
+    assert sft_v2.damage_detection_enabled(mt, vocab_size=vocab, params_b=params_b)
+    assert sft_v2.field_full_route(**kw, base_damage="damaged") and sft_v2.damaged_base_admits(mt, "damaged", params_b, vocab)
+    # a norm change is another checkpoint, never "damaged"
+    fp = _entry_fp(m)
+    norm = sorted(k for k in fp["tensors"] if damage.is_norm(k) and ".layers.1." in k)[0]
+    fp["tensors"][norm][2] = "0" * damage.PREFIX_HEX
+    assert damage.fingerprint_assess([], None, table=t, fp=fp)["verdict"] == "unknown"
+
+
+def test_addendum_qwen3_original_repo_reads_unknown_not_damaged():
+    """The original Qwen3-0.6B / 1.7B repos store a tied lm_head.weight that the re-save drops: a clean task that
+    delivers the original files reads "unknown" (structure differs; the qwen3 route is unchanged), never "damaged"."""
+    damage._TABLE_CACHE.clear()
+    t = damage.load_table()
+    for mid in ("Qwen/Qwen3-0.6B", "Qwen/Qwen3-1.7B"):
+        m = t["models"][mid]
+        fp = _entry_fp(m)
+        fp["tensors"]["lm_head.weight"] = list(m["tensors"]["model.embed_tokens.weight"])
+        rep = damage.fingerprint_assess([], None, table=t, fp=fp)
+        assert rep["verdict"] == "unknown" and rep["reason"] == "structure_differs", rep

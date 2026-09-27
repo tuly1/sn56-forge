@@ -350,7 +350,7 @@ def test_shipped_table_is_plain_json():
     assert max(b for b in raw) < 128 and max(len(line) for line in raw.split(b"\n")) < 4096
     damage._TABLE_CACHE.clear()
     t = damage.load_table()
-    assert t is not None and len(t["models"]) == 73
+    assert t is not None and len(t["models"]) == 109  # 73 (2026-09-23) + 36 small public bases (2026-09-27 addendum)
 
 
 def test_lfm2_small_recipe_matches_the_phase_h_fp32_arm(monkeypatch):
