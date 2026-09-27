@@ -347,13 +347,16 @@ def test_run_default_is_the_executed_recipe(monkeypatch, tmp_path):
     r = route[0]
     pk = t["packing"][0]
     assert pk["mode"] == "sdpa" and pk["pack_len"] == 3072 and t["skipped"] == []
-    assert (r["pack_len"], r["target_blocks"], r["micro"], r["grad_accum"], r["blocks_per_step"]) == (3072, 32, 8, 4, 32)
+    # pack-speed candidate (research-gemma-pack-speed-20260927): the 32 blocks run as one micro-batch (c292732 planned 8 x 4,
+    # still reported as planned_*; FORGE_V2_GEMMA2_PACK_SPEED=0 restores it, tests/test_gemma2_pack_speed.py)
+    assert (r["pack_len"], r["target_blocks"], r["micro"], r["grad_accum"], r["blocks_per_step"]) == (3072, 32, 32, 1, 32)
+    assert (r["planned_micro"], r["planned_grad_accum"]) == (8, 4)
     assert r["env_geometry"] == [] and r["blocks"] == pk["blocks"] and r["mean_rows_per_block"] == pytest.approx(
         pk["rows"] / pk["blocks"], abs=1e-3)
     assert 2.0 < r["mean_rows_per_block"] < 3.5  # the replay cell's ~2.7 rows per block
     assert r["steps_per_epoch"] == math.ceil(pk["blocks"] / 32)
     assert r["lr"] == EXECUTED_LR and r["lr_source"] == "champion_fixed" and r["min_epochs"] == 1.3
-    assert (t["micro"], t["accum"]) == (8, 4)
+    assert (t["micro"], t["accum"]) == (32, 1)
     # the fixed LR reaches every LR point (no clamp, multiplier, sweep or sft_v2_lr_override research event)
     assert t["override"] == []
     assert t["sweep_gate_lr"] == t["train_start_lr"] == t["plan"]["lr"] == t["trainer_lr"] == EXECUTED_LR

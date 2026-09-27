@@ -125,9 +125,13 @@ class PackedPadCollator:
     transformers' position-id detection: rows are isolated.
     """
 
-    def __init__(self, pad_token_id: int | None, *, attention_mask: bool = True) -> None:
+    def __init__(self, pad_token_id: int | None, *, attention_mask: bool = True, pad_as_row: bool = False) -> None:
         self._pad = pad_token_id if pad_token_id is not None else 0
         self.attention_mask = attention_mask
+        # varlen attention (damaged Gemma2 pack-speed route only): the pad tail of a block is ONE extra row (positions
+        # 0..pad-1) instead of one row per pad token, so the kernel sees ~4 segments per block, not hundreds; pads carry
+        # label -100 and sit after the block's real rows, so real-token outputs are unchanged
+        self.pad_as_row = pad_as_row
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         import torch
@@ -139,7 +143,7 @@ class PackedPadCollator:
             pad = width - n
             ids.append(list(f["input_ids"]) + [self._pad] * pad)
             labels.append(list(f["labels"]) + [IGNORE] * pad)
-            pos.append(list(f["position_ids"]) + [0] * pad)
+            pos.append(list(f["position_ids"]) + (list(range(pad)) if self.pad_as_row else [0] * pad))
             attn.append([1] * n + [0] * pad)
         out = {
             "input_ids": torch.tensor(ids, dtype=torch.long),
@@ -309,3 +313,220 @@ def optimizer_steps(n_units: int, micro: int, accum: int) -> int:
     if micro <= 0 or accum <= 0:
         raise ValueError("micro and accumulation must be positive")
     return max(1, math.ceil(n_units / (micro * accum)))
+
+
+# ---- varlen attention for the damaged Gemma2 champion route (research-gemma-pack-speed-20260927) ------------------
+#
+# The sdpa route above isolates packed rows through a materialised 4-D block-diagonal mask. PyTorch's flash kernel
+# takes no mask, so sdpa runs a masked kernel over every (query, key) pair of the block, including the other rows and
+# the future half. Varlen attention runs the flash kernel per row instead, from cumulative row offsets (cu_seqlens)
+# derived from the same reset position ids, the way the public champion's FA2 varlen packing does. Semantics are the
+# sdpa route's exactly: causal inside each row, nothing across rows, NO attention-logit softcap (transformers 5.12.1
+# sdpa drops it too, and the pinned evaluator scores with sdpa), and the sliding window never binds because every
+# row fits inside it (checked). The kernel is PyTorch's own FA2 (torch.ops.aten._flash_attention_forward, the op
+# torch's nested-tensor SDPA calls); the flash-attn package is not in the image. CPU has no flash kernel, so there
+# the same function runs a per-row sdpa loop (the reference the CUDA self-check compares flash against).
+
+VARLEN_ATTN = "forge_gemma2_varlen"
+VARLEN_BACKEND_ATTR = "_forge_varlen_backend"  # set on each attention module: "flash" (CUDA) or "segment_loop"
+VARLEN_BACKENDS = ("flash", "segment_loop")
+
+_SEGMENT_CACHE: dict[str, Any] = {}
+
+
+def segment_offsets(position_ids: Any, batch: int, length: int) -> tuple[Any, int]:
+    """Row offsets over the flattened ``[batch * length]`` tokens: a row starts at every batch row's first token and
+    wherever the position id does not advance by exactly 1 (transformers' ``find_packed_sequence_indices`` rule).
+    Returns (int32 cumulative offsets incl. 0 and batch * length, the longest row)."""
+    import torch
+
+    pos = position_ids
+    if pos.dim() == 1:
+        pos = pos.unsqueeze(0)
+    if pos.shape[0] != batch:
+        pos = pos.expand(batch, -1)
+    if pos.shape[1] != length:
+        raise ValueError(f"position_ids length {pos.shape[1]} != sequence length {length}")
+    start = torch.ones((batch, length), dtype=torch.bool, device=pos.device)
+    if length > 1:
+        start[:, 1:] = (pos[:, 1:] - pos[:, :-1]) != 1
+    idx = torch.nonzero(start.reshape(-1), as_tuple=False).flatten()
+    cu = torch.cat([idx, idx.new_tensor([batch * length])]).to(torch.int32)
+    return cu, int((cu[1:] - cu[:-1]).max().item())
+
+
+def _segments(position_ids: Any, batch: int, length: int) -> tuple[Any, int]:
+    """segment_offsets, computed once per forward: every layer (and the checkpointed recompute) receives the same
+    position_ids object, so a weak reference to it keys the cache (a new batch is a new object)."""
+    import weakref
+
+    hit = _SEGMENT_CACHE.get("entry")
+    key = (batch, length, int(position_ids._version), str(position_ids.device))
+    if hit is not None and hit[0]() is position_ids and hit[1] == key:
+        return hit[2]
+    value = segment_offsets(position_ids, batch, length)
+    _SEGMENT_CACHE["entry"] = (weakref.ref(position_ids), key, value)
+    return value
+
+
+def _flash_varlen(q: Any, k: Any, v: Any, cu: Any, max_len: int, dropout: float, scale: float | None) -> Any:
+    """``[T, H, D]`` causal varlen attention with PyTorch's FA2 kernel (CUDA, fp16/bf16); autograd is registered."""
+    import torch
+
+    return torch.ops.aten._flash_attention_forward(q, k, v, cu, cu, max_len, max_len, float(dropout), True, False,
+                                                   scale=scale)[0]
+
+
+def _loop_varlen(q: Any, k: Any, v: Any, cu: Any, dropout: float, scale: float | None) -> Any:
+    """The reference: plain causal sdpa on each row separately (CPU path and the CUDA self-check's comparison)."""
+    import torch
+
+    bounds = cu.tolist()
+    outs = []
+    for s, e in zip(bounds[:-1], bounds[1:]):
+        o = torch.nn.functional.scaled_dot_product_attention(
+            q[s:e].transpose(0, 1).unsqueeze(0), k[s:e].transpose(0, 1).unsqueeze(0),
+            v[s:e].transpose(0, 1).unsqueeze(0), dropout_p=float(dropout), is_causal=True, scale=scale)
+        outs.append(o[0].transpose(0, 1))
+    return torch.cat(outs, dim=0)
+
+
+def varlen_attention_forward(module: Any, query: Any, key: Any, value: Any, attention_mask: Any, dropout: float = 0.0,
+                             scaling: float | None = None, sliding_window: int | None = None, softcap: float | None = None,
+                             position_ids: Any = None, **kwargs: Any) -> tuple[Any, None]:
+    """transformers AttentionInterface entry. A batch that carries a padding mask (dev evaluation, the dev pass) or
+    decodes against a cache takes transformers' sdpa function unchanged; packed / plain causal training batches take
+    varlen attention. ``softcap`` is dropped exactly as sdpa drops it."""
+    from transformers.integrations.sdpa_attention import repeat_kv, sdpa_attention_forward
+
+    if attention_mask is not None or position_ids is None or query.shape[2] != key.shape[2]:
+        return sdpa_attention_forward(module, query, key, value, attention_mask, dropout=dropout, scaling=scaling,
+                                      sliding_window=sliding_window, softcap=softcap, **kwargs)
+    batch, heads, length, head_dim = query.shape
+    n_rep = heads // key.shape[1]
+    key, value = repeat_kv(key, n_rep), repeat_kv(value, n_rep)
+    cu, max_len = _segments(position_ids, batch, length)
+    if sliding_window is not None and max_len > int(sliding_window):
+        raise RuntimeError(f"varlen row of {max_len} tokens exceeds the sliding window {sliding_window}")
+    q = query.transpose(1, 2).reshape(batch * length, heads, head_dim)
+    k = key.transpose(1, 2).reshape(batch * length, heads, head_dim)
+    v = value.transpose(1, 2).reshape(batch * length, heads, value.shape[-1])
+    backend = getattr(module, VARLEN_BACKEND_ATTR, "segment_loop")
+    if backend == "flash":
+        out = _flash_varlen(q, k, v, cu.to(q.device), max_len, dropout, scaling)
+    else:
+        out = _loop_varlen(q, k, v, cu, dropout, scaling)
+    return out.view(batch, length, heads, value.shape[-1]), None
+
+
+def varlen_mask(*args: Any, attention_mask: Any = None, **kwargs: Any) -> Any:
+    """AttentionMaskInterface entry: no mask for mask-free batches (varlen reads the rows from position_ids, like
+    FA2); a padded batch gets exactly the mask sdpa would, for the sdpa fallback above."""
+    if attention_mask is None:
+        return None
+    from transformers.masking_utils import sdpa_mask
+
+    return sdpa_mask(*args, attention_mask=attention_mask, **kwargs)
+
+
+def register_varlen() -> None:
+    from transformers import AttentionInterface
+    from transformers.masking_utils import AttentionMaskInterface
+
+    AttentionInterface.register(VARLEN_ATTN, varlen_attention_forward)
+    AttentionMaskInterface.register(VARLEN_ATTN, varlen_mask)
+
+
+def flash_varlen_self_check(device: Any, dtype: Any, heads: int, head_dim: int, scale: float | None,
+                            *, impl: Callable[..., Any] | None = None, tol: float = 0.05) -> str | None:
+    """Forward + backward of the flash varlen call against the per-row reference on ragged rows (lengths 1..90) at
+    the model's real heads / head_dim / dtype. None = agree; otherwise the reason (the route then stays on sdpa)."""
+    import torch
+
+    impl = impl or _flash_varlen
+    try:
+        g = torch.Generator().manual_seed(20260927)
+        lens = [37, 5, 1, 90, 3, 64]
+        total = sum(lens)
+        cu = torch.tensor([0] + [sum(lens[:i + 1]) for i in range(len(lens))], dtype=torch.int32, device=device)
+        base = [torch.randn(total, heads, head_dim, generator=g).to(device=device, dtype=dtype) for _ in range(3)]
+        w = torch.randn(total, heads, head_dim, generator=g).to(device=device, dtype=torch.float32)
+        results = []
+        for fn in (lambda q, k, v: impl(q, k, v, cu, max(lens), 0.0, scale),
+                   lambda q, k, v: _loop_varlen(q, k, v, cu, 0.0, scale)):
+            qkv = [t.clone().requires_grad_(True) for t in base]
+            out = fn(*qkv)
+            (out.float() * w).sum().backward()
+            results.append([out.detach().float()] + [t.grad.detach().float() for t in qkv])
+        for name, a, b in zip(("out", "dq", "dk", "dv"), results[0], results[1]):
+            if a.shape != b.shape:
+                return f"{name}_shape:{tuple(a.shape)}!={tuple(b.shape)}"
+            err = float((a - b).abs().max())
+            if not err <= tol * max(1.0, float(b.abs().max())):
+                return f"{name}_mismatch:{err:.4g}"
+        return None
+    except Exception as exc:  # noqa: BLE001 - any kernel failure keeps the sdpa route
+        return f"{type(exc).__name__}: {exc}"[:200]
+
+
+def enable_gemma2_varlen(model: Any, *, pack_len: int, log: Callable[..., None] | None = None) -> str | None:
+    """Switch an admitted damaged-Gemma2 packed model from sdpa to varlen attention. Returns the backend ("flash" on
+    CUDA after a passing self-check, "segment_loop" on CPU) or None with the model left on sdpa. Only called for
+    a model that already qualified for sdpa packing (plan_field_packing mode "sdpa")."""
+    import torch
+
+    reason = None
+    cfg = getattr(model, "config", None)
+    layers = list(getattr(getattr(model, "model", None), "layers", []) or [])
+    sliding = getattr(cfg, "sliding_window", None)
+    if getattr(model, GEMMA2_ROUTE_ATTR, False) is not True or getattr(cfg, "model_type", None) != "gemma2":
+        reason = "not_gemma2_route"
+    elif not layers or any(getattr(l.self_attn.config, "_attn_implementation", None) != "sdpa" for l in layers):
+        reason = "sdpa_backend_required"
+    elif sliding is not None and int(pack_len) > int(sliding):
+        reason = f"pack_len_exceeds_sliding_window:{pack_len}>{sliding}"
+    elif getattr(model, "hf_device_map", None) and len(set(map(str, model.hf_device_map.values()))) > 1:
+        reason = "sharded"
+    elif not hasattr(model, "set_attn_implementation"):
+        reason = "no_set_attn_implementation"
+    backend = None
+    if reason is None:
+        param = next(model.parameters())
+        if param.device.type == "cuda":
+            heads = int(cfg.num_attention_heads)
+            head_dim = int(getattr(cfg, "head_dim", None) or cfg.hidden_size // heads)
+            scale = float(cfg.query_pre_attn_scalar) ** -0.5
+            dtype = param.dtype if param.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
+            err = flash_varlen_self_check(param.device, dtype, heads, head_dim, scale)
+            if err is not None:
+                reason = "self_check_failed:" + err
+            else:
+                backend = "flash"
+        else:
+            backend = "segment_loop"
+    if reason is None:
+        try:
+            register_varlen()
+            model.set_attn_implementation(VARLEN_ATTN)
+            if any(getattr(l.self_attn.config, "_attn_implementation", None) != VARLEN_ATTN for l in layers):
+                raise RuntimeError("layers did not switch")
+            for layer in layers:
+                setattr(layer.self_attn, VARLEN_BACKEND_ATTR, backend)
+        except Exception as exc:  # noqa: BLE001
+            reason = f"switch_failed:{type(exc).__name__}: {exc}"[:200]
+            disable_gemma2_varlen(model)
+    if log is not None:
+        log("sft_v2_gemma2_varlen", enabled=reason is None, backend=backend if reason is None else None,
+            reason=reason, attn_implementation=getattr(cfg, "_attn_implementation", None), pack_len=int(pack_len),
+            sliding_window=sliding, softcap_applied=False)
+    return backend if reason is None else None
+
+
+def disable_gemma2_varlen(model: Any) -> None:
+    try:
+        model.set_attn_implementation("sdpa")
+    except Exception:  # noqa: BLE001
+        model.config._attn_implementation = "sdpa"
+    for layer in list(getattr(getattr(model, "model", None), "layers", []) or []):
+        if hasattr(layer.self_attn, VARLEN_BACKEND_ATTR):
+            delattr(layer.self_attn, VARLEN_BACKEND_ATTR)

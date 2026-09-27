@@ -577,6 +577,34 @@ def _gemma2_champion_recipe() -> bool:
     return os.environ.get("FORGE_V2_GEMMA2_CHAMPION_RECIPE", GEMMA2_CHAMPION_RECIPE_DEFAULT).strip() == "1"
 
 
+# Damaged Gemma2 pack-speed candidate (research-gemma-pack-speed-20260927, research/20260927-gemma-pack-speed/DESIGN.md):
+# phase-w measured the ported route at 11.4 s per 32-block step on H100 PCIe against the public champion's 6.0 s (same
+# physical GPU). On the champion route only, packed training batches take varlen attention (forge.data.packing: PyTorch's
+# FA2 kernel per row from the reset position ids, no 4-D mask, row isolation and sdpa semantics unchanged, softcap still
+# off like the evaluator) and the step runs as ONE micro-batch of all its blocks (32 x 1 instead of 8 x 4), as the
+# champion did; the memory probe still shrinks it. The varlen kernel is verified against a per-row reference on the GPU
+# before use; if that fails, the route stays exactly on c292732's sdpa 8 x 4. FORGE_V2_GEMMA2_PACK_SPEED=0 restores c292732
+# exactly; FORGE_V2_GEMMA2_VARLEN=0/1 and FORGE_V2_GEMMA2_ONE_MICRO=0/1 split the two parts for component timing arms.
+GEMMA2_PACK_SPEED_DEFAULT = "1"
+GEMMA2_ONE_MICRO_MAX_TOKENS = 131072  # one micro-batch up to 41 blocks of 3136 (the champion ran 32 x 3072 = 98,304)
+
+
+def _gemma2_pack_speed() -> bool:
+    return os.environ.get("FORGE_V2_GEMMA2_PACK_SPEED", GEMMA2_PACK_SPEED_DEFAULT).strip() == "1"
+
+
+def _gemma2_pack_speed_part(name: str) -> bool | None:
+    """Explicit research setting of one part (FORGE_V2_GEMMA2_VARLEN / FORGE_V2_GEMMA2_ONE_MICRO), else None."""
+    raw = os.environ.get(name, "").strip()
+    return None if raw not in ("0", "1") else raw == "1"
+
+
+def gemma2_one_micro(blocks_per_step: int, pack_len: int) -> tuple[int, int]:
+    """(micro, accumulation) running ``blocks_per_step`` blocks as one micro-batch within GEMMA2_ONE_MICRO_MAX_TOKENS."""
+    micro = max(1, min(int(blocks_per_step), GEMMA2_ONE_MICRO_MAX_TOKENS // max(1, int(pack_len))))
+    return micro, max(1, math.ceil(int(blocks_per_step) / micro))
+
+
 def gemma2_champion_admits(model_type: str | None, params_b: float, vocab_size: int | None, *,
                            damaged_base_route: bool) -> bool:
     """Damaged Gemma2 champion recipe admission (see GEMMA2_CHAMPION_RECIPE_DEFAULT): a run the dispatcher already put on
@@ -1241,6 +1269,24 @@ def run(
         _g2c_geometry = {"pack_len": pack.pack_len, "blocks": pack.n_blocks,
                          "mean_rows_per_block": round(pack.mean_rows_per_block, 3), "target_blocks": _g2c_blocks,
                          "env_geometry": _g2c_env_geo, "planned_micro": geo.micro_batch, "planned_grad_accum": geo.grad_accum}
+        if _gemma2_pack_speed():
+            # pack-speed candidate (GEMMA2_PACK_SPEED_DEFAULT): varlen attention, then one micro-batch per step
+            _g2v_want = _gemma2_pack_speed_part("FORGE_V2_GEMMA2_VARLEN")
+            _g2v_backend = None
+            if (_g2v_want is None or _g2v_want) and pack.mode == "sdpa":
+                _g2v_backend = packing.enable_gemma2_varlen(model, pack_len=pack.pack_len, log=_event_and_print)
+            if _g2v_backend is not None:
+                pack.collator = packing.PackedPadCollator(tokenizer.pad_token_id, attention_mask=False, pad_as_row=True)
+                pack.attn_implementation = f"{packing.VARLEN_ATTN}:{_g2v_backend}"
+            _g2v_one = _gemma2_pack_speed_part("FORGE_V2_GEMMA2_ONE_MICRO")
+            _g2v_one = (_g2v_backend is not None) if _g2v_one is None else _g2v_one
+            if _g2v_one and not _g2c_env_geo:
+                micro, _accum = gemma2_one_micro(geo.micro_batch * geo.grad_accum, pack.pack_len)
+                geo = Geometry(micro, _accum, geo.max_len, geo.gradient_checkpointing, False, geo.optim)
+            _event_and_print("sft_v2_gemma2_pack_speed", varlen_backend=_g2v_backend, one_micro=bool(_g2v_one and not _g2c_env_geo),
+                             micro=geo.micro_batch, grad_accum=geo.grad_accum, blocks_per_step=geo.eff_batch,
+                             planned_micro=_g2c_geometry["planned_micro"],
+                             planned_grad_accum=_g2c_geometry["planned_grad_accum"])
     _small_batch_default_eff = None
     _small_batch_target_eff = None
     if strategy == "lora":
