@@ -823,7 +823,9 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         # damaged-base route (2026-09-22): detection runs only for enabled DAMAGED_BASE_FAMILIES (or qwen2 while the
         # default-off clean small-Qwen route is on), single GPU, non-KL
         _vocab_size = int(getattr(getattr(loaded.model, "config", None), "vocab_size", 0) or 0) or None
-        _damage_family = (sft_v2.damage_detection_enabled(_mt) and (not pinned_route or lfm_pin)
+        # (llama: only the damaged MiniCPM5-1B shape, sft_v2.damaged_minicpm5_shape; needs vocabulary and size)
+        _damage_family = (sft_v2.damage_detection_enabled(_mt, vocab_size=_vocab_size, params_b=params_b)
+                          and (not pinned_route or lfm_pin)
                           and not falcon_legacy_route and n_gpus == 1 and not is_kl)
         _identity_family = (_mt in sft_v2.FIELD_IDENTICAL_BASE_TYPES and sft_v2._field_identical_base()
                             and not pinned_route and not falcon_legacy_route and n_gpus == 1 and not is_kl)

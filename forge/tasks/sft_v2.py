@@ -349,9 +349,61 @@ def clean_small_qwen_enabled(model_type: str | None) -> bool:
     return _field_full() and _clean_small_qwen() and str(model_type or "").lower() == "qwen2"
 
 
-def damage_detection_enabled(model_type: str | None) -> bool:
-    """Whether the dispatcher should run damage detection for this family at all."""
-    return damaged_base_family_enabled(model_type) or clean_small_qwen_enabled(model_type)
+# Damaged MiniCPM5-1B FIELD route (RELEASE CANDIDATE 2026-09-27, branch release-r1-noqwen-20260927; NOT released).
+# Evidence: replay-bench Phase Y (research/20260923-replay-bench/phase-y/CLOSEOUT-20260927.md): one validator-damaged
+# openbmb/MiniCPM5-1B (G.O.D dd8e898 layer_reinit multi_layer 0.0993; 1.0806 B), OpenOrca 26k fixture, external DEV-512,
+# seed 7, 1.0 h per arm on 1 x H100. F1 = 52d319d + FORGE_V2_FIELD_TYPES=llama, FORGE_V2_FIELD_BF16=1,
+# FORGE_V2_FIELD_BF16_MIN_B=0.3 (FIELD full BF16 at the formula LR, clamped to 1e-4): 1.624800 vs the live v2 LoRA
+# 1.647194, -1.36%, paired 99% CI [-0.04499, -0.00132] (PASS_SEED7). F2 (LR x0.5) REJECT, +7.18%. Seed 17 and a second
+# fixture / damage type are pending.
+# Scope = what was tested: model_type "llama" with vocabulary 130560 (MiniCPM5; Llama-3.x is 128256) and
+# DAMAGED_MINICPM5_MIN_PARAMS_B < params_b <= DAMAGED_MINICPM5_MAX_PARAMS_B, read "damaged" by the damage detectors.
+# Damage detection runs for exactly that llama shape; every other llama base (Llama-3.x 128256, TinyLlama 32000,
+# SmolLM2 49152, other sizes) keeps its 52d319d route with no detection pass, and a clean / unknown MiniCPM5 keeps the
+# adapter route (FIELD_FULL_VOCABS still refuses 130560). DAMAGED_BASE_FAMILIES["llama"] stays disabled.
+# Recipe = F1's executed env, through the damaged-base recipe path (field_recipe(damaged_base=True) reads the llama row's
+# recipe fields: bf16_min_b 0.3, lr_mult 1.0, no small band): bf16 weights + paged 8-bit AdamW, LR = clamp(analytic,
+# 2e-5, 1e-4) x 1.0 (1e-4 on this base), FIELD eff batch 100 (1-2 B), unpacked (packing qualifies Llama 128256 only),
+# llama floors 10k rows / 5M tokens. The export is the plain LlamaForCausalLM save (no auto_map, no .py files).
+# Switches: FORGE_V2_DAMAGED_MINICPM5=0 restores 52d319d exactly (no detection, no admission); the damaged-base master
+# switch FORGE_V2_DAMAGED_BASE_ROUTE=0 and FORGE_V2_FIELD=0 also turn it off.
+DAMAGED_MINICPM5_ROUTE_DEFAULT = "1"
+DAMAGED_MINICPM5_MODEL_TYPE = "llama"
+DAMAGED_MINICPM5_VOCAB = 130560
+DAMAGED_MINICPM5_MIN_PARAMS_B = 0.9   # exclusive; tested 1.0806 B
+DAMAGED_MINICPM5_MAX_PARAMS_B = 1.3   # inclusive
+
+
+def _damaged_minicpm5() -> bool:
+    return os.environ.get("FORGE_V2_DAMAGED_MINICPM5", DAMAGED_MINICPM5_ROUTE_DEFAULT).strip() == "1"
+
+
+def damaged_minicpm5_shape(model_type: str | None, params_b: float | None, vocab_size: int | None) -> bool:
+    """Switches on and the base has the tested MiniCPM5-1B shape (llama, vocabulary 130560, size band). An unknown
+    vocabulary or size never matches."""
+    if not (_field_full() and _damaged_base_route() and _damaged_minicpm5()):
+        return False
+    if str(model_type or "").lower() != DAMAGED_MINICPM5_MODEL_TYPE or vocab_size is None or params_b is None:
+        return False
+    try:
+        vocab, size = int(vocab_size), float(params_b)
+    except (TypeError, ValueError):
+        return False
+    return vocab == DAMAGED_MINICPM5_VOCAB and DAMAGED_MINICPM5_MIN_PARAMS_B < size <= DAMAGED_MINICPM5_MAX_PARAMS_B
+
+
+def damaged_minicpm5_admits(model_type: str | None, base_damage: str | None, params_b: float | None,
+                            vocab_size: int | None) -> bool:
+    """Damaged MiniCPM5-1B admission to the damaged-base FIELD route (row / token floors applied by field_full_route)."""
+    return base_damage == "damaged" and damaged_minicpm5_shape(model_type, params_b, vocab_size)
+
+
+def damage_detection_enabled(model_type: str | None, *, vocab_size: int | None = None,
+                             params_b: float | None = None) -> bool:
+    """Whether the dispatcher should run damage detection for this family at all (for llama: only the damaged
+    MiniCPM5-1B shape, which needs ``vocab_size`` and ``params_b``)."""
+    return (damaged_base_family_enabled(model_type) or clean_small_qwen_enabled(model_type)
+            or damaged_minicpm5_shape(model_type, params_b, vocab_size))
 
 
 def damage_detectors() -> tuple[str, ...]:
@@ -370,6 +422,8 @@ def damaged_base_admits(model_type: str | None, base_damage: str | None, params_
     """Damage verdict + enabled family + tested vocabulary + size cap (never above FIELD_FULL_MAX_PARAMS_B). The
     remaining field gates (GPUs, KL, rows, tokens) are applied by field_full_route."""
     _mt = str(model_type or "").lower()
+    if damaged_minicpm5_admits(_mt, base_damage, params_b, vocab_size):
+        return True  # the scoped damaged MiniCPM5-1B admission (the llama family row itself stays disabled)
     if base_damage != "damaged" or not damaged_base_family_enabled(_mt):
         return False
     fam = _damaged_family(_mt)
@@ -1244,6 +1298,8 @@ def run(
     if field:
         _event_and_print("sft_v2_field_recipe", damaged_base=bool(damaged_base_route),
                          clean_small_qwen=bool(clean_small_qwen_route), **_recipe)
+        if damaged_base_route and damaged_minicpm5_shape(model_type, params_b, vocab):
+            _event_and_print("sft_v2_damaged_minicpm5_route", params_b=round(params_b, 4), vocab=vocab)
     if field and geo.fp32_master and _recipe["bf16"] and os.environ.get("FORGE_V2_FP32_MASTER", "").strip() != "1":
         # 2–4B full weights in fp32 master are throughput-bound in a tournament window
         # (Gemma-2-2B 12.4 s/step → 0.49 epoch in 45 min); bf16 weights + 8-bit AdamW
