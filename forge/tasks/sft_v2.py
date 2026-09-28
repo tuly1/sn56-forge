@@ -461,10 +461,66 @@ def clean_small_qwen_admits(model_type: str | None, base_damage: str | None, par
     return 0 < params_b <= min(CLEAN_SMALL_QWEN_MAX_PARAMS_B, FIELD_FULL_MAX_PARAMS_B)
 
 
+# Clean LFM2.5-1.2B-Instruct FIELD route (CONTINGENT RELEASE CANDIDATE 2026-09-28, branch release-clean-lfm12-field-20260928).
+# Ships only if replay-bench Phase AJ (research/20260923-replay-bench/phase-aj/CARD.md: clean public LFM2.5-1.2B-Instruct
+# @0f604ada, Turkish cc4550ab reduced TRAIN 80,704 rows / 16.79M tokens, row median 179, seed 7, 1.0 h per arm on 1 x H100)
+# meets the owner rule: arm F (11c41a7 + FORGE_V2_FIELD_TYPES=lfm2 + FORGE_V2_FIELD_LR_MULT=2) clearly beats arm C
+# (11c41a7 as deployed: the legacy production LoRA on short rows, the v2 LoRA on long rows), or C is worse than untrained.
+# The route is exactly what F executes, now without env: FIELD full weights for every row length (the FIELD route forces
+# strategy full and overrides the short-row gate), field_recipe(damaged_base=False) = bf16 False at 1.17 B (< the 2.0 B
+# bf16 minimum) -> the geometry's fp32 master + fused AdamW, LR = clamp(analytic, 2e-5, 1e-4) x 2, FIELD eff batch 100,
+# unpacked (packing admits Llama / Qwen2 only), and the generic FIELD floors 15k rows / 8M tokens (F's floors: the
+# FIELD_TYPES env bypassed only the family, vocabulary and 2.0 B minimum-size gates). F on the same base = the recipe
+# production already ships for the damaged small lfm2 band (DAMAGED_BASE_FAMILIES lfm2: fp32 master, LR x2).
+# Scope = what was tested: model_type lfm2, a "clean" damage verdict whose named public reference is exactly
+# LiquidAI/LFM2.5-1.2B-Instruct (fingerprint prefix identity; the task's model name is NOT trusted), 0 < params_b <= 1.5.
+# LFM2-1.2B, LFM2.5-1.2B-Base, LFM2(.5)-350M / 700M, unknown or damaged lfm2 bases and LFM2.5-2.6B keep their 11c41a7
+# routes (a damaged 1.2B already takes the damaged-base small band). FORGE_V2_CLEAN_SMALL_LFM2=0 restores 11c41a7 exactly.
+CLEAN_SMALL_LFM2_ROUTE_DEFAULT = "1"
+CLEAN_SMALL_LFM2_MODEL_TYPE = "lfm2"
+CLEAN_SMALL_LFM2_REFERENCES = frozenset({"liquidai/lfm2.5-1.2b-instruct"})  # forge.routing.damage.reference_id form
+CLEAN_SMALL_LFM2_MAX_PARAMS_B = 1.5  # inclusive; tested 1.1703 B
+CLEAN_SMALL_LFM2_LR_MULT = 2.0
+
+
+def _clean_small_lfm2() -> bool:
+    return os.environ.get("FORGE_V2_CLEAN_SMALL_LFM2", CLEAN_SMALL_LFM2_ROUTE_DEFAULT).strip() == "1"
+
+
+def clean_base_reference(report: dict[str, Any] | None) -> str | None:
+    """The one public reference (forge.routing.damage.reference_id form) that a "clean" damage.assess verdict names; None
+    for any other verdict, a reference-free verdict or disagreeing references."""
+    if not isinstance(report, dict) or report.get("verdict") != "clean":
+        return None
+    from forge.routing.damage import reference_id
+
+    refs = {reference_id(r.get("reference") or r.get("source")) for r in (report.get("detectors") or {}).values()
+            if isinstance(r, dict) and r.get("verdict") == "clean"} - {None}
+    return next(iter(refs)) if len(refs) == 1 else None
+
+
+def clean_small_lfm2_admits(model_type: str | None, base_damage: str | None, params_b: float | None,
+                            base_clean_ref: str | None = None) -> bool:
+    """Clean LFM2.5-1.2B-Instruct FIELD admission (row / token floors and the size cap applied by field_full_route)."""
+    if not (_field_full() and _clean_small_lfm2()):
+        return False
+    if str(model_type or "").lower() != CLEAN_SMALL_LFM2_MODEL_TYPE or base_damage != "clean" or not base_clean_ref:
+        return False
+    from forge.routing.damage import reference_id
+
+    if reference_id(base_clean_ref) not in CLEAN_SMALL_LFM2_REFERENCES:
+        return False
+    try:
+        size = float(params_b)
+    except (TypeError, ValueError):
+        return False
+    return 0 < size <= min(CLEAN_SMALL_LFM2_MAX_PARAMS_B, FIELD_FULL_MAX_PARAMS_B)
+
+
 def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: str | None = None,
                      n_rows: int | None = None, total_tokens: int | None = None, vocab_size: int | None = None,
                      base_identity: str | None = None, base_candidate: str | None = None,
-                     base_damage: str | None = None) -> bool:
+                     base_damage: str | None = None, base_clean_ref: str | None = None) -> bool:
     """Full weights at the field geometry for single-GPU, non-KL instruct tasks up to
     FIELD_FULL_MAX_PARAMS_B (FORGE_V2_FIELD_MAX_PARAMS_B overrides) on an allow-listed
     model family (field_full_types) with at least field_full_min_rows() rows: full weights
@@ -474,13 +530,16 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
     FIELD_IDENTICAL_BASE_TYPES only when it is "identical" and FORGE_V2_FIELD_IDENTICAL_BASE=1. ``base_damage``
     (forge.routing.damage verdict) admits an enabled DAMAGED_BASE_FAMILIES family on a "damaged" base (tested vocabulary,
     no family minimum size) and, only when switched on, a small qwen2 base read "clean" (clean_small_qwen_admits);
-    the row and token floors and the size cap still apply."""
+    the row and token floors and the size cap still apply. ``base_clean_ref`` (clean_base_reference of the damage report)
+    admits the clean LFM2.5-1.2B-Instruct (clean_small_lfm2_admits) past the lfm2 vocabulary and 2.0 B minimum gates, as
+    FORGE_V2_FIELD_TYPES=lfm2 did in Phase AJ arm F; the family, floors and cap still apply."""
     if not _field_full() or is_kl or n_gpus != 1 or params_b <= 0:
         return False
     _mt = str(model_type).lower() if model_type is not None else None
     damaged_admit = damaged_base_admits(_mt, base_damage, params_b, vocab_size)
     csq_admit = not damaged_admit and clean_small_qwen_admits(_mt, base_damage, params_b, vocab_size)
     damaged = damaged_admit or csq_admit
+    csl_admit = not damaged and clean_small_lfm2_admits(_mt, base_damage, params_b, base_clean_ref)
     if damaged:
         pass  # the family allow-list, FIELD_FULL_VOCABS and minimum-size gates below do not apply; rows / tokens / cap do
     elif _mt is not None and _mt not in field_full_types():
@@ -496,12 +555,13 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
         _floor = _rule.get("min_tokens")
         if _floor and not os.environ.get("FORGE_V2_FIELD_MIN_TOKENS") and (total_tokens is None or total_tokens < int(_floor)):
             return False  # this checkpoint's win was measured on large corpora only; unknown volume keeps the route
-    if vocab_size is not None and not damaged and not os.environ.get("FORGE_V2_FIELD_TYPES"):
+    if vocab_size is not None and not damaged and not csl_admit and not os.environ.get("FORGE_V2_FIELD_TYPES"):
         # family-specific: the validated wins are Meta Llama-3.2 (128256) and LFM2.5 (128000); an unknown family
         # or a mismatched vocabulary keeps its route
         if _mt is None or int(vocab_size) not in FIELD_FULL_VOCABS.get(_mt, frozenset()):
             return False
-    if _mt is not None and not damaged and not os.environ.get("FORGE_V2_FIELD_TYPES") and params_b < FIELD_FULL_MIN_PARAMS_B.get(_mt, 0.0):
+    if (_mt is not None and not damaged and not csl_admit and not os.environ.get("FORGE_V2_FIELD_TYPES")
+            and params_b < FIELD_FULL_MIN_PARAMS_B.get(_mt, 0.0)):
         return False  # below the size where the family's validated configuration applies
     min_rows = clean_small_qwen_min_rows() if csq_admit else field_full_min_rows(_mt)
     min_tokens = clean_small_qwen_min_tokens() if csq_admit else field_full_min_tokens(_mt)
@@ -560,10 +620,14 @@ def _field_bf16_enabled(model_type: str | None, *, damaged_base: bool = False) -
 FIELD_LR_MULT_TYPES: dict[str, float] = {"qwen2": 1.0}
 
 
-def _field_lr_mult(model_type: str | None = None, *, damaged_base: bool = False, params_b: float | None = None) -> float:
+def _field_lr_mult(model_type: str | None = None, *, damaged_base: bool = False, params_b: float | None = None,
+                   clean_small_lfm2: bool = False) -> float:
     """Multiplier on the clamped raw analytic LR of the field route: FORGE_V2_FIELD_LR_MULT, else the family default
-    (a damaged family may set a size-scoped small_lr_mult for params_b <= small_max_b)."""
+    (a damaged family may set a size-scoped small_lr_mult for params_b <= small_max_b; the clean LFM2.5-1.2B-Instruct
+    route uses CLEAN_SMALL_LFM2_LR_MULT)."""
     default = FIELD_LR_MULT_TYPES.get(str(model_type or "").lower(), 1.0) if _identical_base_family_defaults(model_type) else 1.0
+    if clean_small_lfm2 and not damaged_base:
+        default = CLEAN_SMALL_LFM2_LR_MULT
     if damaged_base:
         fam = _damaged_family(model_type)
         default = float(fam.get("lr_mult", 1.0))
@@ -575,10 +639,12 @@ def _field_lr_mult(model_type: str | None = None, *, damaged_base: bool = False,
         return default
 
 
-def field_recipe(model_type: str | None, params_b: float, *, damaged_base: bool = False) -> dict[str, Any]:
+def field_recipe(model_type: str | None, params_b: float, *, damaged_base: bool = False,
+                 clean_small_lfm2: bool = False) -> dict[str, Any]:
     """Field-route recipe knobs sft_v2.run applies (env overrides included): bf16 weights + paged 8-bit AdamW (instead of
     the fp32 master when the geometry would choose it), its size threshold, the LR multiplier and the rows-per-step
-    bucket. ``damaged_base`` selects the family's DAMAGED_BASE_FAMILIES recipe."""
+    bucket. ``damaged_base`` selects the family's DAMAGED_BASE_FAMILIES recipe; ``clean_small_lfm2`` (the clean
+    LFM2.5-1.2B-Instruct route) changes only the LR multiplier default (x2, = Phase AJ arm F's FORGE_V2_FIELD_LR_MULT)."""
     min_b = _field_bf16_min_b(model_type, damaged_base=damaged_base)
     # a damaged family's small band (0 < params_b <= small_max_b) is fp32 master + small_lr_mult, boundary included,
     # matching _field_lr_mult's <= (without this, exactly small_max_b == bf16_min_b got bf16 + the small LR). It is a
@@ -587,7 +653,8 @@ def field_recipe(model_type: str | None, params_b: float, *, damaged_base: bool 
     explicit_precision = any(os.environ.get(k, "").strip() for k in ("FORGE_V2_FIELD_BF16", "FORGE_V2_FIELD_BF16_MIN_B"))
     small = small_max is not None and 0 < params_b <= float(small_max) and not explicit_precision
     return {"bf16": bool(_field_bf16_enabled(model_type, damaged_base=damaged_base) and params_b >= min_b and not small),
-            "bf16_min_b": min_b, "lr_mult": _field_lr_mult(model_type, damaged_base=damaged_base, params_b=params_b),
+            "bf16_min_b": min_b, "lr_mult": _field_lr_mult(model_type, damaged_base=damaged_base, params_b=params_b,
+                                                         clean_small_lfm2=clean_small_lfm2),
             "eff_batch": field_eff_batch(params_b), "strategy": "full"}
 
 
@@ -1143,6 +1210,7 @@ def run(
     field_route: bool = False,
     damaged_base_route: bool = False,
     clean_small_qwen_route: bool = False,
+    clean_small_lfm2_route: bool = False,
 ) -> None:
     import torch
     from datasets import Dataset
@@ -1293,13 +1361,17 @@ def run(
     # damaged-base (and, when switched on, clean small-Qwen) field route: the family's executed recipe
     _damaged_recipe = bool(field and (damaged_base_route or clean_small_qwen_route))
     _csq_field = bool(field and clean_small_qwen_route)  # clean small-Qwen FIELD run: window-aware eval governor on
+    _csl_field = bool(field and clean_small_lfm2_route and not _damaged_recipe)  # clean LFM2.5-1.2B-Instruct: LR x2 only
     _recipe = field_recipe(str(getattr(getattr(model, "config", None), "model_type", "") or ""), params_b,
-                           damaged_base=_damaged_recipe)
+                           damaged_base=_damaged_recipe, clean_small_lfm2=_csl_field)
     if field:
         _event_and_print("sft_v2_field_recipe", damaged_base=bool(damaged_base_route),
                          clean_small_qwen=bool(clean_small_qwen_route), **_recipe)
         if damaged_base_route and damaged_minicpm5_shape(model_type, params_b, vocab):
             _event_and_print("sft_v2_damaged_minicpm5_route", params_b=round(params_b, 4), vocab=vocab)
+        if _csl_field:
+            _event_and_print("sft_v2_clean_small_lfm2_route", params_b=round(params_b, 4), vocab=vocab,
+                             lr_mult=_recipe["lr_mult"])
     if field and geo.fp32_master and _recipe["bf16"] and os.environ.get("FORGE_V2_FP32_MASTER", "").strip() != "1":
         # 2–4B full weights in fp32 master are throughput-bound in a tournament window
         # (Gemma-2-2B 12.4 s/step → 0.49 epoch in 45 min); bf16 weights + 8-bit AdamW

@@ -802,6 +802,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     field_route = False
     damaged_base_route = False
     clean_small_qwen_route = False
+    clean_small_lfm2_route = False
     if _v2_strategy in ("lora", "full"):
         # Both v2 paths are validated on long-row tasks only (Smol-jb median 392,
         # Gemma 762, ru-AAQG 302). On short-row open-ended data production's
@@ -820,6 +821,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         _base_identity = None
         _base_candidate = None
         _base_damage = None
+        _base_clean_ref = None  # the public reference a "clean" verdict names (clean LFM2.5-1.2B-Instruct route)
         # damaged-base route (2026-09-22): detection runs only for enabled DAMAGED_BASE_FAMILIES (or qwen2 while the
         # default-off clean small-Qwen route is on), single GPU, non-KL
         _vocab_size = int(getattr(getattr(loaded.model, "config", None), "vocab_size", 0) or 0) or None
@@ -853,6 +855,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             _drep = _dmg.assess(spec.cached_model_dir, identity=_rep, detectors=sft_v2.damage_detectors(),
                                 model_name=spec.model)
             _base_damage = _drep.get("verdict")
+            _base_clean_ref = sft_v2.clean_base_reference(_drep)
             telemetry.event("base_damage", verdict=_base_damage, by=_drep.get("by"), seconds=_drep.get("seconds"),
                             detectors={k: {kk: vv for kk, vv in v.items() if kk in ("verdict", "reason", "hits", "n",
                                                                                    "median_zero_fraction", "source",
@@ -866,17 +869,19 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                                         total_tokens=_total_tokens,
                                         vocab_size=_vocab_size,
                                         base_identity=_base_identity, base_candidate=_base_candidate,
-                                        base_damage=_base_damage)
+                                        base_damage=_base_damage, base_clean_ref=_base_clean_ref)
         )
         damaged_base_route = bool(field_route and sft_v2.damaged_base_admits(_mt, _base_damage, params_b, _vocab_size))
         clean_small_qwen_route = bool(field_route and not damaged_base_route
                                       and sft_v2.clean_small_qwen_admits(_mt, _base_damage, params_b, _vocab_size))
+        clean_small_lfm2_route = bool(field_route and not damaged_base_route and not clean_small_qwen_route
+                                      and sft_v2.clean_small_lfm2_admits(_mt, _base_damage, params_b, _base_clean_ref))
         telemetry.event("sft_v2_field_gate", total_tokens=_total_tokens, rows=len(rows), model_type=_mt, field_route=field_route,
                         base_damage=_base_damage, damaged_base_route=damaged_base_route,
-                        clean_small_qwen_route=clean_small_qwen_route)
+                        clean_small_qwen_route=clean_small_qwen_route, clean_small_lfm2_route=clean_small_lfm2_route)
         if lfm_pin and field_route and _total_tokens is None:
             # a protected pin is released only on evidence: without a known token count the gate is unproven
-            field_route = damaged_base_route = clean_small_qwen_route = False
+            field_route = damaged_base_route = clean_small_qwen_route = clean_small_lfm2_route = False
             telemetry.event("sft_v2_pin_release_refused", model=spec.model, model_type=_mt, reason="unknown_total_tokens")
         if lfm_pin and field_route:
             pinned_route = False
@@ -890,7 +895,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             _v2_strategy = "full"
             v2_strategy_override = "full"
             telemetry.event("sft_v2_field_full_route", params_b=round(params_b, 3), eff_batch=sft_v2.field_eff_batch(params_b),
-                            damaged_base=damaged_base_route, clean_small_qwen=clean_small_qwen_route)
+                            damaged_base=damaged_base_route, clean_small_qwen=clean_small_qwen_route,
+                            clean_small_lfm2=clean_small_lfm2_route)
         short_rows = (not is_long) and not field_route
         if _v2_strategy:
             telemetry.event("sft_v2_row_length_gate", median_tokens=median_len, long_rows=is_long, strategy=_v2_strategy)
@@ -935,6 +941,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 field_route=field_route,
                 damaged_base_route=damaged_base_route,
                 clean_small_qwen_route=clean_small_qwen_route,
+                clean_small_lfm2_route=clean_small_lfm2_route,
             )
             return
         except BaseException as exc:  # noqa: BLE001
