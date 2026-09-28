@@ -466,8 +466,10 @@ def clean_small_qwen_admits(model_type: str | None, base_damage: str | None, par
 # @0f604ada, Turkish cc4550ab reduced TRAIN 80,704 rows / 16.79M tokens, row median 179, seed 7, 1.0 h per arm on 1 x H100)
 # meets the owner rule: arm F (11c41a7 + FORGE_V2_FIELD_TYPES=lfm2 + FORGE_V2_FIELD_LR_MULT=2) clearly beats arm C
 # (11c41a7 as deployed: the legacy production LoRA on short rows, the v2 LoRA on long rows), or C is worse than untrained.
-# The route is exactly what F executes, now without env: FIELD full weights for every row length (the FIELD route forces
-# strategy full and overrides the short-row gate), field_recipe(damaged_base=False) = bf16 False at 1.17 B (< the 2.0 B
+# The route is exactly what F executes, now without env, on the SHORT-ROW branch only (RESP-065, 2026-09-28): a task whose
+# sampled row median is below the v2 row gate (long_row_task False, median < LORA_MIN_MEDIAN_TOKENS = 256), where
+# 11c41a7 runs the legacy production LoRA and where Phase AJ measured. Long-row tasks keep the v2 LoRA (no scored
+# evidence against that incumbent). There: FIELD full weights (the route forces strategy full), field_recipe(damaged_base=False) = bf16 False at 1.17 B (< the 2.0 B
 # bf16 minimum) -> the geometry's fp32 master + fused AdamW, LR = clamp(analytic, 2e-5, 1e-4) x 2, FIELD eff batch 100,
 # unpacked (packing admits Llama / Qwen2 only), and the generic FIELD floors 15k rows / 8M tokens (F's floors: the
 # FIELD_TYPES env bypassed only the family, vocabulary and 2.0 B minimum-size gates). F on the same base = the recipe
@@ -500,9 +502,10 @@ def clean_base_reference(report: dict[str, Any] | None) -> str | None:
 
 
 def clean_small_lfm2_admits(model_type: str | None, base_damage: str | None, params_b: float | None,
-                            base_clean_ref: str | None = None) -> bool:
-    """Clean LFM2.5-1.2B-Instruct FIELD admission (row / token floors and the size cap applied by field_full_route)."""
-    if not (_field_full() and _clean_small_lfm2()):
+                            base_clean_ref: str | None = None, *, long_rows: bool | None = None) -> bool:
+    """Clean LFM2.5-1.2B-Instruct FIELD admission on the short-row branch only (``long_rows`` must be exactly False, as
+    long_row_task reports it; None / True keep 11c41a7). Row / token floors and the size cap are applied by field_full_route."""
+    if not (_field_full() and _clean_small_lfm2()) or long_rows is not False:
         return False
     if str(model_type or "").lower() != CLEAN_SMALL_LFM2_MODEL_TYPE or base_damage != "clean" or not base_clean_ref:
         return False
@@ -520,7 +523,8 @@ def clean_small_lfm2_admits(model_type: str | None, base_damage: str | None, par
 def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: str | None = None,
                      n_rows: int | None = None, total_tokens: int | None = None, vocab_size: int | None = None,
                      base_identity: str | None = None, base_candidate: str | None = None,
-                     base_damage: str | None = None, base_clean_ref: str | None = None) -> bool:
+                     base_damage: str | None = None, base_clean_ref: str | None = None,
+                     long_rows: bool | None = None) -> bool:
     """Full weights at the field geometry for single-GPU, non-KL instruct tasks up to
     FIELD_FULL_MAX_PARAMS_B (FORGE_V2_FIELD_MAX_PARAMS_B overrides) on an allow-listed
     model family (field_full_types) with at least field_full_min_rows() rows: full weights
@@ -531,7 +535,7 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
     (forge.routing.damage verdict) admits an enabled DAMAGED_BASE_FAMILIES family on a "damaged" base (tested vocabulary,
     no family minimum size) and, only when switched on, a small qwen2 base read "clean" (clean_small_qwen_admits);
     the row and token floors and the size cap still apply. ``base_clean_ref`` (clean_base_reference of the damage report)
-    admits the clean LFM2.5-1.2B-Instruct (clean_small_lfm2_admits) past the lfm2 vocabulary and 2.0 B minimum gates, as
+    admits the clean LFM2.5-1.2B-Instruct (clean_small_lfm2_admits; short-row tasks only, ``long_rows`` False) past the lfm2 vocabulary and 2.0 B minimum gates, as
     FORGE_V2_FIELD_TYPES=lfm2 did in Phase AJ arm F; the family, floors and cap still apply."""
     if not _field_full() or is_kl or n_gpus != 1 or params_b <= 0:
         return False
@@ -539,7 +543,7 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
     damaged_admit = damaged_base_admits(_mt, base_damage, params_b, vocab_size)
     csq_admit = not damaged_admit and clean_small_qwen_admits(_mt, base_damage, params_b, vocab_size)
     damaged = damaged_admit or csq_admit
-    csl_admit = not damaged and clean_small_lfm2_admits(_mt, base_damage, params_b, base_clean_ref)
+    csl_admit = not damaged and clean_small_lfm2_admits(_mt, base_damage, params_b, base_clean_ref, long_rows=long_rows)
     if damaged:
         pass  # the family allow-list, FIELD_FULL_VOCABS and minimum-size gates below do not apply; rows / tokens / cap do
     elif _mt is not None and _mt not in field_full_types():

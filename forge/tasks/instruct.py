@@ -869,13 +869,14 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                                         total_tokens=_total_tokens,
                                         vocab_size=_vocab_size,
                                         base_identity=_base_identity, base_candidate=_base_candidate,
-                                        base_damage=_base_damage, base_clean_ref=_base_clean_ref)
+                                        base_damage=_base_damage, base_clean_ref=_base_clean_ref, long_rows=is_long)
         )
         damaged_base_route = bool(field_route and sft_v2.damaged_base_admits(_mt, _base_damage, params_b, _vocab_size))
         clean_small_qwen_route = bool(field_route and not damaged_base_route
                                       and sft_v2.clean_small_qwen_admits(_mt, _base_damage, params_b, _vocab_size))
         clean_small_lfm2_route = bool(field_route and not damaged_base_route and not clean_small_qwen_route
-                                      and sft_v2.clean_small_lfm2_admits(_mt, _base_damage, params_b, _base_clean_ref))
+                                      and sft_v2.clean_small_lfm2_admits(_mt, _base_damage, params_b, _base_clean_ref,
+                                                                         long_rows=is_long))
         telemetry.event("sft_v2_field_gate", total_tokens=_total_tokens, rows=len(rows), model_type=_mt, field_route=field_route,
                         base_damage=_base_damage, damaged_base_route=damaged_base_route,
                         clean_small_qwen_route=clean_small_qwen_route, clean_small_lfm2_route=clean_small_lfm2_route)

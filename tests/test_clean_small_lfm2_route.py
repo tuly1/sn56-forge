@@ -4,8 +4,9 @@ release-clean-lfm12-field-20260928).
 An lfm2 base that the damage detectors read "clean" against exactly LiquidAI/LFM2.5-1.2B-Instruct, 0 < params_b <= 1.5,
 takes the FIELD full route with the recipe replay-bench Phase AJ arm F executed as 11c41a7 + FORGE_V2_FIELD_TYPES=lfm2 +
 FORGE_V2_FIELD_LR_MULT=2 (research/20260923-replay-bench/phase-aj/CARD.md): fp32 master + fused AdamW, LR clamp(analytic)
-x 2, eff batch 100, generic floors 15k rows / 8M tokens, for short AND long rows. Every other base keeps its 11c41a7 route;
-FORGE_V2_CLEAN_SMALL_LFM2=0 restores 11c41a7 exactly."""
+x 2, eff batch 100, generic floors 15k rows / 8M tokens, on SHORT-ROW tasks only (long_row_task False: sampled median <
+256 tokens, where 11c41a7 runs the legacy LoRA; RESP-065). Long-row tasks keep the v2 LoRA. Every other base keeps its
+11c41a7 route; FORGE_V2_CLEAN_SMALL_LFM2=0 restores 11c41a7 exactly."""
 from __future__ import annotations
 
 import copy
@@ -44,13 +45,14 @@ def _clean_env(monkeypatch):
             monkeypatch.delenv(k, raising=False)
 
 
-def _gate(params_b=LFM12_B, *, mt="lfm2", vocab=LFM_VOCAB, verdict="clean", ref=REF, data=AJ, **kw):
+def _gate(params_b=LFM12_B, *, mt="lfm2", vocab=LFM_VOCAB, verdict="clean", ref=REF, data=AJ, long_rows=False, **kw):
     """The instruct.py gate block (field_full_route -> damaged / clean-small-Qwen / clean-small-LFM2 -> field_recipe)."""
     field = bool(sft_v2.field_full_route(params_b=params_b, model_type=mt, vocab_size=vocab, base_damage=verdict,
-                                         base_clean_ref=ref, **HW, **data, **kw))
+                                         base_clean_ref=ref, long_rows=long_rows, **HW, **data, **kw))
     dmg = bool(field and sft_v2.damaged_base_admits(mt, verdict, params_b, vocab))
     csq = bool(field and not dmg and sft_v2.clean_small_qwen_admits(mt, verdict, params_b, vocab))
-    csl = bool(field and not dmg and not csq and sft_v2.clean_small_lfm2_admits(mt, verdict, params_b, ref))
+    csl = bool(field and not dmg and not csq and sft_v2.clean_small_lfm2_admits(mt, verdict, params_b, ref,
+                                                                                long_rows=long_rows))
     rec = sft_v2.field_recipe(mt, params_b, damaged_base=dmg or csq, clean_small_lfm2=csl) if field else None
     return {"field": field, "damaged": dmg, "csq": csq, "csl": csl, "recipe": rec}
 
@@ -99,6 +101,15 @@ def test_phase_aj_task_takes_exactly_arm_f(monkeypatch):
     assert c == {"field": False, "damaged": False, "csq": False, "csl": False, "recipe": None}  # 11c41a7 unset (arm C)
 
 
+@pytest.mark.parametrize("long_rows", [True, None])
+def test_long_or_unknown_row_length_keeps_11c41a7(monkeypatch, long_rows):
+    got = _gate(long_rows=long_rows)
+    assert got == _with_env(monkeypatch, OFF, lambda: _gate(long_rows=long_rows))
+    assert got["field"] is False and got["csl"] is False
+    assert sft_v2.clean_small_lfm2_admits("lfm2", "clean", LFM12_B, REF, long_rows=long_rows) is False
+    assert sft_v2.clean_small_lfm2_admits("lfm2", "clean", LFM12_B, REF) is False  # default None fails closed
+
+
 def test_env_f_on_the_new_commit_is_unchanged(monkeypatch):
     assert _with_env(monkeypatch, F_ENV, _gate)["recipe"] == F_RECIPE
 
@@ -130,7 +141,7 @@ def test_above_the_size_band_nothing_changes(monkeypatch, params_b, vocab):
 
 @pytest.mark.parametrize("mt", ["llama", "qwen2", "qwen3", "gemma2", "lfm2_moe", None])
 def test_other_model_types_are_not_admitted(mt):
-    assert sft_v2.clean_small_lfm2_admits(mt, "clean", LFM12_B, REF) is False
+    assert sft_v2.clean_small_lfm2_admits(mt, "clean", LFM12_B, REF, long_rows=False) is False
 
 
 def test_floors_equal_arm_f(monkeypatch):
@@ -146,7 +157,7 @@ def test_floors_equal_arm_f(monkeypatch):
 
 
 def test_hard_gates_still_apply():
-    base = dict(params_b=LFM12_B, model_type="lfm2", vocab_size=LFM_VOCAB, base_damage="clean", base_clean_ref=REF, **AJ)
+    base = dict(params_b=LFM12_B, model_type="lfm2", vocab_size=LFM_VOCAB, base_damage="clean", base_clean_ref=REF, long_rows=False, **AJ)
     assert sft_v2.field_full_route(n_gpus=1, is_kl=False, **base) is True
     assert sft_v2.field_full_route(n_gpus=2, is_kl=False, **base) is False
     assert sft_v2.field_full_route(n_gpus=1, is_kl=True, **base) is False
@@ -157,7 +168,7 @@ def test_off_switches_restore_11c41a7(monkeypatch, env):
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     assert _gate()["field"] is False
-    assert sft_v2.clean_small_lfm2_admits("lfm2", "clean", LFM12_B, REF) is False
+    assert sft_v2.clean_small_lfm2_admits("lfm2", "clean", LFM12_B, REF, long_rows=False) is False
 
 
 def test_lr_mult_env_keeps_precedence(monkeypatch):
@@ -182,7 +193,7 @@ contract = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(contract)
 
 
-def _dispatch(monkeypatch, tmp_path, *, long_rows, ref=REF, verdict="clean", params_b=LFM12_B, env=None):
+def _dispatch(monkeypatch, tmp_path, *, long_rows, ref=REF, verdict="clean", params_b=LFM12_B, env=None, median=None):
     from forge import cli
     from forge.tasks import instruct
 
@@ -197,6 +208,11 @@ def _dispatch(monkeypatch, tmp_path, *, long_rows, ref=REF, verdict="clean", par
     monkeypatch.setattr(instruct, "model_param_billions", lambda m: params_b)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
+    if median is not None:
+        # the REAL long_row_task decides; only its tokenization is a double (every sampled row has `median` tokens)
+        monkeypatch.setattr(sft_v2.prompts, "build_instruct_examples", lambda picked, cols: list(picked))
+        monkeypatch.setattr(sft_v2.tokenize, "tokenize_instruct",
+                            lambda ex, tok, cap: [{"input_ids": [5] * median} for _ in ex])
     monkeypatch.setattr(idr, "identify", lambda model_dir, **kw: {"status": "unknown", "reason": "no_matching_table"})
     monkeypatch.setitem(damage.DETECTORS, "fingerprint",
                         lambda d, i, **kw: {"verdict": verdict, "reason": "double", "source": ref})
@@ -215,12 +231,37 @@ def _dispatch(monkeypatch, tmp_path, *, long_rows, ref=REF, verdict="clean", par
             for r in seen["routes"]], dict(seen["events"])
 
 
-@pytest.mark.parametrize("long_rows", [False, True])
-def test_dispatch_clean_lfm12_instruct_takes_field_full_for_every_row_length(monkeypatch, tmp_path, long_rows):
-    routes, ev = _dispatch(monkeypatch, tmp_path, long_rows=long_rows)
+def test_dispatch_clean_lfm12_instruct_short_rows_take_field_full(monkeypatch, tmp_path):
+    routes, ev = _dispatch(monkeypatch, tmp_path, long_rows=False)
     assert routes == [{"handler": "sft_v2", "field": True, "strategy": "full", "csl": True}]
     assert ev["sft_v2_field_gate"]["clean_small_lfm2_route"] is True
     assert ev["sft_v2_field_full_route"]["clean_small_lfm2"] is True
+
+
+def test_dispatch_clean_lfm12_instruct_long_rows_keep_v2_lora(monkeypatch, tmp_path):
+    routes, ev = _dispatch(monkeypatch, tmp_path, long_rows=True)
+    assert routes == [{"handler": "sft_v2", "field": False, "strategy": "lora", "csl": False}]
+    assert ev["sft_v2_field_gate"]["clean_small_lfm2_route"] is False
+    off, _ = _dispatch(monkeypatch, tmp_path / "off", long_rows=True, env=OFF)
+    assert off == routes  # == 11c41a7
+
+
+@pytest.mark.parametrize("median,want_field", [(1, True), (254, True), (255, True), (256, False), (257, False), (403, False)])
+def test_dispatch_row_median_boundary(monkeypatch, tmp_path, median, want_field):
+    """Real long_row_task at the 256-token cut: median 255 -> short branch -> new FIELD route; 256 / 257 -> long branch
+    -> the v2 LoRA exactly as 11c41a7; switch off -> 11c41a7 on both sides (legacy LoRA below, v2 LoRA at/above)."""
+    assert sft_v2.LORA_MIN_MEDIAN_TOKENS == 256
+    routes, ev = _dispatch(monkeypatch, tmp_path / "new", long_rows=True, median=median)
+    assert ev["sft_v2_row_length_gate"]["median_tokens"] == median
+    assert ev["sft_v2_row_length_gate"]["long_rows"] is (median >= 256)
+    if want_field:
+        assert routes == [{"handler": "sft_v2", "field": True, "strategy": "full", "csl": True}]
+    else:
+        assert routes == [{"handler": "sft_v2", "field": False, "strategy": "lora", "csl": False}]
+    off, _ = _dispatch(monkeypatch, tmp_path / "off", long_rows=True, median=median, env=OFF)
+    assert off == ([{"handler": "legacy", "field": False, "strategy": "lora"}] if want_field else routes)
+    f, _ = _dispatch(monkeypatch, tmp_path / "f", long_rows=True, median=median, env={**OFF, **F_ENV})
+    assert f == [{"handler": "sft_v2", "field": True, "strategy": "full", "csl": False}]  # 11c41a7 + F env, both sides
 
 
 @pytest.mark.parametrize("long_rows", [False, True])
@@ -238,8 +279,8 @@ def test_dispatch_off_switch_is_11c41a7(monkeypatch, tmp_path, long_rows, want):
 
 @pytest.mark.parametrize("ref", ["LiquidAI/LFM2-1.2B", "LiquidAI/LFM2.5-1.2B-Base"])
 def test_dispatch_other_clean_lfm12_bases_keep_11c41a7(monkeypatch, tmp_path, ref):
-    routes, _ = _dispatch(monkeypatch, tmp_path, long_rows=True, ref=ref)
-    assert routes == [{"handler": "sft_v2", "field": False, "strategy": "lora", "csl": False}]
+    routes, _ = _dispatch(monkeypatch, tmp_path, long_rows=False, ref=ref)
+    assert routes == [{"handler": "legacy", "field": False, "strategy": "lora"}]  # short rows: 11c41a7 legacy LoRA
 
 
 # ---- sft_v2.run on CPU: candidate route == arm F env on the plain FIELD route ---------------------------------------
