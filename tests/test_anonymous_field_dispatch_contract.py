@@ -37,6 +37,8 @@ class StopAtLegacyPlan(BaseException):
 
 def prepare(monkeypatch, tmp_path, model_type, *, n_rows=20000, long_rows=True):
     for name in list(os.environ):
+        if name == "FORGE_V2_FULLFT_DEFAULT":
+            continue  # set by the caller: "0" = the cab930c-equivalence suites, unset = the release default
         if name.startswith("FORGE_") or name in {"USE_KL", "KL_COEF", "BASELINE_STATS_PATH"}:
             monkeypatch.delenv(name, raising=False)
     # Mock the deployment's reported one-GPU topology; no CUDA allocation occurs.
@@ -96,12 +98,23 @@ def prepare(monkeypatch, tmp_path, model_type, *, n_rows=20000, long_rows=True):
     return args, observed, stats
 
 
-@pytest.mark.parametrize("model_type,long_rows,expected_field,expected_strategy", [
+@pytest.fixture(params=["release", "cab930c"])
+def fullft(request, monkeypatch):
+    """release = the full-FT default (no env); cab930c = the research switch FORGE_V2_FULLFT_DEFAULT=0."""
+    if request.param == "cab930c":
+        monkeypatch.setenv("FORGE_V2_FULLFT_DEFAULT", "0")
+    else:
+        monkeypatch.delenv("FORGE_V2_FULLFT_DEFAULT", raising=False)
+    return request.param
+
+
+@pytest.mark.parametrize("model_type,long_rows,cab930c_field,cab930c_strategy", [
     ("llama", True, True, "full"),
     ("qwen2", True, False, "lora"),
 ])
-def test_actual_cli_dispatch_with_anonymous_id_and_stats(monkeypatch, tmp_path, model_type,
-                                                        long_rows, expected_field, expected_strategy):
+def test_actual_cli_dispatch_with_anonymous_id_and_stats(monkeypatch, tmp_path, fullft, model_type,
+                                                        long_rows, cab930c_field, cab930c_strategy):
+    expected_field, expected_strategy = (True, "full") if fullft == "release" else (cab930c_field, cab930c_strategy)
     args, seen, stats = prepare(monkeypatch, tmp_path, model_type, long_rows=long_rows)
     assert cli.main(args) == 0
     assert len(seen["routes"]) == 1
@@ -119,40 +132,55 @@ def test_actual_cli_dispatch_with_anonymous_id_and_stats(monkeypatch, tmp_path, 
     assert ("sft_v2_field_full_route" in events) is expected_field
 
 
-def test_short_qwen_anonymous_contract_uses_legacy_adapter(monkeypatch, tmp_path):
-    args, seen, stats = prepare(monkeypatch, tmp_path, "qwen2", long_rows=False)
+def _spec_from(args):
     parsed = cli._parse(args)
-    spec = TaskSpec.build(task_id=parsed.task_id, task_type=parsed.task_type,
+    return TaskSpec.build(task_id=parsed.task_id, task_type=parsed.task_type,
                           model=parsed.model, dataset=parsed.dataset,
                           dataset_type_json=parsed.dataset_type,
                           expected_repo_name=parsed.expected_repo_name,
                           baseline_stats_path=parsed.baseline_stats, file_format=parsed.file_format)
-    with pytest.raises(StopAtLegacyPlan):
+
+
+def _dispatch_until_plan(seen, args):
+    spec = _spec_from(args)
+    try:
         dispatch.for_task(spec.task_type)(spec, Deadline.from_hours(
             1, started_monotonic=time.monotonic(), export_reserve_s=180))
-    assert seen["routes"] == [{"handler": "legacy", "field": False, "strategy": "lora"}]
+    except StopAtLegacyPlan:
+        pass
+    return seen["routes"]
+
+
+def test_short_qwen_anonymous_contract(monkeypatch, tmp_path, fullft):
+    """cab930c: short rows -> legacy adapter. Release: full weights (no row-length gate)."""
+    args, seen, stats = prepare(monkeypatch, tmp_path, "qwen2", long_rows=False)
+    routes = _dispatch_until_plan(seen, args)
+    events = {name for name, _ in seen["events"]}
+    if fullft == "release":
+        assert [(r["handler"], r["field"], r["strategy"]) for r in routes] == [("sft_v2", True, "full")]
+        assert "sft_v2_field_full_route" in events
+    else:
+        assert routes == [{"handler": "legacy", "field": False, "strategy": "lora"}]
+        assert "sft_v2_field_full_route" not in events
     assert any(meta.get("baseline_num_records") == 20000 for meta in seen["meta"])
-    assert not {name for name, _ in seen["events"]} & {"baseline_stats_invalid", "sft_v2_field_full_route"}
+    assert "baseline_stats_invalid" not in events
 
 
-def test_below_threshold_llama_does_not_silently_enter_field(monkeypatch, tmp_path):
-    args, seen, stats = prepare(monkeypatch, tmp_path, "llama", n_rows=9999)  # just below the llama row gate (10k since 2026-09-17)
+def test_below_threshold_llama(monkeypatch, tmp_path, fullft):
+    """9,999 rows: below cab930c's llama row gate (10k) -> v2 adapter there; the release has no floor -> full."""
+    args, seen, stats = prepare(monkeypatch, tmp_path, "llama", n_rows=9999)
     assert cli.main(args) == 0
     assert len(seen["routes"]) == 1
-    assert (seen["routes"][0]["field"], seen["routes"][0]["strategy"]) == (False, "lora")
+    want = (True, "full") if fullft == "release" else (False, "lora")
+    assert (seen["routes"][0]["field"], seen["routes"][0]["strategy"]) == want
 
 
-def test_short_llama_below_token_gate_uses_legacy_adapter(monkeypatch, tmp_path):
-    """20k short rows = 160k tokens: below the 8M-token gate the short-row rule sends the task to legacy."""
+def test_short_llama_below_token_gate(monkeypatch, tmp_path, fullft):
+    """20k short rows = 160k tokens: cab930c's 5M-token llama gate + short-row rule -> legacy; release -> full."""
     args, seen, stats = prepare(monkeypatch, tmp_path, "llama", long_rows=False)
-    parsed = cli._parse(args)
-    spec = TaskSpec.build(task_id=parsed.task_id, task_type=parsed.task_type,
-                          model=parsed.model, dataset=parsed.dataset,
-                          dataset_type_json=parsed.dataset_type,
-                          expected_repo_name=parsed.expected_repo_name,
-                          baseline_stats_path=parsed.baseline_stats, file_format=parsed.file_format)
-    with pytest.raises(StopAtLegacyPlan):
-        dispatch.for_task(spec.task_type)(spec, Deadline.from_hours(
-            1, started_monotonic=time.monotonic(), export_reserve_s=180))
-    assert seen["routes"] == [{"handler": "legacy", "field": False, "strategy": "lora"}]
-    assert not {name for name, _ in seen["events"]} & {"sft_v2_field_full_route"}
+    routes = _dispatch_until_plan(seen, args)
+    if fullft == "release":
+        assert [(r["handler"], r["field"], r["strategy"]) for r in routes] == [("sft_v2", True, "full")]
+    else:
+        assert routes == [{"handler": "legacy", "field": False, "strategy": "lora"}]
+        assert not {name for name, _ in seen["events"]} & {"sft_v2_field_full_route"}

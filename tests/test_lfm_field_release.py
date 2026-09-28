@@ -127,8 +127,12 @@ def test_lfm_pin_stands_when_field_disabled(monkeypatch, tmp_path):
     assert "sft_v2_pinned_route_skip" in events and "sft_v2_pin_released_to_field" not in events
 
 
-def test_lfm_pin_stands_without_a_known_token_count(monkeypatch, tmp_path):
-    """No baseline total_tokens and no usable row-length estimate: the protected pin is not released on guesswork."""
+@pytest.mark.parametrize("fullft", ["release", "cab930c"])
+def test_lfm_pin_without_a_known_token_count(monkeypatch, tmp_path, fullft):
+    """No baseline total_tokens and no usable row-length estimate. cab930c: the protected pin is not released on
+    guesswork. Release: a long-row LFM2.5-2.6B task is outside the short-row exception and has no token gate -> full."""
+    if fullft == "cab930c":
+        monkeypatch.setenv("FORGE_V2_FULLFT_DEFAULT", "0")
     args, seen, stats = prepare(monkeypatch, tmp_path, "lfm2", n_rows=20000, long_rows=True)
     import json as _json
     d = _json.loads(stats.read_text()); d["dataset"].pop("total_tokens", None); stats.write_text(_json.dumps(d))
@@ -136,6 +140,12 @@ def test_lfm_pin_stands_without_a_known_token_count(monkeypatch, tmp_path):
     loaded.model = _lfm_model()
     _pin_lfm(monkeypatch, loaded.model)
     monkeypatch.setattr(sft_v2, "long_row_task", lambda rows, spec, tok: (True, None))
+    if fullft == "release":
+        _run_dispatch(args)
+        events = {name for name, _ in seen["events"]}
+        assert "sft_v2_pin_release_refused" not in events and "sft_v2_pin_released_to_field" in events
+        assert [(r["handler"], r["field"], r["strategy"]) for r in seen["routes"]] == [("sft_v2", True, "full")]
+        return
     with pytest.raises(StopAtLegacyPlan):
         _run_dispatch(args)
     events = {name for name, _ in seen["events"]}

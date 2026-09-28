@@ -38,6 +38,9 @@ def _clean_env(monkeypatch):
     for k in list(os.environ):
         if k.startswith("FORGE_"):
             monkeypatch.delenv(k, raising=False)
+    # cab930c-equivalence suite: these tests pin the pre-full-FT-default admission, reachable only with the research
+    # switch FORGE_V2_FULLFT_DEFAULT=0; the release behaviour is pinned by tests/test_fullft_default_route_table.py
+    monkeypatch.setenv("FORGE_V2_FULLFT_DEFAULT", "0")
 
 
 def _route(params_b=MINICPM_B, *, mt="llama", verdict="damaged", vocab=MINICPM_VOCAB, data=OPENORCA):
@@ -330,7 +333,7 @@ def test_run_candidate_equals_phase_y_f1(monkeypatch, tmp_path, rms):
     if rms == 1.0:
         assert want == 1.0e-4
     assert _ev(ev, "sft_v2_field_recipe")[0]["damaged_base"] is True
-    assert t["recipe"] == [{"clean_small_qwen": False, "bf16": True, "bf16_min_b": 0.3, "lr_mult": 1.0,
+    assert t["recipe"] == [{"clean_small_qwen": False, "recipe_key": None, "cheap_full": False, "bf16": True, "bf16_min_b": 0.3, "lr_mult": 1.0,
                             "eff_batch": 100, "strategy": "full"}]
     assert len(t["bf16"]) == 1  # bf16 weights (+ paged 8-bit AdamW where bitsandbytes is present)
     assert _ev(ev, "sft_v2_damaged_minicpm5_route") == [{"params_b": round(MINICPM_B, 4), "vocab": MINICPM_VOCAB}]

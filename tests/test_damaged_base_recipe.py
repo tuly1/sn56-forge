@@ -62,6 +62,9 @@ def _clean_env(monkeypatch):
     for k in list(os.environ):
         if k.startswith("FORGE_"):
             monkeypatch.delenv(k, raising=False)
+    # cab930c-equivalence suite: these tests pin the pre-full-FT-default admission, reachable only with the research
+    # switch FORGE_V2_FULLFT_DEFAULT=0; the release behaviour is pinned by tests/test_fullft_default_route_table.py
+    monkeypatch.setenv("FORGE_V2_FULLFT_DEFAULT", "0")
 
 
 def _knobs(mt, params_b, *, damaged):

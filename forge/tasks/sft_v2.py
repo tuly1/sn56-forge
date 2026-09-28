@@ -582,6 +582,172 @@ def field_full_route(*, params_b: float, n_gpus: int, is_kl: bool, model_type: s
     return params_b <= cap
 
 
+# ---- Full fine-tuning by default (release-fullft-default-20260929) ----
+# Owner standing directives 1-4 (SN56-text/AGENTS.md, 2026-09-28): every single-GPU, non-KL instruct task up to 4.2 B
+# parameters trains full weights. There is no family allow-list, row / token floor, row-length gate, vocabulary gate or
+# minimum size; identity and damage-detector verdicts may choose hyperparameters, never adapter vs full weights. Adapters
+# run only for a named, dated exception (CURRENT-CAMPAIGN "Adapter exceptions") or as the crash fallback of last resort
+# (instruct.run: full FT -> cheaper full FT -> adapter). The admission above (field_full_route and its allow-lists and
+# floors) is no longer consulted for in-scope tasks; it still documents which recipe each family measured.
+# FORGE_V2_FULLFT_DEFAULT=0 restores cab930c's routing exactly (research replays only; the validator sets no env).
+FULLFT_DEFAULT_ROUTE_DEFAULT = "1"
+# "up to 4.2B parameters" (owner scope). Qwen3.5-4B loads text-only at 4.2058 B (research/20260925-release-lfm-q35drift/
+# CPU-PRECHECK.json), so the numeric cap is 4.25 to keep the 4B class inside the owner's rounded 4.2 B. The next pool size
+# above it is Qwen3.5-4B loaded with its vision tower (4.66 B) and the 7-9 B class; nothing in the pool sits in (4.21, 4.25].
+FULLFT_DEFAULT_MAX_PARAMS_B = 4.25
+# Named, dated quality exceptions (CURRENT-CAMPAIGN "Adapter exceptions"); matched in instruct.run by the loaded
+# architecture, never by the request name:
+#   falcon-rw-1b                    our adapter placed 1st on 08-31 (instruct.eligible_falcon_rw1b_legacy_route)
+#   LFM2.5-2.6B short-row tasks     tokenized row median < 256 (LFM25_26B_SHORT_ROW_MEDIAN) keep the pinned one-epoch
+#                                   adapter (owner decision 2026-09-28; our r32 adapter 2nd of 12 on 09-07); every damage
+#                                   verdict, every data size. Long rows (median >= 256) train full weights.
+QUALITY_EXCEPTIONS = ("falcon-rw-1b", "lfm2.5-2.6b-short-rows")
+LFM25_26B_SHORT_ROW_MEDIAN = 256
+# The LFM2.5-2.6B pin (forge.tuning.lfm25_epoch_cap._matches_base_model) matches the architecture only, which LFM2-2.6B
+# (vocabulary 65536) shares; the exception names LFM2.5-2.6B, so it also requires LFM2.5's vocabulary.
+LFM25_26B_VOCAB = 128000
+# Crash exceptions: model_type -> {"since": "YYYY-MM-DD", "test": "<failing crash-sweep item / receipt path>",
+# optional "min_params_b" / "max_params_b" (inclusive band)}. A family listed here skips full weights and trains the
+# fixed legacy adapter. Empty until the crash sweep (research/20260929-release-fullft-default/CRASH-SWEEP-PLAN.md) names a
+# failing family; an entry expires when the crash is fixed. FORGE_V2_CRASH_EXCEPTIONS="type[,type]" adds entries for tests.
+CRASH_EXCEPTIONS: dict[str, dict[str, Any]] = {}
+# Unmeasured families (no row in DAMAGED_BASE_FAMILIES and not llama): FIELD geometry at the clamped analytic LR x1.0
+# (every measured full-weight family win ran x1.0 except the fp32 LFM2 small band; x0.5 lost on MiniCPM5 (+7.2%) and on
+# the exact Sept-14 Qwen task), fp32 master + fused AdamW below 2.0 B (the Llama production path; bf16 rounding froze
+# small updates on LFM2.5-1.2B, Phase H) and bf16 weights + paged 8-bit AdamW from 2.0 B (the FIELD default threshold;
+# fp32 master at 3-4 B is throughput- and memory-bound: Gemma-2-2B 0.49 epoch in 45 min, the 76 GB OOM).
+GENERIC_FIELD_BF16_MIN_B = 2.0
+GENERIC_FIELD_LR_MULT = 1.0
+
+
+def _fullft_default() -> bool:
+    return _field_full() and os.environ.get("FORGE_V2_FULLFT_DEFAULT", FULLFT_DEFAULT_ROUTE_DEFAULT).strip() == "1"
+
+
+def fullft_default_max_params_b() -> float:
+    try:
+        return float(os.environ.get("FORGE_V2_FULLFT_MAX_PARAMS_B", str(FULLFT_DEFAULT_MAX_PARAMS_B)))
+    except ValueError:
+        return FULLFT_DEFAULT_MAX_PARAMS_B
+
+
+def crash_exceptions() -> dict[str, dict[str, Any]]:
+    table = dict(CRASH_EXCEPTIONS)
+    for mt in os.environ.get("FORGE_V2_CRASH_EXCEPTIONS", "").split(","):
+        if mt.strip():
+            table.setdefault(mt.strip().lower(), {"since": "env", "test": "FORGE_V2_CRASH_EXCEPTIONS"})
+    return table
+
+
+def crash_exception(model_type: str | None, params_b: float | None) -> str | None:
+    """The crash exception naming this family (and size band), else None."""
+    entry = crash_exceptions().get(str(model_type or "").lower())
+    if entry is None:
+        return None
+    try:
+        size = float(params_b or 0.0)
+    except (TypeError, ValueError):
+        size = 0.0
+    lo, hi = entry.get("min_params_b"), entry.get("max_params_b")
+    if (lo is not None and size < float(lo)) or (hi is not None and size > float(hi)):
+        return None
+    return f"crash:{str(model_type).lower()}:{entry.get('since')}:{entry.get('test')}"
+
+
+def fullft_scope_refusal(*, task_type: str | None, has_instruct: bool, is_kl: bool, n_gpus: int, params_b: float,
+                         quasar: bool = False) -> str | None:
+    """Why a task is outside the full-FT-default scope (None = in scope). Scope = owner directive scope: single-GPU,
+    non-KL InstructTextTask up to FULLFT_DEFAULT_MAX_PARAMS_B. Out-of-scope tasks keep cab930c's routing unchanged."""
+    if not _fullft_default():
+        return "switch_off"
+    if task_type != "InstructTextTask" or not has_instruct:
+        return "not_instruct_task"  # ChatTask / DPO / GRPO keep their handlers
+    if is_kl:
+        return "kl"
+    if n_gpus != 1:
+        return "not_single_gpu"
+    if quasar:
+        return "quasar_remote_code"  # 8.6 B anyway; sft_v2.eligible refuses it
+    if not (0 < params_b <= fullft_default_max_params_b()):
+        return "size"
+    return None
+
+
+@dataclass(frozen=True)
+class RouteDecision:
+    """Full-FT-default dispatcher verdict for an in-scope task."""
+
+    route: str  # "full" | "adapter_exception"
+    reason: str  # "default" or the exception name
+    recipe: str = ""  # default_recipe_key() for "full"
+
+
+def default_recipe_key(model_type: str | None, params_b: float, vocab_size: int | None) -> str:
+    """Which measured recipe a full-FT-default task trains with. Independent of the damage verdict (directive 3: a
+    family's measured recipe ships clean and damaged):
+      "minicpm5"  llama, vocabulary 130560, 0.9 < params_b <= 1.3: the damaged MiniCPM5-1B F1 recipe (bf16 + paged 8-bit,
+                  LR clamp(analytic) x1.0 = 1e-4 on that base; Phase Y)
+      "family"    a DAMAGED_BASE_FAMILIES row (qwen2, qwen3, gemma2, lfm2): that row's recipe (qwen2/qwen3 bf16 from 0.3 B
+                  x1.0 = the Qwen FIELD recipe; gemma2 bf16 x1.0 + the champion port in its size band; lfm2 fp32 master
+                  LR x2 up to 1.5 B, bf16 x1.0 above)
+      "llama"     every other llama (Llama-3.2, TinyLlama, SmolLM/SmolLM2, open_llama): the production Llama FIELD path
+                  (fp32 master + fused AdamW up to FP32_MASTER_MAX_B, x1.0)
+      "generic"   everything else (phi3, mistral/Phi-3, phi, gpt_neox, falcon, bloom, gemma, granite, qwen3_5, ...):
+                  GENERIC_FIELD_* above."""
+    mt = str(model_type or "").lower()
+    try:
+        vocab = int(vocab_size) if vocab_size is not None else None
+    except (TypeError, ValueError):
+        vocab = None
+    if (mt == DAMAGED_MINICPM5_MODEL_TYPE and vocab == DAMAGED_MINICPM5_VOCAB
+            and DAMAGED_MINICPM5_MIN_PARAMS_B < float(params_b) <= DAMAGED_MINICPM5_MAX_PARAMS_B):
+        return "minicpm5"
+    if mt in DAMAGED_BASE_FAMILIES and DAMAGED_BASE_FAMILIES[mt].get("enabled"):
+        return "family"
+    if mt == "llama":
+        return "llama"
+    return "generic"
+
+
+def fullft_default_route(*, model_type: str | None, params_b: float, vocab_size: int | None,
+                         falcon_rw1b: bool = False, lfm25_26b: bool = False, median_tokens: int | None = None,
+                         long_rows: bool | None = None) -> RouteDecision:
+    """Route of an IN-SCOPE task (fullft_scope_refusal returned None). The only non-full outcomes are the named
+    exceptions. ``falcon_rw1b`` / ``lfm25_26b``: the loaded architecture matched the exception's base
+    (instruct.eligible_falcon_rw1b_legacy_route / the LFM2.5-2.6B pin match); ``median_tokens``: sampled tokenized row
+    median (long_row_task). The damage verdict is deliberately not an input."""
+    if falcon_rw1b:
+        return RouteDecision("adapter_exception", "quality:falcon-rw-1b")
+    # short = sampled tokenized median < 256; without a median (sampling failed) the row-length flag decides, and
+    # long_row_task reports a failed sample as (False, 0) = short, i.e. the exception's pinned adapter
+    short = (int(median_tokens) < LFM25_26B_SHORT_ROW_MEDIAN) if median_tokens else (long_rows is not True)
+    if lfm25_26b and short:
+        return RouteDecision("adapter_exception", "quality:lfm2.5-2.6b-short-rows")
+    crash = crash_exception(model_type, params_b)
+    if crash:
+        return RouteDecision("adapter_exception", crash)
+    return RouteDecision("full", "default", default_recipe_key(model_type, params_b, vocab_size))
+
+
+def legacy_adapter_fixes_enabled(*, fallback: bool, crash_exception_route: bool, quality_exception_route: bool) -> bool:
+    """Legacy adapter fixes (forge.tuning.legacy_adapter_fixes) run on the crash-fallback adapter and on crash
+    exceptions of in-scope tasks. The quality exceptions keep the exact adapter that earned the exception on a real board
+    unless FORGE_LEGACY_FIXES_ON_EXCEPTIONS=1 (their recipe is the evidence; changing it is unmeasured)."""
+    if os.environ.get("FORGE_LEGACY_ADAPTER_FIXES", "1").strip() == "0":
+        return False
+    if quality_exception_route:
+        return os.environ.get("FORGE_LEGACY_FIXES_ON_EXCEPTIONS", "0").strip() == "1"
+    return bool(fallback or crash_exception_route)
+
+
+class ZeroTrainedStepsError(RuntimeError):
+    """sft_v2 finished without a single optimizer step. The output holds only the untrained floor, which must never be
+    shipped while a cheaper rung can still train: the dispatcher catches this and moves to the next rung."""
+
+
+CHEAP_FULL_MIN_REMAINING_S = 900.0  # a cheaper full-FT retry needs a reload + tokenization + at least a few hundred steps
+
+
 FIELD_BF16_MIN_B_TYPES: dict[str, float] = {"qwen2": 0.3}  # qwen2 validated at 0.494 B with bf16 + paged 8-bit AdamW
 
 
@@ -590,8 +756,10 @@ def _identical_base_family_defaults(model_type: str | None) -> bool:
     return str(model_type or "").lower() in FIELD_IDENTICAL_BASE_TYPES and _field_identical_base()
 
 
-def _field_bf16_min_b(model_type: str | None = None, *, damaged_base: bool = False) -> float:
+def _field_bf16_min_b(model_type: str | None = None, *, damaged_base: bool = False, generic: bool = False) -> float:
     default = FIELD_BF16_MIN_B_TYPES.get(str(model_type or "").lower(), 2.0) if _identical_base_family_defaults(model_type) else 2.0
+    if generic and not damaged_base:
+        default = GENERIC_FIELD_BF16_MIN_B
     if damaged_base:
         default = float(_damaged_family(model_type).get("bf16_min_b", 2.0))  # the threshold that family's arm ran
     try:
@@ -605,7 +773,7 @@ FIELD_BF16_DEFAULT_TYPES = frozenset({"lfm2"})  # families whose field win was m
 # Qwen2.5-0.5B full-weight arm ran FORGE_V2_FIELD_BF16=1, BF16_MIN_B=0.3, LR_MULT=0.5); with the switch off nothing changes.
 
 
-def _field_bf16_enabled(model_type: str | None, *, damaged_base: bool = False) -> bool:
+def _field_bf16_enabled(model_type: str | None, *, damaged_base: bool = False, generic: bool = False) -> bool:
     """bf16 weights + paged 8-bit AdamW on the field route (>= _field_bf16_min_b() B). FORGE_V2_FIELD_BF16=1/0
     forces it; unset, it is on only for FIELD_BF16_DEFAULT_TYPES (lfm2: the 2026-09-16 MathFusion win ran this way,
     1.7 epochs in 2 h; fp32 master at the same size managed 0.49–2.2 partial epochs). Llama-1B never reaches the
@@ -613,7 +781,8 @@ def _field_bf16_enabled(model_type: str | None, *, damaged_base: bool = False) -
     forced = os.environ.get("FORGE_V2_FIELD_BF16", "").strip()
     if forced in ("0", "1"):
         return forced == "1"
-    return damaged_base or str(model_type or "").lower() in FIELD_BF16_DEFAULT_TYPES or _identical_base_family_defaults(model_type)
+    return (damaged_base or generic or str(model_type or "").lower() in FIELD_BF16_DEFAULT_TYPES
+            or _identical_base_family_defaults(model_type))
 
 
 # qwen2 (Qwen2.5-0.5B): 0.5 until 2026-09-18, chosen on a chat-style stand-in fixture (x1.0 lost 2.2% there, one seed each).
@@ -644,19 +813,22 @@ def _field_lr_mult(model_type: str | None = None, *, damaged_base: bool = False,
 
 
 def field_recipe(model_type: str | None, params_b: float, *, damaged_base: bool = False,
-                 clean_small_lfm2: bool = False) -> dict[str, Any]:
+                 clean_small_lfm2: bool = False, generic: bool = False) -> dict[str, Any]:
     """Field-route recipe knobs sft_v2.run applies (env overrides included): bf16 weights + paged 8-bit AdamW (instead of
     the fp32 master when the geometry would choose it), its size threshold, the LR multiplier and the rows-per-step
     bucket. ``damaged_base`` selects the family's DAMAGED_BASE_FAMILIES recipe; ``clean_small_lfm2`` (the clean
-    LFM2.5-1.2B-Instruct route) changes only the LR multiplier default (x2, = Phase AJ arm F's FORGE_V2_FIELD_LR_MULT)."""
-    min_b = _field_bf16_min_b(model_type, damaged_base=damaged_base)
+    LFM2.5-1.2B-Instruct route) changes only the LR multiplier default (x2, = Phase AJ arm F's FORGE_V2_FIELD_LR_MULT);
+    ``generic`` (full-FT default, unmeasured family) = bf16 from GENERIC_FIELD_BF16_MIN_B, LR x GENERIC_FIELD_LR_MULT."""
+    generic = bool(generic and not damaged_base)
+    min_b = _field_bf16_min_b(model_type, damaged_base=damaged_base, generic=generic)
     # a damaged family's small band (0 < params_b <= small_max_b) is fp32 master + small_lr_mult, boundary included,
     # matching _field_lr_mult's <= (without this, exactly small_max_b == bf16_min_b got bf16 + the small LR). It is a
     # DEFAULT only: an explicit FORGE_V2_FIELD_BF16 / FORGE_V2_FIELD_BF16_MIN_B research control keeps precedence.
     small_max = _damaged_family(model_type).get("small_max_b") if damaged_base else None
     explicit_precision = any(os.environ.get(k, "").strip() for k in ("FORGE_V2_FIELD_BF16", "FORGE_V2_FIELD_BF16_MIN_B"))
     small = small_max is not None and 0 < params_b <= float(small_max) and not explicit_precision
-    return {"bf16": bool(_field_bf16_enabled(model_type, damaged_base=damaged_base) and params_b >= min_b and not small),
+    return {"bf16": bool(_field_bf16_enabled(model_type, damaged_base=damaged_base, generic=generic)
+                         and params_b >= min_b and not small),
             "bf16_min_b": min_b, "lr_mult": _field_lr_mult(model_type, damaged_base=damaged_base, params_b=params_b,
                                                          clean_small_lfm2=clean_small_lfm2),
             "eff_batch": field_eff_batch(params_b), "strategy": "full"}
@@ -1215,7 +1387,12 @@ def run(
     damaged_base_route: bool = False,
     clean_small_qwen_route: bool = False,
     clean_small_lfm2_route: bool = False,
+    recipe_key: str | None = None,
+    cheap_full: bool = False,
 ) -> None:
+    """``recipe_key`` (default_recipe_key, full-FT default route): which measured recipe the FIELD route trains with.
+    ``cheap_full`` (fallback rung 2): bf16 weights + paged 8-bit AdamW at any size, half the micro-batch, checkpointing
+    on, no Gemma2 champion geometry. Raises ZeroTrainedStepsError when no optimizer step was taken."""
     import torch
     from datasets import Dataset
     from transformers import Trainer, TrainerCallback, TrainingArguments
@@ -1319,7 +1496,11 @@ def run(
             use_liger = False
     # damaged Gemma2 champion recipe (GEMMA2_CHAMPION_RECIPE_DEFAULT): row-isolated packing is admitted for this model
     # instance only (forge.data.packing.GEMMA2_ROUTE_ATTR); geometry, LR and planner floor are applied below
-    _g2c = bool(field and gemma2_champion_admits(model_type, params_b, _vocab(model), damaged_base_route=damaged_base_route))
+    _family_recipe = bool(field and recipe_key in ("family", "minicpm5"))  # full-FT default: the family's measured row
+    _generic_recipe = bool(field and recipe_key == "generic")
+    _g2c = bool(field and not cheap_full
+                and gemma2_champion_admits(model_type, params_b, _vocab(model),
+                                           damaged_base_route=damaged_base_route or _family_recipe))
     if _g2c:
         setattr(model, packing.GEMMA2_ROUTE_ATTR, True)
     if field:
@@ -1363,15 +1544,16 @@ def run(
                          gate_reason=_admission.get("gate", {}).get("reason") if isinstance(_admission.get("gate"), dict) else None)
         gemma_adapter_small_batch = _admission.get("action") == "enable_gemma_small_batch"
     # damaged-base (and, when switched on, clean small-Qwen) field route: the family's executed recipe
-    _damaged_recipe = bool(field and (damaged_base_route or clean_small_qwen_route))
+    _damaged_recipe = bool(field and (damaged_base_route or clean_small_qwen_route or _family_recipe))
     _csq_field = bool(field and clean_small_qwen_route)  # clean small-Qwen FIELD run: window-aware eval governor on
     _csl_field = bool(field and clean_small_lfm2_route and not _damaged_recipe)  # clean LFM2.5-1.2B-Instruct: LR x2 only
     _recipe = field_recipe(str(getattr(getattr(model, "config", None), "model_type", "") or ""), params_b,
-                           damaged_base=_damaged_recipe, clean_small_lfm2=_csl_field)
+                           damaged_base=_damaged_recipe, clean_small_lfm2=_csl_field, generic=_generic_recipe)
     if field:
         _event_and_print("sft_v2_field_recipe", damaged_base=bool(damaged_base_route),
-                         clean_small_qwen=bool(clean_small_qwen_route), **_recipe)
-        if damaged_base_route and damaged_minicpm5_shape(model_type, params_b, vocab):
+                         clean_small_qwen=bool(clean_small_qwen_route), recipe_key=recipe_key, cheap_full=bool(cheap_full),
+                         **_recipe)
+        if (damaged_base_route and damaged_minicpm5_shape(model_type, params_b, vocab)) or recipe_key == "minicpm5":
             _event_and_print("sft_v2_damaged_minicpm5_route", params_b=round(params_b, 4), vocab=vocab)
         if _csl_field:
             _event_and_print("sft_v2_clean_small_lfm2_route", params_b=round(params_b, 4), vocab=vocab,
@@ -1384,6 +1566,18 @@ def run(
         geo = Geometry(micro, _accum, geo.max_len, geo.gradient_checkpointing, False,
                        "paged_adamw_8bit" if _bnb_available() else "adamw_torch")
         _event_and_print("sft_v2_field_bf16", params_b=round(params_b, 3), micro=geo.micro_batch, grad_accum=geo.grad_accum, optim=geo.optim)
+    if cheap_full and strategy == "full":
+        # fallback rung 2 (owner directive 4): the cheaper full fine-tune after the first attempt failed - bf16 weights +
+        # paged 8-bit AdamW whatever the size or recipe, half the micro-batch (same effective batch), checkpointing on
+        if geo.fp32_master or _recipe.get("bf16"):
+            micro, _accum = field_bf16_micro_accum(unit_len=unit_len, vocab=vocab, eff_default=max(1, geo.eff_batch))
+        else:
+            micro = geo.micro_batch
+        micro = max(1, micro // 2)
+        geo = Geometry(micro, max(1, math.ceil(max(1, geo.eff_batch) / micro)), geo.max_len, True, False,
+                       "paged_adamw_8bit" if _bnb_available() else "adamw_torch")
+        _event_and_print("sft_v2_cheap_full", params_b=round(params_b, 3), micro=geo.micro_batch, grad_accum=geo.grad_accum,
+                         optim=geo.optim)
     _g2c_geometry = None
     if _g2c and (pack is None or geo.fp32_master):
         # the recipe is packed bf16 + paged 8-bit AdamW; without either the incumbent route runs unchanged
@@ -2239,7 +2433,10 @@ def run(
     _event_and_print("sft_v2_train_end", step=final_step, best=state["best"], best_step=state["best_step"],
                      phases=phase, remaining_s=round(deadline.remaining_hard(), 1))
     if final_step <= 0:
-        return
+        # never ship the untrained floor while a cheaper rung can still train (owner directive 4): fail loudly
+        _event_and_print("sft_v2_zero_trained_steps", phases=phase, remaining_s=round(deadline.remaining_hard(), 1),
+                         cheap_full=bool(cheap_full))
+        raise ZeroTrainedStepsError("sft_v2 took no optimizer step")
 
     if two_seed_result is not None:
         # the chosen candidate (single seed or the exact two-seed soup) is loaded in the model

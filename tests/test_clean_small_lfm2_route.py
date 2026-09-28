@@ -43,6 +43,9 @@ def _clean_env(monkeypatch):
     for k in list(os.environ):
         if k.startswith("FORGE_"):
             monkeypatch.delenv(k, raising=False)
+    # cab930c-equivalence suite: these tests pin the pre-full-FT-default admission, reachable only with the research
+    # switch FORGE_V2_FULLFT_DEFAULT=0; the release behaviour is pinned by tests/test_fullft_default_route_table.py
+    monkeypatch.setenv("FORGE_V2_FULLFT_DEFAULT", "0")
 
 
 def _gate(params_b=LFM12_B, *, mt="lfm2", vocab=LFM_VOCAB, verdict="clean", ref=REF, data=AJ, long_rows=False, **kw):
@@ -395,7 +398,8 @@ def test_run_candidate_equals_phase_aj_arm_f(monkeypatch, tmp_path, rms):
     ev, tr = _run(monkeypatch, tmp_path / "route", csl=True, rms=rms)
     t = _trace(ev, tr)
     assert _ev(ev, "sft_v2_clean_small_lfm2_route") == [{"params_b": round(LFM12_B, 4), "vocab": LFM_VOCAB, "lr_mult": 2.0}]
-    assert t["recipe"] == [{"damaged_base": False, "clean_small_qwen": False, **F_RECIPE}]
+    assert t["recipe"] == [{"damaged_base": False, "clean_small_qwen": False, "recipe_key": None, "cheap_full": False,
+                           **F_RECIPE}]
     assert t["bf16"] == []  # fp32 master, no bf16 switch
     fl = t["field_lr"]
     assert len(fl) == 1 and fl[0]["mult"] == 2.0 and t["override"] == []

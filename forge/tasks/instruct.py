@@ -795,10 +795,24 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     short_rows = False
     v2_strategy_override: str | None = None
     v2_route_lr: float | None = None
-    if pinned_route and not lfm_pin:
-        telemetry.event("sft_v2_pinned_route_skip", model=spec.model)
     _mt = str(getattr(getattr(loaded.model, "config", None), "model_type", "") or "")
-    _v2_strategy = sft_v2.strategy_for(params_b, _mt) if (not pinned_route or lfm_pin) else ""
+    # Full fine-tuning by default (owner directives 1-4; sft_v2 "Full fine-tuning by default"): a single-GPU, non-KL
+    # InstructTextTask up to 4.2 B trains full weights unless a named exception applies. Out of scope = cab930c routing.
+    fullft_scope_refusal = sft_v2.fullft_scope_refusal(
+        task_type=spec.task_type, has_instruct=spec.instruct is not None, is_kl=is_kl, n_gpus=n_gpus,
+        params_b=params_b, quasar=is_quasar_model(loaded.model))
+    fullft_in_scope = fullft_scope_refusal is None
+    fullft_decision: Any = None
+    fullft_recipe: str | None = None
+    adapter_exception: str | None = None
+    telemetry.event("sft_v2_fullft_scope", in_scope=fullft_in_scope, refusal=fullft_scope_refusal,
+                    params_b=round(params_b, 4), model_type=_mt, n_gpus=n_gpus, is_kl=is_kl)
+    if falcon_legacy_route and fullft_in_scope:
+        adapter_exception = "quality:falcon-rw-1b"
+    if pinned_route and not lfm_pin and not fullft_in_scope:
+        telemetry.event("sft_v2_pinned_route_skip", model=spec.model)
+    _v2_strategy = (sft_v2.strategy_for(params_b, _mt)
+                    if (not pinned_route or lfm_pin or (fullft_in_scope and not falcon_legacy_route)) else "")
     field_route = False
     damaged_base_route = False
     clean_small_qwen_route = False
@@ -871,6 +885,27 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                                         base_identity=_base_identity, base_candidate=_base_candidate,
                                         base_damage=_base_damage, base_clean_ref=_base_clean_ref, long_rows=is_long)
         )
+        if fullft_in_scope:
+            # the full-FT default replaces the allow-list / floor / vocabulary / size / row-length admission above; the
+            # damage verdict only selects hyperparameters (flags below), never adapter vs full weights
+            fullft_decision = sft_v2.fullft_default_route(
+                model_type=_mt, params_b=params_b, vocab_size=_vocab_size, falcon_rw1b=bool(falcon_legacy_route),
+                lfm25_26b=bool(lfm_pin and _vocab_size == sft_v2.LFM25_26B_VOCAB), median_tokens=median_len,
+                long_rows=is_long)
+            telemetry.event("sft_v2_fullft_default", route=fullft_decision.route, reason=fullft_decision.reason,
+                            recipe=fullft_decision.recipe, median_tokens=median_len, rows=len(rows),
+                            total_tokens=_total_tokens, base_damage=_base_damage, cab930c_field_route=field_route)
+            if fullft_decision.route == "full":
+                field_route = True
+                pinned_route = False
+                if lfm_pin:  # an LFM2.5-2.6B long-row task: the pin is not an exception there
+                    telemetry.event("sft_v2_pin_released_to_field", model=spec.model, model_type=_mt,
+                                    reason="fullft_default_long_rows")
+                lfm_pin = False
+                fullft_recipe = fullft_decision.recipe
+            else:
+                field_route = False
+                adapter_exception = fullft_decision.reason
         damaged_base_route = bool(field_route and sft_v2.damaged_base_admits(_mt, _base_damage, params_b, _vocab_size))
         clean_small_qwen_route = bool(field_route and not damaged_base_route
                                       and sft_v2.clean_small_qwen_admits(_mt, _base_damage, params_b, _vocab_size))
@@ -880,7 +915,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         telemetry.event("sft_v2_field_gate", total_tokens=_total_tokens, rows=len(rows), model_type=_mt, field_route=field_route,
                         base_damage=_base_damage, damaged_base_route=damaged_base_route,
                         clean_small_qwen_route=clean_small_qwen_route, clean_small_lfm2_route=clean_small_lfm2_route)
-        if lfm_pin and field_route and _total_tokens is None:
+        if lfm_pin and field_route and _total_tokens is None and fullft_decision is None:
             # a protected pin is released only on evidence: without a known token count the gate is unproven
             field_route = damaged_base_route = clean_small_qwen_route = clean_small_lfm2_route = False
             telemetry.event("sft_v2_pin_release_refused", model=spec.model, model_type=_mt, reason="unknown_total_tokens")
@@ -924,9 +959,16 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 loaded = load_base(spec.cached_model_dir, for_generation=False)
                 tokenizer = loaded.tokenizer
     v2_fallback = False
-    if not pinned_route and not falcon_legacy_route and not short_rows and sft_v2.eligible(
-        spec, is_kl=is_kl, params_b=params_b, n_gpus=n_gpus, model=loaded.model
-    ):
+    fullft_route = bool(fullft_decision is not None and fullft_decision.route == "full" and field_route)
+    if adapter_exception is not None:
+        telemetry.event("sft_v2_adapter_exception", exception=adapter_exception, model_type=_mt,
+                        params_b=round(params_b, 4))
+    # fallback ladder (owner directive 4): full FT -> cheaper full FT (bf16 + paged 8-bit AdamW, half micro-batch) ->
+    # adapter (the legacy LoRA below, with the legacy fixes) as the crash fallback of last resort
+    rung = "full"
+    while (adapter_exception is None and not pinned_route and not falcon_legacy_route and not short_rows
+           and sft_v2.eligible(spec, is_kl=is_kl, params_b=params_b, n_gpus=n_gpus, model=loaded.model)):
+        retry_cheap = False
         try:
             sft_v2.run(
                 spec,
@@ -943,6 +985,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 damaged_base_route=damaged_base_route,
                 clean_small_qwen_route=clean_small_qwen_route,
                 clean_small_lfm2_route=clean_small_lfm2_route,
+                recipe_key=fullft_recipe,
+                cheap_full=rung == "cheap_full",
             )
             return
         except BaseException as exc:  # noqa: BLE001
@@ -950,13 +994,33 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 "sft_v2_failed",
                 error=f"{type(exc).__name__}: {exc}",
                 remaining_s=round(deadline.remaining(), 1),
+                rung=rung,
+                zero_trained_steps=isinstance(exc, sft_v2.ZeroTrainedStepsError),
             )
-            if sft_v2.trained_artifact_present(spec) or deadline.remaining() < 900:
-                # Keep whatever v2 already persisted (best dev checkpoint or
-                # the floor); there is no time for a second full recipe.
+            if sft_v2.trained_artifact_present(spec):
+                # Keep whatever v2 already persisted (a trained best dev checkpoint).
                 telemetry.write_into(spec.output_dir)
                 return
-            v2_fallback = True
+            if not fullft_route and deadline.remaining() < 900:
+                # out-of-scope routes keep cab930c: no time for a second recipe, keep the floor
+                telemetry.write_into(spec.output_dir)
+                return
+            retry_cheap = (fullft_route and rung == "full" and isinstance(exc, Exception)
+                           and deadline.remaining() >= sft_v2.CHEAP_FULL_MIN_REMAINING_S)
+            v2_fallback = not retry_cheap
+        if not retry_cheap:
+            break
+        # rung 2, outside the except suite so the failed attempt's frames (model, optimizer) can be freed
+        rung = "cheap_full"
+        import gc as _gc_cheap
+
+        loaded = None
+        tokenizer = None
+        _gc_cheap.collect()
+        _free_cuda()
+        loaded = load_base(spec.cached_model_dir, for_generation=False)
+        tokenizer = loaded.tokenizer
+        telemetry.event("sft_v2_fallback_to_cheap_full", remaining_s=round(deadline.remaining(), 1))
     if v2_fallback:
         # Fresh model for the validated LoRA path. This runs outside the except
         # suite on purpose: while the handler is active, the exception's traceback
@@ -982,6 +1046,20 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     use_full = decide_full_finetune(
         use_kl=is_kl, params_b=params_b, n_gpus=n_gpus, per_gpu_gb=per_gpu_gb
     )
+    # legacy adapter fixes (anneal to ~0, epoch cap on small data, early stop, checkpoint averaging) for the in-scope
+    # crash fallback and crash exceptions; the quality exceptions keep the adapter that earned them (see sft_v2)
+    legacy_fixes = bool(
+        fullft_in_scope and not use_full and not is_qwen35_model(loaded.model)
+        and sft_v2.legacy_adapter_fixes_enabled(
+            fallback=v2_fallback,
+            crash_exception_route=bool(adapter_exception and adapter_exception.startswith("crash:")),
+            quality_exception_route=bool(adapter_exception and adapter_exception.startswith("quality:")),
+        )
+    )
+    if fullft_in_scope and not v2_fallback and adapter_exception is None and not use_full:
+        # an in-scope task reached the adapter without an exception or a failed full-FT attempt (e.g. no CUDA,
+        # sft_v2.eligible refused): record it loudly; the route-table test pins the dispatcher so this is a runtime-only path
+        telemetry.event("sft_v2_fullft_unexpected_adapter", model_type=_mt, params_b=round(params_b, 4))
     strategy = "full" if use_full else "lora"
     from forge.model import median_weight_rms
 
@@ -993,6 +1071,16 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         n_gpus=n_gpus,
         per_gpu_gb=per_gpu_gb,
     )
+    legacy_pool = None
+    if legacy_fixes:
+        from forge.tuning import legacy_adapter_fixes as _lfix
+        from forge.tuning.selection import SnapshotPool as _SnapshotPool
+
+        plan = _lfix.apply_plan(plan)
+        legacy_pool = _SnapshotPool(k=_lfix.SOUP_POOL_K)
+        telemetry.event("legacy_fixes_on", fallback=v2_fallback, exception=adapter_exception,
+                        lr_scheduler=plan.lr_scheduler, patience=_lfix.EARLY_STOP_PATIENCE,
+                        small_data_rows=_lfix.SMALL_DATA_ROWS, small_data_max_epochs=_lfix.SMALL_DATA_MAX_EPOCHS)
     original_batch = plan.per_device_batch_size
     original_grad_accum = plan.grad_accum_steps
     plan, qwen35_geometry_changed = conservative_qwen35_plan(loaded.model, plan)
@@ -1180,7 +1268,9 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             probe_rows if probe_rows is not None else view.train,
             [] if probe_rows is not None else view.validation,
             collator, is_kl, strategy, n_gpus,
-            probe=probe_rows is not None, epochs=epochs)
+            probe=probe_rows is not None, epochs=epochs,
+            extra_callbacks=(_lfix.make_callbacks(legacy_pool)
+                             if legacy_pool is not None and probe_rows is None else None))
 
     holder = [model]
     del model
@@ -1262,6 +1352,12 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             holder = [timing_model]
             timing_model = None
             _discard(holder.pop())
+        if legacy_fixes:
+            _uncapped = candidate_epochs
+            candidate_epochs = _lfix.cap_epochs(candidate_epochs, len(view.train), float(candidate.num_epochs))
+            if candidate_epochs != _uncapped:
+                telemetry.event("legacy_fixes_epoch_cap", measured=_uncapped, applied=candidate_epochs,
+                                train_n=len(view.train))
         if candidate_epochs is not None:
             telemetry.event(
                 "time_aware_epochs",
@@ -1341,6 +1437,17 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                                tokenizer=tokenizer)
     write_artifact_truth(spec.output_dir, truth, optimizer_step=selected_step,
                          reason="selected_export")
+    if (legacy_pool is not None and fixed_average_route is None and soup_route is None
+            and deadline.remaining() > 300.0):  # the soup's seed evaluation always runs: keep export slack
+        _soup_step = final_step
+
+        def _save_soup(m: Any) -> None:
+            save_adapter(m, tokenizer, spec.output_dir, artifact_truth=truth, optimizer_step=_soup_step,
+                         truth_reason="legacy_fixes_soup")
+
+        _lfix.soup_and_save(model, legacy_pool, training_view.validation, collator, save=_save_soup,
+                            time_budget_s=max(0.0, min(600.0, deadline.remaining() - 120.0)))
+        legacy_pool = None
 
     if fixed_average_route is not None:
         native_snapshot = os.path.join(workdir(spec), "qwen35-fixed-average-native")
@@ -1757,6 +1864,7 @@ def _make_trainer(
     *,
     probe: bool = False,
     epochs: float | None = None,
+    extra_callbacks: list | None = None,
 ):
     from datasets import Dataset
     from transformers import Trainer, TrainingArguments
@@ -1826,6 +1934,7 @@ def _make_trainer(
                 ))
             if route is not None:
                 callbacks.append(make_qwen35_soup_capture_callback(route, tokenizer))
+            callbacks.extend(extra_callbacks or [])
     fields = dict(model=model, args=args, train_dataset=Dataset.from_list(train_ex),
                   eval_dataset=Dataset.from_list(val_ex) if val_ex else None,
                   data_collator=collator, callbacks=callbacks)

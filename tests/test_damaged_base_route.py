@@ -36,6 +36,9 @@ ENABLED = {"qwen2", "lfm2", "gemma2", "qwen3"}  # llama OFF: production fp32 FIE
 def _clean_env(monkeypatch):
     for k in ENV:
         monkeypatch.delenv(k, raising=False)
+    # cab930c-equivalence suite: these tests pin the pre-full-FT-default admission, reachable only with the research
+    # switch FORGE_V2_FULLFT_DEFAULT=0; the release behaviour is pinned by tests/test_fullft_default_route_table.py
+    monkeypatch.setenv("FORGE_V2_FULLFT_DEFAULT", "0")
 
 
 def _gate(mt, **kw):
