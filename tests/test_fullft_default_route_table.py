@@ -121,13 +121,15 @@ def model_double(entry: dict):
 
 def dispatch(monkeypatch, entry: dict, *, data: str, rows: str, verdict: str, n_gpus: int = 1, use_kl: bool = False,
              switch: str | None = None, hours: float = 1.0, v2_handler=None, legacy_handler=None,
-             events_out: list | None = None) -> dict:
+             events_out: list | None = None, env: dict | None = None) -> dict:
     """Run instruct.run to the handler call. Returns {"handler", "field", "strategy", "recipe", "exception", ...}."""
     for k in list(os.environ):
         if k.startswith("FORGE_"):
             monkeypatch.delenv(k, raising=False)
     if switch is not None:
         monkeypatch.setenv("FORGE_V2_FULLFT_DEFAULT", switch)
+    for k, v in (env or {}).items():
+        monkeypatch.setenv(k, v)
     n_rows, tokens = DATA[data]
     median = ROWS[rows]
     events: list = [] if events_out is None else events_out
@@ -156,7 +158,10 @@ def dispatch(monkeypatch, entry: dict, *, data: str, rows: str, verdict: str, n_
     def stop_v2(spec, deadline, rows_, loaded_arg, tokenizer, **kw):
         routes.append({"handler": "sft_v2", "field": kw["field_route"], "recipe": kw.get("recipe_key"),
                        "strategy": kw["strategy_override"] or sft_v2.strategy_for(kw["params_b"], entry["model_type"]),
-                       "damaged": kw["damaged_base_route"], "cheap": kw.get("cheap_full")})
+                       "damaged": kw["damaged_base_route"], "cheap": kw.get("cheap_full"),
+                       "kw": {k: kw.get(k) for k in ("params_b", "per_gpu_gb", "strategy_override", "route_lr",
+                                                     "field_route", "damaged_base_route", "clean_small_qwen_route",
+                                                     "clean_small_lfm2_route", "recipe_key", "cheap_full")}})
 
     def stop_legacy(**kw):
         routes.append({"handler": "legacy", "field": False, "strategy": kw["strategy"], "recipe": None})
@@ -200,8 +205,7 @@ def is_full(r: dict) -> bool:
 def expected_exception(entry: dict, rows: str) -> str | None:
     if entry["model"] == "tiiuae/falcon-rw-1b":
         return "quality:falcon-rw-1b"
-    if entry["model"] == "LiquidAI/LFM2.5-2.6B" and rows == "short":
-        return "quality:lfm2.5-2.6b-short-rows"
+    # "quality:lfm2.5-2.6b-short-rows" was removed 2026-09-29 (phase-an: full FT beat the pinned adapter)
     return None
 
 
@@ -286,26 +290,37 @@ def test_803a8f69_shape_is_full_ft(monkeypatch):
     assert old["handler"] == "legacy"  # what cab930c shipped (the floors refused it)
 
 
-def test_lfm25_26b_exception_is_short_rows_only_and_every_verdict(monkeypatch):
+def test_lfm25_26b_trains_full_at_every_row_length_equal_to_phase_an_arm_f(monkeypatch):
+    """The LFM2.5-2.6B short-row exception is gone (phase-an REDUCE-20260929: full FT DEV -0.0408, 99% CI < 0). Every
+    cell trains the family full-FT route, and the handler receives exactly what arm F ran (FORGE_V2_TAKES_LFM25=1)."""
     entry = next(e for e in IN_SCOPE if e["model"] == "LiquidAI/LFM2.5-2.6B")
     for verdict in ("clean", "damaged", "unknown"):
         for data in DATA:
-            assert dispatch(monkeypatch, entry, data=data, rows="short", verdict=verdict)["handler"] == "legacy"
-            r = dispatch(monkeypatch, entry, data=data, rows="long", verdict=verdict)
-            assert is_full(r) and r["recipe"] == "family"
+            for rows in ROWS:
+                r = dispatch(monkeypatch, entry, data=data, rows=rows, verdict=verdict)
+                f = dispatch(monkeypatch, entry, data=data, rows=rows, verdict=verdict, env={"FORGE_V2_TAKES_LFM25": "1"})
+                assert is_full(r) and r["recipe"] == "family" and r["exception"] is None, (data, rows, verdict, r)
+                assert r["kw"] == f["kw"], (data, rows, verdict, r["kw"], f["kw"])
     lfm2_26 = next(e for e in IN_SCOPE if e["model"] == "LiquidAI/LFM2-2.6B")  # same architecture, vocab 65536
     assert is_full(dispatch(monkeypatch, lfm2_26, data="small", rows="short", verdict="clean"))
+    assert sft_v2.QUALITY_EXCEPTIONS == ("falcon-rw-1b",)
 
 
-def test_lfm25_26b_median_boundary():
-    for median, want in [(1, "adapter_exception"), (255, "adapter_exception"), (256, "full"), (257, "full")]:
-        d = sft_v2.fullft_default_route(model_type="lfm2", params_b=2.697, vocab_size=128000, lfm25_26b=True,
-                                        median_tokens=median)
-        assert d.route == want, (median, d)
-    assert sft_v2.fullft_default_route(model_type="lfm2", params_b=2.697, vocab_size=128000, lfm25_26b=True,
-                                       median_tokens=0, long_rows=False).route == "adapter_exception"
-    assert sft_v2.fullft_default_route(model_type="lfm2", params_b=2.697, vocab_size=128000, lfm25_26b=True,
-                                       median_tokens=None, long_rows=True).route == "full"
+def test_lfm25_26b_out_of_scope_keeps_the_pin(monkeypatch):
+    entry = next(e for e in IN_SCOPE if e["model"] == "LiquidAI/LFM2.5-2.6B")
+    for kw in (dict(n_gpus=2), dict(use_kl=True)):
+        new = dispatch(monkeypatch, entry, data="large", rows="short", verdict="clean", **kw)
+        old = dispatch(monkeypatch, entry, data="large", rows="short", verdict="clean", switch="0", **kw)
+        strip = lambda r: {k: v for k, v in r.items() if k not in ("decision", "scope")}  # noqa: E731
+        assert strip(new) == strip(old)
+
+
+def test_lfm25_26b_median_never_refuses():
+    for median in (0, 1, 155, 255, 256, 257, None):
+        for long_rows in (False, True, None):
+            d = sft_v2.fullft_default_route(model_type="lfm2", params_b=2.697, vocab_size=128000, lfm25_26b=True,
+                                            median_tokens=median, long_rows=long_rows)
+            assert d.route == "full" and d.recipe == "family", (median, long_rows, d)
 
 
 def test_crash_exception_hook(monkeypatch):
@@ -378,8 +393,8 @@ def test_historical_r1_coverage(monkeypatch):
     routes = historical_routes(monkeypatch)
     assert len(routes) == 34
     misses = sorted((tid, model) for tid, _d, model, full in routes if not full)
-    assert misses == [("29fc1a10", "LiquidAI/LFM2.5-2.6B"), ("d99ce208", "tiiuae/falcon-rw-1b")]  # the two exceptions
-    assert sum(full for *_, full in routes) == 32
+    assert misses == [("d99ce208", "tiiuae/falcon-rw-1b")]  # the one remaining quality exception
+    assert sum(full for *_, full in routes) == 33
 
 
 def test_gate_catches_adapters_under_cab930c(monkeypatch):

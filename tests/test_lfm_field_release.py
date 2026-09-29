@@ -102,6 +102,9 @@ def test_lfm_pin_yields_to_field_route_when_gates_pass(monkeypatch, tmp_path):
 
 
 def test_lfm_pin_stands_below_the_token_gate(monkeypatch, tmp_path):
+    # cab930c semantics (FORGE_V2_FULLFT_DEFAULT=0): the pin stands below the token gate. The release sends this in-scope
+    # short-row task to full FT (the LFM2.5-2.6B short-row exception was removed 2026-09-29; see the test below).
+    monkeypatch.setenv("FORGE_V2_FULLFT_DEFAULT", "0")
     args, seen, stats = prepare(monkeypatch, tmp_path, "lfm2", n_rows=20000, long_rows=False)  # 160k tokens
     loaded = instruct.load_base("x")
     loaded.model = _lfm_model()
@@ -152,3 +155,15 @@ def test_lfm_pin_without_a_known_token_count(monkeypatch, tmp_path, fullft):
     assert "sft_v2_pin_release_refused" in events and "sft_v2_pinned_route_skip" in events
     assert "sft_v2_pin_released_to_field" not in events and "sft_v2_field_full_route" not in events
     assert seen["routes"] == [{"handler": "legacy", "field": False, "strategy": "lora"}]
+
+
+def test_release_lfm25_26b_short_rows_train_full(monkeypatch, tmp_path):
+    """Release default: the in-scope LFM2.5-2.6B short-row task below the old token gate trains full weights (phase-an)."""
+    monkeypatch.delenv("FORGE_V2_FULLFT_DEFAULT", raising=False)
+    args, seen, stats = prepare(monkeypatch, tmp_path, "lfm2", n_rows=20000, long_rows=False)
+    loaded = instruct.load_base("x")
+    loaded.model = _lfm_model()
+    _pin_lfm(monkeypatch, loaded.model)
+    cli.main(args)
+    assert seen["routes"] and seen["routes"][0]["handler"] == "sft_v2"
+    assert seen["routes"][0]["field"] is True and seen["routes"][0]["strategy"] == "full"

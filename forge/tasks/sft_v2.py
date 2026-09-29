@@ -598,10 +598,13 @@ FULLFT_DEFAULT_MAX_PARAMS_B = 4.25
 # Named, dated quality exceptions (CURRENT-CAMPAIGN "Adapter exceptions"); matched in instruct.run by the loaded
 # architecture, never by the request name:
 #   falcon-rw-1b                    our adapter placed 1st on 08-31 (instruct.eligible_falcon_rw1b_legacy_route)
-#   LFM2.5-2.6B short-row tasks     tokenized row median < 256 (LFM25_26B_SHORT_ROW_MEDIAN) keep the pinned one-epoch
-#                                   adapter (owner decision 2026-09-28; our r32 adapter 2nd of 12 on 09-07); every damage
-#                                   verdict, every data size. Long rows (median >= 256) train full weights.
-QUALITY_EXCEPTIONS = ("falcon-rw-1b", "lfm2.5-2.6b-short-rows")
+# REMOVED 2026-09-29: "lfm2.5-2.6b-short-rows" (tokenized median < 256 kept the pinned one-epoch adapter; owner decision
+#   2026-09-28 "drop the exception if full FT wins"). replay-bench phase-an (research/20260923-replay-bench/phase-an/
+#   REDUCE-20260929.md) on the task that earned it (29fc1a10, clean LFM2.5-2.6B, seed 7): full FT (family recipe = what
+#   FORGE_V2_TAKES_LFM25=1 selected) vs the pinned adapter, DEV -0.0408 99% [-0.0593, -0.0248] PASS; historical -3.57%;
+#   1st of 13 on the retained 09-07 board (adapter 3rd). LFM2.5-2.6B tasks in scope now train full weights at every row
+#   length, as long rows already did; the pin still applies out of scope (cab930c).
+QUALITY_EXCEPTIONS = ("falcon-rw-1b",)
 LFM25_26B_SHORT_ROW_MEDIAN = 256
 # The LFM2.5-2.6B pin (forge.tuning.lfm25_epoch_cap._matches_base_model) matches the architecture only, which LFM2-2.6B
 # (vocabulary 65536) shares; the exception names LFM2.5-2.6B, so it also requires LFM2.5's vocabulary.
@@ -718,11 +721,8 @@ def fullft_default_route(*, model_type: str | None, params_b: float, vocab_size:
     median (long_row_task). The damage verdict is deliberately not an input."""
     if falcon_rw1b:
         return RouteDecision("adapter_exception", "quality:falcon-rw-1b")
-    # short = sampled tokenized median < 256; without a median (sampling failed) the row-length flag decides, and
-    # long_row_task reports a failed sample as (False, 0) = short, i.e. the exception's pinned adapter
-    short = (int(median_tokens) < LFM25_26B_SHORT_ROW_MEDIAN) if median_tokens else (long_rows is not True)
-    if lfm25_26b and short:
-        return RouteDecision("adapter_exception", "quality:lfm2.5-2.6b-short-rows")
+    # lfm25_26b / median_tokens / long_rows: kept for telemetry and callers; the LFM2.5-2.6B short-row quality exception
+    # was removed on 2026-09-29 (phase-an: full FT won), so they no longer refuse full weights
     crash = crash_exception(model_type, params_b)
     if crash:
         return RouteDecision("adapter_exception", crash)
