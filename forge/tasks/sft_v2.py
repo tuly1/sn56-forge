@@ -2056,9 +2056,11 @@ def run(
                        if pack else max(1, len(train_ex) // geo.eff_batch))
 
     # ---- training with validator-style dev selection ----
-    # D2: the RAM gate reads the container's cgroup headroom (selection.available_ram); above 3 B params the pool keeps
-    # at most 3 bf16 snapshots so pool + fp32 soup sum + export stay well inside G.O.D's 110 GiB container
-    pool = selection.SnapshotPool(k=selection.snapshot_pool_k(float(params_b) * 1e9))
+    # D2: the RAM gate reads the container's cgroup headroom (selection.available_ram); above 3 B params a FULL-weight
+    # pool keeps at most 3 bf16 snapshots so pool + fp32 soup sum + export stay well inside G.O.D's 110 GiB container
+    # (adapter snapshots are adapter-only and keep k = 8, cab930c)
+    pool = selection.SnapshotPool(k=selection.snapshot_pool_k(float(params_b) * 1e9) if strategy == "full"
+                                  else selection.SNAPSHOT_POOL_K)
     _event_and_print("sft_v2_snapshot_pool", k=pool.k, params_b=round(float(params_b), 3),
                      available_ram=selection.available_ram(), **selection.cgroup_memory_peak())
     stop_at = _StopAt(deadline, finish_reserve)

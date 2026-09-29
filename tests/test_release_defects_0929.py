@@ -94,6 +94,14 @@ def test_pool_k_cap_above_3b(params, k):
     assert selection.snapshot_pool_k(params) == k
 
 
+def test_adapter_pool_keeps_k8(monkeypatch, tmp_path):
+    import inspect
+
+    src = inspect.getsource(sft_v2.run)
+    assert 'snapshot_pool_k(float(params_b) * 1e9) if strategy == "full"' in src and "else selection.SNAPSHOT_POOL_K" in src
+    assert selection.SNAPSHOT_POOL_K == 8
+
+
 def test_run_logs_pool_k_and_cgroup(monkeypatch, tmp_path):
     ev, _ = _run(monkeypatch, tmp_path, recipe_key="family")
     pool = lfm._ev(ev, "sft_v2_snapshot_pool")
