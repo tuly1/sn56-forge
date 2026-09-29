@@ -485,6 +485,33 @@ def _restore_base_architectures(staged_dir: str, model: Any) -> None:
         except Exception:
             pass
 
+def _align_export_with_base(staged_dir: str, model: Any) -> None:
+    """Post-save (after the architectures restore): make a full-weight export pass the validator's is_finetune check on
+    EVERY compared attribute (release defect D1; forge.tasks.export_compat). Adapter exports have no config.json and are
+    skipped. Never raises: the report goes to telemetry (``export_config_aligned`` / ``export_config_align_failed``)."""
+    try:
+        from forge import telemetry
+
+        if not os.path.isfile(os.path.join(staged_dir, "config.json")):
+            return
+        base_dir = _infer_base_model_dir(model)
+        if base_dir is None:
+            telemetry.event("export_config_align_skipped", reason="base_dir_unresolved")
+            return
+        from forge.tasks.export_compat import align_export_with_base
+
+        report = align_export_with_base(staged_dir, base_dir)
+        name = "export_config_align_failed" if report.get("ok") is False else "export_config_aligned"
+        telemetry.event(name, **{k: v for k, v in report.items() if isinstance(v, (str, int, float, bool)) or v is None})
+    except Exception as exc:  # never crash a completed run over metadata
+        try:
+            from forge import telemetry
+
+            telemetry.event("export_config_align_failed", error=f"{type(exc).__name__}: {exc}"[:400])
+        except Exception:
+            pass
+
+
 _ARTIFACT_TRUTH_FILE = "forge_artifact_truth.json"
 ARTIFACT_FLOOR = "FLOOR"
 ARTIFACT_PARTIAL_TRAINED_BEST = "PARTIAL_TRAINED_BEST"
@@ -554,6 +581,7 @@ def save_adapter(
         model.save_pretrained(tmp, **save_kwargs)
         tokenizer.save_pretrained(tmp)
         _restore_base_architectures(tmp, model)
+        _align_export_with_base(tmp, model)
         if artifact_truth is not None:
             _write_truth(
                 os.path.join(tmp, _ARTIFACT_TRUTH_FILE),

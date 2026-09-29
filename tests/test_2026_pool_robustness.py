@@ -208,8 +208,11 @@ def test_floor_best_export_and_non_sft_handlers_remain_unchanged():
     expected = {
         # 2026-09-10: save_adapter gained an optional state_dict= parameter (default None,
         # identical behaviour) for the v2 handler's bf16 snapshot export; pin refreshed.
+        # 2026-09-29 (release defect D1): save_adapter aligns a FULL-weight export's config (and, for composite
+        # Qwen3.5-style bases, tensor names) with the base so the validator's is_finetune check passes
+        # (forge.tasks.export_compat; tests/test_export_validator_finetune.py). Adapter exports are untouched.
         "forge/tasks/common.py": (
-            "2b7ea6bd2cc646f39c510f14af1e58de42b3eb07d68fd01fa767c13aff1ecfcd"
+            "332dd32b10ec46575779c041c62446216c8ed9c76af7ffae2fec6169f044f3d4"
         ),
         "forge/tasks/fallback.py": (
             "16a556b7c5104f45584b0bdc24bb2f050835eb2945be496a9e659cef6e9ceed0"

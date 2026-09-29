@@ -10,6 +10,7 @@ proxy.
 from __future__ import annotations
 
 import gc
+import os
 import math
 import time
 from typing import Any, Callable
@@ -107,7 +108,69 @@ def load_state(model: Any, state: dict[str, Any]) -> None:
                 p.data.copy_(state[n].to(device=p.device, dtype=p.dtype))
 
 
-def available_ram() -> int | None:
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def _read_int(path: str) -> int | None:
+    try:
+        with open(path) as fh:
+            raw = fh.read().strip()
+    except Exception:
+        return None
+    if not raw or raw == "max":
+        return None
+    try:
+        return int(raw.split()[0])
+    except ValueError:
+        return None
+
+
+def _cgroup_stat(path: str, key: str) -> int:
+    try:
+        with open(path) as fh:
+            for line in fh:
+                k, _, v = line.partition(" ")
+                if k == key:
+                    return int(v.strip())
+    except Exception:
+        pass
+    return 0
+
+
+def cgroup_memory_available(root: str | None = None) -> int | None:
+    """Bytes the container may still allocate before its cgroup limit: limit - (usage - inactive page cache).
+    cgroup v2 (memory.max / memory.current / memory.stat inactive_file) or v1 (memory/memory.limit_in_bytes /
+    usage_in_bytes / stat total_inactive_file). None when there is no finite limit (unlimited or not a container).
+    Release defect D2: G.O.D runs trainers in a 110 GiB container on ~1.4 TB hosts, so host RAM said nothing."""
+    root = root or CGROUP_ROOT
+    limit = _read_int(os.path.join(root, "memory.max"))
+    if limit is not None:
+        usage = _read_int(os.path.join(root, "memory.current")) or 0
+        usage -= _cgroup_stat(os.path.join(root, "memory.stat"), "inactive_file")
+        return max(0, limit - max(0, usage))
+    v1 = os.path.join(root, "memory")
+    limit = _read_int(os.path.join(v1, "memory.limit_in_bytes"))
+    if limit is not None and limit < (1 << 60):  # v1 reports ~2^63 for "unlimited"
+        usage = _read_int(os.path.join(v1, "memory.usage_in_bytes")) or 0
+        usage -= _cgroup_stat(os.path.join(v1, "memory.stat"), "total_inactive_file")
+        return max(0, limit - max(0, usage))
+    return None
+
+
+def cgroup_memory_peak(root: str | None = None) -> dict[str, int | None]:
+    """cgroup peak / limit in bytes for the flight recorder (v2 memory.peak + memory.max, v1 max_usage_in_bytes)."""
+    root = root or CGROUP_ROOT
+    peak = _read_int(os.path.join(root, "memory.peak"))
+    limit = _read_int(os.path.join(root, "memory.max"))
+    if peak is None and limit is None:
+        peak = _read_int(os.path.join(root, "memory", "memory.max_usage_in_bytes"))
+        limit = _read_int(os.path.join(root, "memory", "memory.limit_in_bytes"))
+        if limit is not None and limit >= (1 << 60):
+            limit = None
+    return {"peak_bytes": peak, "limit_bytes": limit}
+
+
+def _host_available_ram() -> int | None:
     try:
         import psutil
 
@@ -122,6 +185,21 @@ def available_ram() -> int | None:
     except Exception:
         pass
     return None
+
+
+def available_ram() -> int | None:
+    """min(host available, container cgroup headroom); either may be unknown."""
+    vals = [v for v in (_host_available_ram(), cgroup_memory_available()) if v is not None]
+    return min(vals) if vals else None
+
+
+SNAPSHOT_POOL_K = 8
+SNAPSHOT_POOL_K_LARGE = 3  # D2: models above 3 B params keep at most 3 bf16 snapshots (4.2 B: 8 x 8.4 GB = 67 GB)
+SNAPSHOT_POOL_LARGE_MIN_PARAMS = 3.0e9
+
+
+def snapshot_pool_k(n_params: float) -> int:
+    return SNAPSHOT_POOL_K_LARGE if float(n_params) > SNAPSHOT_POOL_LARGE_MIN_PARAMS else SNAPSHOT_POOL_K
 
 
 class SnapshotPool:

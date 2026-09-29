@@ -745,6 +745,46 @@ class ZeroTrainedStepsError(RuntimeError):
     shipped while a cheaper rung can still train: the dispatcher catches this and moves to the next rung."""
 
 
+FULLFT_EXTEND_MIN_WINDOW_S = 300.0
+
+
+def fullft_epoch_cap_extension(*, recipe_key: str | None, phase: int, extended: bool, last_phase_complete: bool,
+                               stopped_overfit: bool, best_step: int, step_offset: int, epochs_done: float,
+                               max_epochs: float, window_s: float, min_window_s: float, t_step: float | None,
+                               steps_per_epoch: int) -> float:
+    """Extra epochs for ONE continuation phase of a full-FT default run whose epoch cap ended training early (window
+    use, 2026-09-29), else 0.
+
+    The FIELD route trains one cosine over min(epoch cap, what fits). When the cap binds, the rest of the paid window is
+    idle: the live NuExtract task stopped at the 3-epoch cap after 2,306 of 4,500 s with the DEV loss improving at every
+    evaluation (0.8060 -> 0.8023 -> 0.7984). Continuing is only allowed when the DEV loss says training still helps:
+    phase 0 completed its plan (the cap bound, not the clock), no overfit stop, the best DEV loss is the phase's LAST
+    evaluation, and at least FULLFT_EXTEND_MIN_WINDOW_S / 25 steps of window remain. The continuation is a fresh
+    annealed cosine at the restart LR (x0.5) over at most one more cap of epochs, planned inside the window. The best-
+    snapshot pool keeps the phase-0 end, the overfit early stop is active and the greedy soup is monotone, so on DEV the
+    shipped weights are never worse than stopping at the cap. FORGE_V2_FULLFT_EXTEND=0 switches it off."""
+    if os.environ.get("FORGE_V2_FULLFT_EXTEND", "1").strip() == "0":
+        return 0.0
+    if not recipe_key or extended or phase != 1 or not last_phase_complete or stopped_overfit or not t_step:
+        return 0.0
+    if best_step <= 0 or best_step != step_offset:
+        return 0.0  # DEV was not improving at the end of the capped phase
+    if epochs_done < max_epochs - 1e-3:
+        return 0.0  # the cap did not bind (the clock or the planner ended the phase)
+    if window_s < max(FULLFT_EXTEND_MIN_WINDOW_S, min_window_s):
+        return 0.0
+    spe = max(1, int(steps_per_epoch))
+    extra = round(max(0.0, min(float(max_epochs), window_s * 0.85 / float(t_step) / spe)), 3)
+    if math.ceil(spe * extra) < max(10, int(0.15 * spe)):
+        return 0.0  # below the planner's minimum continuation phase
+    return extra
+
+
+class PersistFailedError(RuntimeError):
+    """sft_v2 trained but no trained artifact could be written (release defect D5). Raised on the full-FT default route
+    only, so the dispatcher's ladder retries instead of shipping the untrained floor with a clean exit."""
+
+
 CHEAP_FULL_MIN_REMAINING_S = 900.0  # a cheaper full-FT retry needs a reload + tokenization + at least a few hundred steps
 
 
@@ -832,6 +872,32 @@ def field_recipe(model_type: str | None, params_b: float, *, damaged_base: bool 
             "bf16_min_b": min_b, "lr_mult": _field_lr_mult(model_type, damaged_base=damaged_base, params_b=params_b,
                                                          clean_small_lfm2=clean_small_lfm2),
             "eff_batch": field_eff_batch(params_b), "strategy": "full"}
+
+
+# D7 SWITCH (release defect D7, 2026-09-29). The "llama" full-FT default recipe keeps fp32 master + fused AdamW up to
+# FP32_MASTER_MAX_B (3.3 B, so Llama-3.2-3B, open_llama_3b and WizardVicuna-3b train fp32 master: ~51 GB static). fp32
+# master at 3 B is UNMEASURED; the decision comes from the phase-am am-llama32-3bi step time (fp32 master) against a
+# bf16 + paged 8-bit arm. None = OFF = the b676020 behaviour. A float X = llama recipe tasks with params_b >= X train
+# bf16 weights + paged 8-bit AdamW (the generic recipe uses 2.0). FORGE_V2_LLAMA_BF16_MIN_B overrides for research.
+LLAMA_RECIPE_BF16_MIN_B: float | None = None
+
+
+def llama_recipe_bf16_min_b() -> float | None:
+    raw = os.environ.get("FORGE_V2_LLAMA_BF16_MIN_B", "").strip()
+    if raw:
+        try:
+            return float(raw)
+        except ValueError:
+            return LLAMA_RECIPE_BF16_MIN_B
+    return LLAMA_RECIPE_BF16_MIN_B
+
+
+def llama_recipe_precision(recipe: dict[str, Any], params_b: float) -> dict[str, Any]:
+    """Apply the D7 switch to a "llama" recipe dict (unchanged when the switch is off)."""
+    min_b = llama_recipe_bf16_min_b()
+    if min_b is None or recipe.get("bf16") or float(params_b) < float(min_b):
+        return recipe
+    return {**recipe, "bf16": True, "bf16_min_b": float(min_b)}
 
 
 def field_bf16_micro_accum(*, unit_len: int, vocab: int, eff_default: int) -> tuple[int, int]:
@@ -1164,6 +1230,7 @@ def bigdata_full_route(*, n_rows: int, hours: float, model_type: str | None, par
         and hours >= min_hours
     )
 MIN_TASK_SECONDS_FOR_V2 = 20 * 60
+TIMING_PROBE_MIN_REMAINING_S = 600.0  # D4: fixed-LR full-FT default runs (incl. late rung 2) still measure step time
 
 
 def _log(name: str, payload: dict[str, Any] | None = None, **kw: Any) -> None:
@@ -1549,6 +1616,8 @@ def run(
     _csl_field = bool(field and clean_small_lfm2_route and not _damaged_recipe)  # clean LFM2.5-1.2B-Instruct: LR x2 only
     _recipe = field_recipe(str(getattr(getattr(model, "config", None), "model_type", "") or ""), params_b,
                            damaged_base=_damaged_recipe, clean_small_lfm2=_csl_field, generic=_generic_recipe)
+    if field and recipe_key == "llama":
+        _recipe = llama_recipe_precision(_recipe, params_b)
     if field:
         _event_and_print("sft_v2_field_recipe", damaged_base=bool(damaged_base_route),
                          clean_small_qwen=bool(clean_small_qwen_route), recipe_key=recipe_key, cheap_full=bool(cheap_full),
@@ -1825,7 +1894,17 @@ def run(
     if field_calibration:
         n_probe_batches = 25 * geo.grad_accum  # one full, non-wrapping experimental panel prefix
     lr, t_per_step, diag = prior_lr, None, {}
-    if remaining > MIN_TASK_SECONDS_FOR_V2:
+    # D4: a fixed-LR full-FT default run (e.g. the late fallback rung 2) needs only the 3-step timing probe, so it runs
+    # above TIMING_PROBE_MIN_REMAINING_S instead of the sweep's 20 min; without timing the planner would plan one full
+    # epoch and the clock would stop it in warmup / near peak LR with no anneal. (The rung-2 entry floor stays
+    # CHEAP_FULL_MIN_REMAINING_S: raising it would send late failures straight to the adapter, directive 4.)
+    _probe_floor = (TIMING_PROBE_MIN_REMAINING_S if (recipe_key and _lr_override > 0 and not field_calibration)
+                    else MIN_TASK_SECONDS_FOR_V2)
+    if _probe_floor < MIN_TASK_SECONDS_FOR_V2 and remaining <= MIN_TASK_SECONDS_FOR_V2:
+        n_probe_batches = min(n_probe_batches, max(8, 4 * geo.grad_accum))  # timing only: 3 steps
+        _event_and_print("sft_v2_late_timing_probe", remaining_s=round(remaining, 1), cheap_full=bool(cheap_full),
+                         batches=n_probe_batches)
+    if remaining > _probe_floor:
         try:
             for i, b in enumerate(probe_trainer.get_train_dataloader()):
                 if i >= n_probe_batches:
@@ -1977,7 +2056,11 @@ def run(
                        if pack else max(1, len(train_ex) // geo.eff_batch))
 
     # ---- training with validator-style dev selection ----
-    pool = selection.SnapshotPool(k=8)
+    # D2: the RAM gate reads the container's cgroup headroom (selection.available_ram); above 3 B params the pool keeps
+    # at most 3 bf16 snapshots so pool + fp32 soup sum + export stay well inside G.O.D's 110 GiB container
+    pool = selection.SnapshotPool(k=selection.snapshot_pool_k(float(params_b) * 1e9))
+    _event_and_print("sft_v2_snapshot_pool", k=pool.k, params_b=round(float(params_b), 3),
+                     available_ram=selection.available_ram(), **selection.cgroup_memory_peak())
     stop_at = _StopAt(deadline, finish_reserve)
     state = {"best": float("inf"), "best_step": 0, "overfit": 0, "persisted_best": float("inf"), "persisted_step": 0,
              "eval_count": 0, "last_persist_at": 0.0, "step_offset": 0, "epochs_done": 0.0, "eval_secs": 0.0,
@@ -2204,6 +2287,7 @@ def run(
     # two seeds scored 0.557561 vs 0.558400 / 0.564622 for the seeds themselves
     # (the seed spread alone is ~1%). Only where a second epoch fits comfortably.
     two_seed = os.environ.get("FORGE_V2_TWO_SEED", "0") == "1" and strategy == "lora"
+    fullft_extended = False  # window use: one DEV-gated continuation past the epoch cap (fullft_epoch_cap_extension)
     two_seed_result: tuple[float, int, str] | None = None
     seed_b_active = False
     seed_a: dict[str, Any] = {}
@@ -2225,7 +2309,18 @@ def run(
         if phase > 0 and window < min_window:
             break
         if phase > 0 and field and not oom_continue:
-            break  # the field route is one cosine: no continuation phases
+            _ext = fullft_epoch_cap_extension(
+                recipe_key=recipe_key, phase=phase, extended=fullft_extended, last_phase_complete=state["last_phase_complete"],
+                stopped_overfit=state["stopped_overfit"], best_step=state["best_step"], step_offset=state["step_offset"],
+                epochs_done=state["epochs_done"], max_epochs=max_epochs_total, window_s=window, min_window_s=min_window,
+                t_step=t_step, steps_per_epoch=steps_per_epoch)
+            if _ext <= 0:
+                break  # the field route is one cosine: no continuation phases
+            fullft_extended = True
+            _event_and_print("sft_v2_fullft_epoch_cap_extended", cap=max_epochs_total, extra_epochs=_ext,
+                             window_s=round(window, 1), best=state["best"], best_step=state["best_step"],
+                             lr_next=lr * max(0.1, _restart_factor ** phase))
+            max_epochs_total += _ext
         oom_continue = False
         if phase > 0 and os.environ.get("FORGE_V2_SOUP_FIRST", "0") == "1" and t_step:
             # experiment: a later phase only when the greedy soup (3 evals) and the
@@ -2433,10 +2528,13 @@ def run(
     _event_and_print("sft_v2_train_end", step=final_step, best=state["best"], best_step=state["best_step"],
                      phases=phase, remaining_s=round(deadline.remaining_hard(), 1))
     if final_step <= 0:
-        # never ship the untrained floor while a cheaper rung can still train (owner directive 4): fail loudly
+        # never ship the untrained floor while a cheaper rung can still train (owner directive 4): fail loudly. Only on
+        # the in-scope full-FT default route (recipe_key set, D3); every other route keeps cab930c (return, floor kept)
         _event_and_print("sft_v2_zero_trained_steps", phases=phase, remaining_s=round(deadline.remaining_hard(), 1),
-                         cheap_full=bool(cheap_full))
-        raise ZeroTrainedStepsError("sft_v2 took no optimizer step")
+                         cheap_full=bool(cheap_full), raised=bool(recipe_key))
+        if recipe_key:
+            raise ZeroTrainedStepsError("sft_v2 took no optimizer step")
+        return  # cab930c: out-of-scope routes return with the floor kept
 
     if two_seed_result is not None:
         # the chosen candidate (single seed or the exact two-seed soup) is loaded in the model
@@ -2444,11 +2542,15 @@ def run(
         pool.items = []
     # ---- final evaluation of the last weights (may be the best) ----
     if dev_rows_for_selection and state["last_eval_step"] != final_step and deadline.remaining_hard() > export_reserve + dev_eval_est:
-        last_loss = eval_dev(model)
-        telemetry.eval_point(final_step, last_loss)
-        if last_loss < state["best"]:
-            state["best"], state["best_step"] = last_loss, final_step
-        pool.consider(model, last_loss, final_step)
+        try:  # D5: a failed final eval (e.g. OOM) must not discard the trained weights; the pool/best keep selection
+            last_loss = eval_dev(model)
+            telemetry.eval_point(final_step, last_loss)
+            if last_loss < state["best"]:
+                state["best"], state["best_step"] = last_loss, final_step
+            pool.consider(model, last_loss, final_step)
+        except Exception as exc:
+            _event_and_print("sft_v2_final_eval_failed", error=f"{type(exc).__name__}: {exc}"[:300])
+            _free_cuda()
 
     # ---- greedy soup ----
     chosen_state: dict[str, Any] | None = None
@@ -2502,13 +2604,17 @@ def run(
         except Exception as exc:
             _event_and_print("sft_v2_stage_failed", stage=name, error=f"{type(exc).__name__}: {exc}")
 
-    if dev_ex and len(dev_ex) >= 100 and deadline.remaining_hard() > export_reserve + dev_pass_s + 30 and os.environ.get("FORGE_DEV_PASS", "1") != "0":
+    _dp_factory = dev_pass_optimizer_factory(geo, optimizer_factory, strategy=strategy, betas=(_beta1, _beta2))
+    if _dp_factory is None and dev_ex and len(dev_ex) >= 100:
+        _event_and_print("sft_v2_dev_pass_skipped", reason="bf16_weights_without_8bit_adamw", optim=geo.optim)
+    if (_dp_factory is not None and dev_ex and len(dev_ex) >= 100 and deadline.remaining_hard() > export_reserve + dev_pass_s + 30
+            and os.environ.get("FORGE_DEV_PASS", "1") != "0"):
         _keep_stage("soup")
         for _k in range(_dp_epochs):
             if _k > 0 and deadline.remaining_hard() <= export_reserve + dev_pass_s + 30:
                 break
             try:
-                _dev_pass(model, dev_ex, collator, lr=lr * _dp_mult, geo=geo, autocast=autocast, optimizer_factory=optimizer_factory)
+                _dev_pass(model, dev_ex, collator, lr=lr * _dp_mult, geo=geo, autocast=autocast, optimizer_factory=_dp_factory)
                 chosen_state = None  # weights in the model are now the final ones
                 _event_and_print("sft_v2_dev_pass_done", rows=len(dev_ex), lr=lr * _dp_mult, pass_index=_k + 1)
                 _keep_stage(f"devpass{_k + 1}")
@@ -2525,8 +2631,14 @@ def run(
         return
     final_state = chosen_state if chosen_state is not None else selection.snapshot_trainable(model)
     ok = persist(model, final_state, chosen_step or final_step, truth, "sft_v2_final")
+    if not ok and recipe_key and not trained_artifact_present(spec):
+        # D5: trained weights exist but nothing trained reached the output (only the floor would ship with a clean exit).
+        # In-scope full-FT route: raise so the dispatcher's ladder retries (cheap full FT, then the adapter) or the task
+        # fails loudly. Out-of-scope routes keep cab930c.
+        _event_and_print("sft_v2_persist_failed_no_artifact", step=final_step, remaining_s=round(deadline.remaining_hard(), 1))
+        raise PersistFailedError("sft_v2 trained but could not save any trained artifact")
     _event_and_print("sft_v2_final", saved=ok, chosen_loss=chosen_loss, chosen_step=chosen_step, truth=truth,
-                    remaining_s=round(deadline.remaining_hard(), 1))
+                    remaining_s=round(deadline.remaining_hard(), 1), **{f"cgroup_{k}": v for k, v in selection.cgroup_memory_peak().items()})
     telemetry.write_into(spec.output_dir)
 
 
@@ -2733,6 +2845,25 @@ def _dev_pass_estimate(n_dev: int, t_per_step: float | None, geo: Geometry) -> f
     if t_per_step is None:
         return 120.0
     return max(20.0, 1.5 * (n_dev / max(1, geo.eff_batch)) * t_per_step + 20.0)
+
+
+def dev_pass_optimizer_factory(geo: Geometry, default_factory: Callable, *, strategy: str = "full",
+                               betas: tuple[float, float] = (0.9, 0.999)) -> Callable | None:
+    """Optimizer of the post-selection dev pass (release defect D6). fp32 master weights keep the run's torch AdamW. bf16
+    weights take bitsandbytes' paged 8-bit AdamW, the optimizer the training run's memory probe reserved for (2 B/param);
+    plain AdamW there allocates bf16 moments at 4 B/param, can OOM at the probed micro-batch (then the pass is silently
+    dropped) and was never the trained recipe. Without 8-bit AdamW a bf16 run skips the dev pass (returns None)."""
+    if strategy != "full" or geo.fp32_master:  # adapters train fp32 adapter weights: unchanged
+        return default_factory
+    if "8bit" not in str(geo.optim) or not _bnb_available():
+        return None
+
+    def factory(params: list, lr: float):
+        import bitsandbytes as bnb
+
+        return bnb.optim.PagedAdamW8bit(params, lr=lr, betas=betas, eps=1e-8, weight_decay=0.0)
+
+    return factory
 
 
 def _dev_pass(model: Any, dev: list[dict], collator: Any, *, lr: float, geo: Geometry, autocast: bool, optimizer_factory: Callable) -> None:
