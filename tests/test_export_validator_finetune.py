@@ -187,3 +187,105 @@ def test_emulated_view_matches_real_load(tmp_path):
         real = _validator_load(base).config
         assert type(view) is type(real) and view.model_type == real.model_type
         assert view.architectures == real.architectures
+
+
+# ---- RESP-072-1: the header/index rewrite is transactional -----------------------------------------------------------
+
+def _sharded_q35(tmp_path):
+    base = _make_base(tmp_path, "qwen3_5")
+    trained = _train_like_forge(base)
+    out = tmp_path / "sharded"
+    trained.save_pretrained(out, max_shard_size="40KB")
+    files, index = export_compat._weight_files(str(out))
+    assert index and len(files) >= 2
+    snap = {p.name: p.read_bytes() for p in out.iterdir()}
+    return base, trained, out, snap
+
+
+def _assert_pristine(out, snap, trained):
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == snap  # every file byte-identical, no stray temp files
+    ids = torch.randint(3, 256, (1, 7))
+    assert torch.equal(_logits(_validator_load(out, torch.float32), ids), _logits(trained, ids))
+
+
+def test_later_shard_failure_rolls_back_everything(tmp_path, monkeypatch):
+    base, trained, out, snap = _sharded_q35(tmp_path)
+    real, calls = export_compat._rename_in_place, []
+
+    def flaky(path, rename):
+        calls.append(path)
+        if len(calls) == 2:
+            raise OSError("EIO on shard 2")
+        return real(path, rename)
+
+    monkeypatch.setattr(export_compat, "_rename_in_place", flaky)
+    report = export_compat.align_export_with_base(str(out), str(base))
+    assert report["ok"] is False and "EIO" in report["error"] and len(calls) == 2
+    _assert_pristine(out, snap, trained)
+
+
+def test_torn_header_write_rolls_back(tmp_path, monkeypatch):
+    base, trained, out, snap = _sharded_q35(tmp_path)
+
+    def torn(path, rename):  # half a header reaches the disk, then the write fails
+        with open(path, "r+b") as fh:
+            fh.seek(8)
+            fh.write(b"{" * 64)
+        raise OSError("ENOSPC mid-write")
+
+    monkeypatch.setattr(export_compat, "_rename_in_place", torn)
+    assert export_compat.align_export_with_base(str(out), str(base))["ok"] is False
+    _assert_pristine(out, snap, trained)
+
+
+def test_index_replacement_failure_rolls_back(tmp_path, monkeypatch):
+    base, trained, out, snap = _sharded_q35(tmp_path)
+    real, failed = export_compat._atomic_write_bytes, []
+
+    def flaky(path, data):
+        if path.endswith("model.safetensors.index.json") and not failed:
+            failed.append(path)
+            Path(path + ".align.tmp").write_bytes(data[:10])  # a partial temp file is left behind
+            raise OSError("EIO replacing the index")
+        return real(path, data)
+
+    monkeypatch.setattr(export_compat, "_atomic_write_bytes", flaky)
+    report = export_compat.align_export_with_base(str(out), str(base))
+    assert report["ok"] is False and failed
+    _assert_pristine(out, snap, trained)
+
+
+def test_unverified_rollback_raises_and_save_adapter_keeps_promoted_artifact(tmp_path, monkeypatch):
+    base = _make_base(tmp_path, "qwen3_5")
+    trained = _train_like_forge(base)
+    out = tmp_path / "out"
+    common.save_adapter(trained, _Tok(), str(out))  # a good promoted artifact
+    promoted = {p.name: p.read_bytes() for p in out.iterdir()}
+
+    raw = tmp_path / "raw"
+    trained.save_pretrained(raw)  # unaligned export: the alignment will run
+    monkeypatch.setattr(export_compat, "keys_match", lambda d: (False, "forced"))
+    monkeypatch.setattr(export_compat._Journal, "verify", lambda self: False)  # rollback cannot be verified
+    with pytest.raises(export_compat.ExportAlignmentError):
+        export_compat.align_export_with_base(str(raw), str(base))
+    with pytest.raises(export_compat.ExportAlignmentError):
+        common.save_adapter(trained, _Tok(), str(out))  # staging fails instead of promoting
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == promoted
+    assert not (tmp_path / "out.tmp").exists()
+
+
+def test_failed_rollback_write_raises(tmp_path, monkeypatch):
+    base, trained, out, snap = _sharded_q35(tmp_path)
+    real = export_compat._rename_in_place
+    n = []
+
+    def flaky(path, rename):
+        n.append(path)
+        if len(n) == 2:
+            raise OSError("EIO on shard 2")
+        return real(path, rename)
+
+    monkeypatch.setattr(export_compat, "_rename_in_place", flaky)
+    monkeypatch.setattr(export_compat, "_atomic_write_bytes", lambda p, d: (_ for _ in ()).throw(OSError("ro fs")))
+    with pytest.raises(export_compat.ExportAlignmentError):
+        export_compat.align_export_with_base(str(out), str(base))

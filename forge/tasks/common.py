@@ -488,7 +488,8 @@ def _restore_base_architectures(staged_dir: str, model: Any) -> None:
 def _align_export_with_base(staged_dir: str, model: Any) -> None:
     """Post-save (after the architectures restore): make a full-weight export pass the validator's is_finetune check on
     EVERY compared attribute (release defect D1; forge.tasks.export_compat). Adapter exports have no config.json and are
-    skipped. Never raises: the report goes to telemetry (``export_config_aligned`` / ``export_config_align_failed``)."""
+    skipped. The report goes to telemetry (``export_config_aligned`` / ``export_config_align_failed``). Raises only
+    ExportAlignmentError (rollback not verified), which fails the staging instead of promoting mismatched files."""
     try:
         from forge import telemetry
 
@@ -503,7 +504,19 @@ def _align_export_with_base(staged_dir: str, model: Any) -> None:
         report = align_export_with_base(staged_dir, base_dir)
         name = "export_config_align_failed" if report.get("ok") is False else "export_config_aligned"
         telemetry.event(name, **{k: v for k, v in report.items() if isinstance(v, (str, int, float, bool)) or v is None})
-    except Exception as exc:  # never crash a completed run over metadata
+    except Exception as exc:  # never crash a completed run over metadata ...
+        from forge.tasks.export_compat import ExportAlignmentError
+
+        if isinstance(exc, ExportAlignmentError):
+            # ... except when the staged files are in an unverified state: fail the staging so save_adapter removes it,
+            # the promoted artifact stays intact and the caller's persistence fallback acts (RESP-072-1)
+            try:
+                from forge import telemetry
+
+                telemetry.event("export_config_align_unrecoverable", error=f"{exc}"[:400])
+            except Exception:
+                pass
+            raise
         try:
             from forge import telemetry
 

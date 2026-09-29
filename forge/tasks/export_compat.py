@@ -169,8 +169,89 @@ def keys_match(export_dir: str) -> tuple[bool, str | None]:
     return True, None
 
 
+class ExportAlignmentError(RuntimeError):
+    """A failed alignment could not be rolled back to verified original bytes. Raised (never swallowed) so the staging
+    in save_adapter fails, the previously promoted artifact stays intact and the persistence fallback acts."""
+
+
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    tmp = path + ".align.tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+class _Journal:
+    """Original bytes of everything an alignment may mutate, captured BEFORE the first mutation: config.json, the shard
+    index and, per safetensors file, its 8-byte length prefix + JSON header. The header rewrite keeps the header length
+    (space padding) and never touches the payload, so writing the saved prefix back restores each file exactly, even
+    after a partial write. ``restore`` then re-reads every file and compares bytes; any difference raises
+    ExportAlignmentError."""
+
+    def __init__(self, export_dir: str) -> None:
+        self.export_dir = export_dir
+        self.config_path = os.path.join(export_dir, "config.json")
+        files, index = _weight_files(export_dir)
+        self.index_path = index
+        with open(self.config_path, "rb") as fh:
+            self.config = fh.read()
+        self.index = None
+        if index:
+            with open(index, "rb") as fh:
+                self.index = fh.read()
+        self.headers: dict[str, bytes] = {}
+        for f in files:
+            with open(f, "rb") as fh:
+                n = int.from_bytes(fh.read(8), "little", signed=False)
+                fh.seek(0)
+                self.headers[f] = fh.read(8 + n)
+
+    def _current(self, path: str, length: int | None = None) -> bytes:
+        with open(path, "rb") as fh:
+            return fh.read() if length is None else fh.read(length)
+
+    def verify(self) -> bool:
+        try:
+            if self._current(self.config_path) != self.config:
+                return False
+            if self.index_path and self._current(self.index_path) != self.index:
+                return False
+            return all(self._current(f, len(h)) == h for f, h in self.headers.items())
+        except Exception:
+            return False
+
+    def restore(self) -> None:
+        errors: list[str] = []
+        for f, h in self.headers.items():
+            try:
+                with open(f, "r+b") as fh:
+                    fh.seek(0)
+                    fh.write(h)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            except Exception as exc:
+                errors.append(f"{os.path.basename(f)}: {type(exc).__name__}: {exc}")
+        for path, data in ((self.index_path, self.index), (self.config_path, self.config)):
+            if path and data is not None:
+                try:
+                    _atomic_write_bytes(path, data)
+                except Exception as exc:
+                    errors.append(f"{os.path.basename(path)}: {type(exc).__name__}: {exc}")
+        for name in os.listdir(self.export_dir):
+            if name.endswith((".align.tmp", ".json.tmp")):
+                try:
+                    os.remove(os.path.join(self.export_dir, name))
+                except Exception:
+                    pass
+        if not self.verify():
+            raise ExportAlignmentError(f"alignment rollback not verified: {errors[:3]}")
+
+
 def _apply_rename(export_dir: str, fn) -> dict[str, str]:
-    """Rename tensors ``k -> fn(k)`` in every weight file and the shard index; returns the applied mapping."""
+    """Rename tensors ``k -> fn(k)`` in every weight file and the shard index; returns the applied mapping. Not atomic
+    on its own: callers hold a _Journal taken before the call and restore it on any exception."""
     files, index = _weight_files(export_dir)
     applied: dict[str, str] = {}
     for f in files:
@@ -183,13 +264,21 @@ def _apply_rename(export_dir: str, fn) -> dict[str, str]:
         with open(index, encoding="utf-8") as fh:
             data = json.load(fh)
         data["weight_map"] = {applied.get(k, k): v for k, v in data["weight_map"].items()}
-        tmp = index + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, index)
+        _atomic_write_bytes(index, json.dumps(data, indent=2, sort_keys=True).encode("utf-8"))
     return applied
+
+
+def _index_consistent(export_dir: str) -> bool:
+    files, index = _weight_files(export_dir)
+    if not index:
+        return True
+    with open(index, encoding="utf-8") as fh:
+        wm = json.load(fh)["weight_map"]
+    for f in files:
+        names = {k for k in _read_header(f)[1] if k != "__metadata__"}
+        if names != {k for k, v in wm.items() if os.path.join(export_dir, v) == f}:
+            return False
+    return True
 
 
 # ---- alignment ---------------------------------------------------------------------------------------------------
@@ -240,7 +329,8 @@ def _composite_patch(saved: dict, base_raw: dict) -> dict:
 
 def align_export_with_base(export_dir: str, base_dir: str) -> dict[str, Any]:
     """Align ``export_dir/config.json`` (and, for composite bases, the tensor names) with the base so the validator's
-    check passes. Returns a report dict; restores the original bytes when verification fails. Never raises."""
+    check passes. Returns a report dict. On any failure every file is rolled back to its journaled original bytes and the
+    rollback is verified byte for byte; only an unverifiable rollback raises (ExportAlignmentError)."""
     report: dict[str, Any] = {"changed": False}
     cfg_path = os.path.join(export_dir, "config.json")
     if not os.path.isfile(cfg_path):
@@ -257,7 +347,10 @@ def align_export_with_base(export_dir: str, base_dir: str) -> dict[str, Any]:
     saved = json.loads(original_text)
     with open(os.path.join(base_dir, "config.json"), encoding="utf-8") as fh:
         base_raw = json.load(fh)
-    renamed: dict[str, str] = {}
+    try:
+        journal = _Journal(export_dir)  # before ANY mutation
+    except Exception as exc:
+        return {**report, "ok": False, "skipped": f"journal_unavailable: {type(exc).__name__}: {exc}"[:300]}
     try:
         composite = _is_composite_swap(base_dir) and "text_config" in base_raw
         report["mode"] = "composite" if composite else "flat"
@@ -268,23 +361,18 @@ def align_export_with_base(export_dir: str, base_dir: str) -> dict[str, Any]:
         if composite or type_changed:
             match, detail = keys_match(export_dir)
             if not match:
-                renamed = _apply_rename(export_dir, lambda k: _COMPOSITE_PREFIX.sub("model.", k))
+                report["renamed_tensors"] = len(_apply_rename(export_dir, lambda k: _COMPOSITE_PREFIX.sub("model.", k)))
                 match, detail = keys_match(export_dir)
-            report["renamed_tensors"] = len(renamed)
             if not match:
                 raise ValueError(f"tensor names do not match the loaded model: {detail}")
+            if not _index_consistent(export_dir):
+                raise ValueError("shard index does not match the shard headers")
         ok, why = emulated_is_finetune(base_dir, export_dir)
         if not ok:
             raise ValueError(f"still fails the validator check: {why}")
         return {**report, "ok": True}
     except Exception as exc:
-        # revert to the original bytes (names first, then config) so a failed alignment never makes it worse
-        try:
-            if renamed:
-                inverse = {v: k for k, v in renamed.items()}
-                _apply_rename(export_dir, lambda k: inverse.get(k, k))
-            with open(cfg_path, "w", encoding="utf-8") as fh:
-                fh.write(original_text)
-        except Exception as exc2:  # pragma: no cover - reported, never raised
-            report["revert_error"] = f"{type(exc2).__name__}: {exc2}"
+        # roll every file back to the journaled bytes; an unverifiable rollback raises ExportAlignmentError so the
+        # staged artifact is never promoted
+        journal.restore()
         return {**report, "ok": False, "changed": False, "error": f"{type(exc).__name__}: {exc}"[:400]}

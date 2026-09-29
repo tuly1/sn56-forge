@@ -211,8 +211,9 @@ def test_floor_best_export_and_non_sft_handlers_remain_unchanged():
         # 2026-09-29 (release defect D1): save_adapter aligns a FULL-weight export's config (and, for composite
         # Qwen3.5-style bases, tensor names) with the base so the validator's is_finetune check passes
         # (forge.tasks.export_compat; tests/test_export_validator_finetune.py). Adapter exports are untouched.
+        # RESP-072-1: an unverifiable alignment rollback (ExportAlignmentError) now fails the staging.
         "forge/tasks/common.py": (
-            "332dd32b10ec46575779c041c62446216c8ed9c76af7ffae2fec6169f044f3d4"
+            "3ba13433cfc2fc541532e16ab33887d657c28986d2556278fffa442eaa617bd3"
         ),
         "forge/tasks/fallback.py": (
             "16a556b7c5104f45584b0bdc24bb2f050835eb2945be496a9e659cef6e9ceed0"
