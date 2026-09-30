@@ -2190,6 +2190,16 @@ def run(
     except ValueError:
         _soup_reserve_evals = 0.0
     finish_reserve = export_reserve + (1.5 + _soup_reserve_evals) * dev_eval_est + _dev_pass_estimate(len(dev_ex), t_per_step, geo)
+    if recipe_key:
+        # phase-ao fix (Qwen3.5-4B long rows: reserve 3,696 s vs 1,793 s left -> zero steps, rung 1 lost): drop the dev-pass
+        # estimate from the reserve when keeping it would leave no training window. The dev pass is still gated at run
+        # time on the remaining time. Full-FT default route only; inert whenever the window is not starved.
+        _fr = starved_finish_reserve(remaining=deadline.remaining_hard(), finish_reserve=finish_reserve,
+                                     dev_pass_s=_dev_pass_estimate(len(dev_ex), t_per_step, geo), t_step=t_per_step)
+        if _fr != finish_reserve:
+            _event_and_print("sft_v2_finish_reserve_dev_pass_dropped", finish_reserve_s=round(finish_reserve, 1),
+                             new_s=round(_fr, 1), remaining_s=round(deadline.remaining_hard(), 1))
+            finish_reserve = _fr
     max_epochs_total = 4.0 if len(train_ex) < 10000 else 3.0
     try:
         if os.environ.get("FORGE_V2_MAX_EPOCHS"):
@@ -2759,8 +2769,15 @@ def run(
         for _k in range(_dp_epochs):
             if _k > 0 and deadline.remaining_hard() <= export_reserve + dev_pass_s + 30:
                 break
+            _dp_pre = chosen_state if chosen_state is not None else (pool.best()["state"] if pool.best() is not None else None)
             try:
-                _dev_pass(model, dev_ex, collator, lr=lr * _dp_mult, geo=geo, autocast=autocast, optimizer_factory=_dp_factory)
+                if recipe_key:
+                    dev_pass_with_oom_retry(model, dev_ex, collator, lr=lr * _dp_mult, geo=geo, autocast=autocast,
+                                            optimizer_factory=_dp_factory, restore_state=_dp_pre,
+                                            remaining_s=deadline.remaining_hard, export_reserve_s=export_reserve,
+                                            dev_pass_s=dev_pass_s)
+                else:
+                    _dev_pass(model, dev_ex, collator, lr=lr * _dp_mult, geo=geo, autocast=autocast, optimizer_factory=_dp_factory)
                 chosen_state = None  # weights in the model are now the final ones
                 _event_and_print("sft_v2_dev_pass_done", rows=len(dev_ex), lr=lr * _dp_mult, pass_index=_k + 1)
                 _keep_stage(f"devpass{_k + 1}")
@@ -3010,6 +3027,55 @@ def dev_pass_optimizer_factory(geo: Geometry, default_factory: Callable, *, stra
         return bnb.optim.PagedAdamW8bit(params, lr=lr, betas=betas, eps=1e-8, weight_decay=0.0)
 
     return factory
+
+
+def starved_finish_reserve(*, remaining: float, finish_reserve: float, dev_pass_s: float, t_step: float | None) -> float:
+    """phase-ao planner fix: the finish reserve without the dev-pass estimate when keeping it would leave less than
+    max(25% of the remaining time, 3 measured steps) to train; otherwise unchanged."""
+    floor = max(0.25 * remaining, 3.0 * (t_step or 0.0))
+    if remaining - finish_reserve < floor and dev_pass_s > 0:
+        return max(0.0, finish_reserve - dev_pass_s)
+    return finish_reserve
+
+
+DEV_PASS_RETRY_FACTOR = 1.5  # a half-micro retry is budgeted at 1.5 x the one-pass estimate (smaller micro runs slower)
+DEV_PASS_RETRY_MARGIN_S = 60.0
+
+
+def dev_pass_retry_fits(*, remaining_s: float, export_reserve_s: float, dev_pass_s: float) -> bool:
+    """RESP-074-1 B1: a retry runs only if a conservative complete half-micro pass plus the export still fit."""
+    return remaining_s > export_reserve_s + DEV_PASS_RETRY_FACTOR * max(0.0, dev_pass_s) + DEV_PASS_RETRY_MARGIN_S
+
+
+def dev_pass_with_oom_retry(model: Any, dev: list[dict], collator: Any, *, lr: float, geo: Geometry, autocast: bool,
+                            optimizer_factory: Callable, restore_state: dict[str, Any] | None,
+                            remaining_s: Callable[[], float], export_reserve_s: float, dev_pass_s: float) -> None:
+    """phase-ao fix (Qwen3.5-4B dev pass OOM at micro 24, vocabulary 248k): on a CUDA OOM, restore the pre-dev-pass
+    weights and free memory; then retry once at half the micro-batch (same effective batch) ONLY if a conservative full
+    retry plus the export reserve still fits the deadline (``remaining_s()`` read after the restore). Otherwise keep the
+    restored trained weights and skip the retry. Other errors, and OOMs without a restorable state, propagate."""
+    try:
+        _dev_pass(model, dev, collator, lr=lr, geo=geo, autocast=autocast, optimizer_factory=optimizer_factory)
+        return
+    except Exception as exc:
+        if not _is_oom(exc) or geo.micro_batch <= 1 or restore_state is None:
+            raise
+        _event_and_print("sft_v2_dev_pass_oom_retry", micro=geo.micro_batch, new_micro=max(1, geo.micro_batch // 2))
+    try:
+        model.zero_grad(set_to_none=True)
+    except Exception:
+        pass
+    selection.load_state(model, restore_state)
+    _free_cuda()
+    left = float(remaining_s())
+    if not dev_pass_retry_fits(remaining_s=left, export_reserve_s=export_reserve_s, dev_pass_s=dev_pass_s):
+        _event_and_print("sft_v2_dev_pass_retry_skipped", remaining_s=round(left, 1), export_reserve_s=export_reserve_s,
+                         dev_pass_s=round(dev_pass_s, 1))
+        return  # the restored pre-dev-pass weights (soup or best) are the final weights
+    half = max(1, geo.micro_batch // 2)
+    geo2 = Geometry(half, max(1, math.ceil(geo.eff_batch / half)), geo.max_len, geo.gradient_checkpointing,
+                    geo.fp32_master, geo.optim)
+    _dev_pass(model, dev, collator, lr=lr, geo=geo2, autocast=autocast, optimizer_factory=optimizer_factory)
 
 
 def _dev_pass(model: Any, dev: list[dict], collator: Any, *, lr: float, geo: Geometry, autocast: bool, optimizer_factory: Callable) -> None:
