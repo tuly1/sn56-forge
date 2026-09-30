@@ -834,10 +834,11 @@ FIELD_LR_MULT_TYPES: dict[str, float] = {"qwen2": 1.0}
 
 
 def _field_lr_mult(model_type: str | None = None, *, damaged_base: bool = False, params_b: float | None = None,
-                   clean_small_lfm2: bool = False) -> float:
+                   clean_small_lfm2: bool = False, recipe_key: str | None = None) -> float:
     """Multiplier on the clamped raw analytic LR of the field route: FORGE_V2_FIELD_LR_MULT, else the family default
     (a damaged family may set a size-scoped small_lr_mult for params_b <= small_max_b; the clean LFM2.5-1.2B-Instruct
-    route uses CLEAN_SMALL_LFM2_LR_MULT)."""
+    route uses CLEAN_SMALL_LFM2_LR_MULT). ``recipe_key``: the full-FT default recipe (run_field_recipe; None on the
+    cab930c routes and for callers that pass no key)."""
     default = FIELD_LR_MULT_TYPES.get(str(model_type or "").lower(), 1.0) if _identical_base_family_defaults(model_type) else 1.0
     if clean_small_lfm2 and not damaged_base:
         default = CLEAN_SMALL_LFM2_LR_MULT
@@ -853,7 +854,7 @@ def _field_lr_mult(model_type: str | None = None, *, damaged_base: bool = False,
 
 
 def field_recipe(model_type: str | None, params_b: float, *, damaged_base: bool = False,
-                 clean_small_lfm2: bool = False, generic: bool = False) -> dict[str, Any]:
+                 clean_small_lfm2: bool = False, generic: bool = False, recipe_key: str | None = None) -> dict[str, Any]:
     """Field-route recipe knobs sft_v2.run applies (env overrides included): bf16 weights + paged 8-bit AdamW (instead of
     the fp32 master when the geometry would choose it), its size threshold, the LR multiplier and the rows-per-step
     bucket. ``damaged_base`` selects the family's DAMAGED_BASE_FAMILIES recipe; ``clean_small_lfm2`` (the clean
@@ -870,7 +871,7 @@ def field_recipe(model_type: str | None, params_b: float, *, damaged_base: bool 
     return {"bf16": bool(_field_bf16_enabled(model_type, damaged_base=damaged_base, generic=generic)
                          and params_b >= min_b and not small),
             "bf16_min_b": min_b, "lr_mult": _field_lr_mult(model_type, damaged_base=damaged_base, params_b=params_b,
-                                                         clean_small_lfm2=clean_small_lfm2),
+                                                         clean_small_lfm2=clean_small_lfm2, recipe_key=recipe_key),
             "eff_batch": field_eff_batch(params_b), "strategy": "full"}
 
 
@@ -898,6 +899,23 @@ def llama_recipe_precision(recipe: dict[str, Any], params_b: float) -> dict[str,
     if min_b is None or recipe.get("bf16") or float(params_b) < float(min_b):
         return recipe
     return {**recipe, "bf16": True, "bf16_min_b": float(min_b)}
+
+
+def run_field_recipe(model_type: str | None, params_b: float, *, field: bool, recipe_key: str | None = None,
+                     damaged_base_route: bool = False, clean_small_qwen_route: bool = False,
+                     clean_small_lfm2_route: bool = False) -> dict[str, Any]:
+    """The recipe dict sft_v2.run applies for its routing kwargs (precision, LR multiplier, bucket). Extracted verbatim
+    from run (release-candidate-v8, no behaviour change) so the route snapshot test (tests/test_route_snapshot_v8.py) can
+    compare what every dispatched cell would train with against 7024722 without a GPU."""
+    family_recipe = bool(field and recipe_key in ("family", "minicpm5"))  # full-FT default: the family's measured row
+    generic_recipe = bool(field and recipe_key == "generic")
+    damaged_recipe = bool(field and (damaged_base_route or clean_small_qwen_route or family_recipe))
+    csl_field = bool(field and clean_small_lfm2_route and not damaged_recipe)
+    recipe = field_recipe(model_type, params_b, damaged_base=damaged_recipe, clean_small_lfm2=csl_field,
+                          generic=generic_recipe, recipe_key=recipe_key if field else None)
+    if field and recipe_key == "llama":
+        recipe = llama_recipe_precision(recipe, params_b)
+    return recipe
 
 
 def field_bf16_micro_accum(*, unit_len: int, vocab: int, eff_default: int) -> tuple[int, int]:
@@ -1614,10 +1632,10 @@ def run(
     _damaged_recipe = bool(field and (damaged_base_route or clean_small_qwen_route or _family_recipe))
     _csq_field = bool(field and clean_small_qwen_route)  # clean small-Qwen FIELD run: window-aware eval governor on
     _csl_field = bool(field and clean_small_lfm2_route and not _damaged_recipe)  # clean LFM2.5-1.2B-Instruct: LR x2 only
-    _recipe = field_recipe(str(getattr(getattr(model, "config", None), "model_type", "") or ""), params_b,
-                           damaged_base=_damaged_recipe, clean_small_lfm2=_csl_field, generic=_generic_recipe)
-    if field and recipe_key == "llama":
-        _recipe = llama_recipe_precision(_recipe, params_b)
+    _recipe = run_field_recipe(str(getattr(getattr(model, "config", None), "model_type", "") or ""), params_b,
+                               field=field, recipe_key=recipe_key, damaged_base_route=damaged_base_route,
+                               clean_small_qwen_route=clean_small_qwen_route,
+                               clean_small_lfm2_route=clean_small_lfm2_route)
     if field:
         _event_and_print("sft_v2_field_recipe", damaged_base=bool(damaged_base_route),
                          clean_small_qwen=bool(clean_small_qwen_route), recipe_key=recipe_key, cheap_full=bool(cheap_full),
