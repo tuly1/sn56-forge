@@ -46,7 +46,7 @@ from forge.tasks.common import (
     workdir,
     write_artifact_truth,
 )
-from forge.tuning import lr_probe, selection
+from forge.tuning import large_model_rule, lr_probe, selection
 
 EVAL_CAP = 4096
 EFF_BATCH_TARGET = 64
@@ -963,6 +963,18 @@ def llama_recipe_precision(recipe: dict[str, Any], params_b: float) -> dict[str,
     if min_b is None or recipe.get("bf16") or float(params_b) < float(min_b):
         return recipe
     return {**recipe, "bf16": True, "bf16_min_b": float(min_b)}
+
+
+def large_model_rule_eligible(*, field: bool, recipe_key: str | None, cheap_full: bool, g2c: bool, strategy: str | None,
+                              params_b: float) -> bool:
+    """Static part of the >= 3.0 B large-model batch rule gate in run (release-candidate-v9): the full-FT default FIELD
+    route (a recipe_key), rung 1 (not cheap_full), not the damaged Gemma2 champion port, full strategy, and
+    large_model_rule.applies(params_b) (params_b >= 3.0 and FORGE_V2_LARGE_MODEL_RULE unset or "1"). run additionally
+    needs a measured step time, a fixed FIELD LR (_lr_override > 0) and no FIELD LR calibration experiment; then
+    large_model_rule.plan_growth decides from the window and data whether the batch grows (else
+    sft_v2_large_model_batch_kept). Used by the route snapshot (tests/test_route_snapshot_v9.py)."""
+    return bool(field and recipe_key and not cheap_full and not g2c and strategy == "full"
+                and large_model_rule.applies(params_b))
 
 
 def run_field_recipe(model_type: str | None, params_b: float, *, field: bool, recipe_key: str | None = None,
@@ -2057,17 +2069,39 @@ def run(
     gc.collect()
     _free_cuda()
 
-    # ---- PLACEHOLDER (release-candidate-v8; NOT IMPLEMENTED): >= 3 B large-model batch / LR rule ----
-    # Nothing here runs: >= 3 B tasks train exactly as in 7024722 (tests/test_route_snapshot_v8.py). The slot waits on
-    # replay-bench phase-ba (research/20260923-replay-bench/phase-ba; arms C alpha 0.5 cap 2.0, D alpha 0, E alpha 0.75
-    # cap 1.5 vs c1f7501's alpha 0.75 cap 2.0, which failed the blow-up guard on 522e0294 at +2.3 %). If an arm is chosen
-    # (DEV-VERDICT.json, then TEST confirmation), port c1f7501 here: forge/tuning/large_model_rule.py (+ tests) and its
-    # sft_v2.run block at exactly this point (after the timing probe, before the adaptive batch), gated by
-    # `field and recipe_key and not cheap_full and not _g2c and strategy == "full" and t_per_step and _lr_override > 0
-    # and not field_calibration and large_model_rule.applies(params_b)`, with LR_ALPHA / LR_FACTOR_MAX set to the chosen
-    # (alpha, cap) as constants (the c919e4c env knobs stay research-only). c1f7501's two phase-ao planner fixes
-    # (starved_finish_reserve, dev_pass_with_oom_retry) are separate and run at every size on the full-FT route: port
-    # them as their own commit. NONE_ELIGIBLE -> this block stays empty. See research/20260930-release-candidate-v8.
+    # ---- large-model batch rule (forge.tuning.large_model_rule; release-candidate-v9, default ON): in-scope full-FT
+    # default tasks >= 3.0 B only. Below 3.0 B this block is not entered, so the run is 854bf7a's. Grows the effective
+    # batch (same micro-batch, more accumulation) toward the champion's tokens per step and scales the fixed FIELD LR by
+    # min(LR_FACTOR_MAX 2.0, (B_new / B_old) ** LR_ALPHA 0.5) (phase-ba arm C; c1f7501 used 0.75). ----
+    if (large_model_rule_eligible(field=field, recipe_key=recipe_key, cheap_full=cheap_full, g2c=_g2c, strategy=strategy,
+                                  params_b=params_b)
+            and t_per_step and _lr_override > 0 and not field_calibration):
+        _lm_sorted = sorted(lengths)
+        _lm_len = large_model_rule.champion_len(_lm_sorted[len(_lm_sorted) // 2],
+                                                _lm_sorted[min(len(_lm_sorted) - 1, int(0.99 * len(_lm_sorted)))])
+        _lm_units = pack.n_blocks if pack else len(train_ex)
+        _lm_tokens = float(sum(len(ex["input_ids"]) for ex in train_ex))
+        _lm_window = deadline.remaining_hard() - (EXPORT_RESERVE_S + 2.0 * _estimate_eval_seconds(len(dev_ex), t_per_step, geo)
+                                                  + _dev_pass_estimate(len(dev_ex), t_per_step, geo))
+        _lm = large_model_rule.plan_growth(
+            train_tokens=_lm_tokens, tokens_per_unit=_lm_tokens / max(1, _lm_units), eff_units=geo.eff_batch,
+            micro=geo.micro_batch, t_step_s=t_per_step, window_s=_lm_window,
+            max_epochs=(4.0 if len(train_ex) < 10000 else 3.0), champ_len=_lm_len,
+            fill=float((pack.stats.get("fill") if pack else None) or large_model_rule.DEFAULT_FILL), gpu_gb=per_gpu_gb)
+        if _lm is not None:
+            _lm_new, _lm_info = _lm
+            _lm_f = _lm_info["lr_factor"]
+            t_per_step = t_per_step * _lm_new / geo.eff_batch
+            geo = Geometry(geo.micro_batch, max(1, _lm_new // geo.micro_batch), geo.max_len, geo.gradient_checkpointing,
+                           geo.fp32_master, geo.optim)
+            lr = prior_lr * _lm_f
+            _lr_override = lr
+            _event_and_print("sft_v2_large_model_batch", params_b=round(params_b, 3), lr_old=prior_lr, lr_new=lr,
+                             champ_len=_lm_len, **_lm_info)
+        else:
+            _event_and_print("sft_v2_large_model_batch_kept", params_b=round(params_b, 3), eff_units=geo.eff_batch,
+                             t_per_step=round(t_per_step, 4), window_s=round(_lm_window, 1))
+
     # ---- adaptive effective batch: guarantee enough optimizer updates in short tasks ----
     # (not on the field route: the champion keeps its bucket and trains fewer steps)
     if t_per_step and not field:
