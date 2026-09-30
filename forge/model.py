@@ -67,10 +67,40 @@ def pick_dtype() -> Any:
     return torch.float32
 
 
+def disable_hub_kernels_offline() -> bool:
+    """Keep Transformers' Hub-kernel loader off the network in the offline runtime.
+
+    Mamba-hybrid architectures (falcon_h1, granitemoehybrid, bamba, jamba, zamba,
+    nemotron_h, mamba/mamba2) call ``lazy_load_kernel("causal-conv1d")`` /
+    ``("mamba-ssm")`` while the model is constructed. When the ``kernels`` package
+    is importable (it is in the trainer image), Transformers 5.12 asks the Hub for
+    ``kernels-community/*`` and only catches FileNotFoundError, so under
+    HF_HUB_OFFLINE=1 the whole ``from_pretrained`` raises OfflineModeIsEnabled and
+    the task falls back to an untrained copy (phase-bf, Falcon-H1-0.5B-Base).
+    Marking Hub kernels unavailable routes ``lazy_load_kernel`` to its local-import
+    branch: the image's compiled ``causal_conv1d`` is used when importable, and
+    otherwise the model's pure-torch path. Returns True when the switch was made.
+    """
+    if os.environ.get("HF_HUB_OFFLINE", "").strip() not in ("1", "true", "True", "YES", "yes"):
+        return False
+    try:
+        from transformers.integrations import hub_kernels
+    except Exception:  # noqa: BLE001 - older/newer Transformers without the module
+        return False
+    if not getattr(hub_kernels, "_kernels_available", False):
+        return False
+    hub_kernels._kernels_available = False
+    for name, mod in list(hub_kernels._KERNEL_MODULE_MAPPING.items()):
+        if mod is None:  # a cached failed Hub lookup: retry via the local branch
+            hub_kernels._KERNEL_MODULE_MAPPING.pop(name, None)
+    return True
+
+
 def load_base(cached_model_dir: str, *, for_generation: bool = False) -> LoadedModel:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    disable_hub_kernels_offline()
     model_dir = resolve_model_dir(cached_model_dir)
     config_data = _preflight_model_dir(model_dir)
     dtype = pick_dtype()
