@@ -621,6 +621,17 @@ CRASH_EXCEPTIONS: dict[str, dict[str, Any]] = {}
 # fp32 master at 3-4 B is throughput- and memory-bound: Gemma-2-2B 0.49 epoch in 45 min, the 76 GB OOM).
 GENERIC_FIELD_BF16_MIN_B = 2.0
 GENERIC_FIELD_LR_MULT = 1.0
+# lfm2 small band on the full-FT default route (release-candidate-v8, 2026-09-30). The "family" recipe of an lfm2 base
+# with 0 < params_b <= DAMAGED_BASE_FAMILIES["lfm2"]["small_max_b"] (1.5 B) keeps its fp32 master + fused AdamW and
+# bucket, but trains at LR = clamp(analytic, 2e-5, 1e-4) x FULLFT_LFM2_SMALL_LR_MULT instead of the band's
+# small_lr_mult (x2, 7024722). Evidence: replay-bench phase-bb (research/20260923-replay-bench/phase-bb/results/
+# REDUCED.md; image 7024722, arm B = FORGE_V2_FIELD_LR_MULT=1, which is exactly this code path), LFM2.5-1.2B-Instruct
+# (1.1703 B): clean hko1aw s7 -2.80 % / s11 -2.73 % DEV PASS, komedcl -1.16 % PASS; damaged (pruned cc4550ab) turkish
+# s7 -0.43 % / s11 -0.81 %, komed -0.44 % HOLD (every CI spans 0, none worse). trclean was NOT_RUN at build time.
+# Band members never measured at either multiplier: LFM2-350M, LFM2-700M, LFM2-1.2B, LFM2.5-350M, LFM2.5-1.2B-Base.
+# The cab930c research routes (FORGE_V2_FULLFT_DEFAULT=0: damaged small band, clean LFM2.5-1.2B-I route) keep x2.
+# None = 7024722 (the band's small_lr_mult). An explicit FORGE_V2_FIELD_LR_MULT still overrides.
+FULLFT_LFM2_SMALL_LR_MULT: float | None = 1.0
 
 
 def _fullft_default() -> bool:
@@ -692,7 +703,7 @@ def default_recipe_key(model_type: str | None, params_b: float, vocab_size: int 
                   LR clamp(analytic) x1.0 = 1e-4 on that base; Phase Y)
       "family"    a DAMAGED_BASE_FAMILIES row (qwen2, qwen3, gemma2, lfm2): that row's recipe (qwen2/qwen3 bf16 from 0.3 B
                   x1.0 = the Qwen FIELD recipe; gemma2 bf16 x1.0 + the champion port in its size band; lfm2 fp32 master
-                  LR x2 up to 1.5 B, bf16 x1.0 above)
+                  up to 1.5 B at LR x FULLFT_LFM2_SMALL_LR_MULT (x1; 7024722 x2), bf16 x1.0 above)
       "llama"     every other llama (Llama-3.2, TinyLlama, SmolLM/SmolLM2, open_llama): the production Llama FIELD path
                   (fp32 master + fused AdamW up to FP32_MASTER_MAX_B, x1.0)
       "generic"   everything else (phi3, mistral/Phi-3, phi, gpt_neox, falcon, bloom, gemma, granite, qwen3_5, ...):
@@ -847,6 +858,9 @@ def _field_lr_mult(model_type: str | None = None, *, damaged_base: bool = False,
         default = float(fam.get("lr_mult", 1.0))
         if params_b is not None and fam.get("small_max_b") is not None and 0 < params_b <= float(fam["small_max_b"]):
             default = float(fam.get("small_lr_mult", default))
+            if (recipe_key == "family" and str(model_type or "").lower() == "lfm2"
+                    and FULLFT_LFM2_SMALL_LR_MULT is not None):
+                default = float(FULLFT_LFM2_SMALL_LR_MULT)  # full-FT default lfm2 small band (v8, phase-bb)
     try:
         return float(os.environ.get("FORGE_V2_FIELD_LR_MULT", str(default)) or default)
     except ValueError:

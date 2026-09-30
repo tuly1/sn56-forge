@@ -142,8 +142,8 @@ def test_quality_exceptions_keep_their_adapter_recipe(monkeypatch):
 # ---- recipes ---------------------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("mt,params_b,vocab,key,bf16,lr_mult", [
-    ("lfm2", 1.1703, 65536, "family", False, 2.0),      # LFM2 small band: fp32 master, LR x2 (Phase H / AJ)
-    ("lfm2", 0.354, 65536, "family", False, 2.0),
+    ("lfm2", 1.1703, 65536, "family", False, 1.0),      # LFM2 small band: fp32 master, LR x1 (v8, phase-bb; 7024722 x2)
+    ("lfm2", 0.354, 65536, "family", False, 1.0),
     ("lfm2", 2.697, 128000, "family", True, 1.0),      # LFM2.5-2.6B long rows: bf16 + paged 8-bit, x1 (MathFusion)
     ("qwen2", 0.494, 151936, "family", True, 1.0),     # Qwen FIELD: bf16 from 0.3 B, x1
     ("qwen2", 3.086, 151936, "family", True, 1.0),
@@ -165,8 +165,12 @@ def test_recipe_per_family(monkeypatch, mt, params_b, vocab, key, bf16, lr_mult)
         if k.startswith("FORGE_"):
             monkeypatch.delenv(k, raising=False)
     assert sft_v2.default_recipe_key(mt, params_b, vocab) == key
-    rec = sft_v2.field_recipe(mt, params_b, damaged_base=key in ("family", "minicpm5"), generic=key == "generic")
+    rec = sft_v2.run_field_recipe(mt, params_b, field=True, recipe_key=key)  # what sft_v2.run applies
     assert (rec["bf16"], rec["lr_mult"], rec["strategy"]) == (bf16, lr_mult, "full")
+    # field_recipe without a recipe key is the family row as the cab930c routes read it (lfm2 small band still x2)
+    old = sft_v2.field_recipe(mt, params_b, damaged_base=key in ("family", "minicpm5"), generic=key == "generic")
+    small_lfm2 = mt == "lfm2" and params_b <= 1.5
+    assert (old["bf16"], old["lr_mult"]) == (bf16, 2.0 if small_lfm2 else lr_mult)
 
 
 # ---- sft_v2.run on CPU: zero-step guard, cheap rung, recipe keys -----------------------------------------------------
@@ -204,7 +208,7 @@ def test_zero_trained_steps_raise(monkeypatch, tmp_path):
 def test_family_recipe_key_is_the_lfm2_small_band(monkeypatch, tmp_path):
     ev, tr = _run(monkeypatch, tmp_path, recipe_key="family")
     rec = lfm._ev(ev, "sft_v2_field_recipe")[0]
-    assert (rec["recipe_key"], rec["bf16"], rec["lr_mult"], rec["cheap_full"]) == ("family", False, 2.0, False)
+    assert (rec["recipe_key"], rec["bf16"], rec["lr_mult"], rec["cheap_full"]) == ("family", False, 1.0, False)  # v8
     assert lfm._ev(ev, "sft_v2_cheap_full") == []
 
 

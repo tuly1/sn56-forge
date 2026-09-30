@@ -120,6 +120,17 @@ ENTRY = {e["model"]: e for e in rt.POOL}
 CHANGES: dict[str, tuple] = {}
 
 
+def _lfm2_small_fullft(key: str, base: dict) -> bool:
+    model, _data, _rows, _verdict, switch = key.split("|")
+    kw = base.get("kw") or {}
+    return (switch == "default" and ENTRY[model]["model_type"] == "lfm2" and kw.get("recipe_key") == "family"
+            and 0 < kw["params_b"] <= 1.5)
+
+
+# commit "lfm2 small band": full-FT default "family" recipe, LR x2 -> x1 (phase-bb)
+CHANGES["lfm2_small_lr_x1"] = (_lfm2_small_fullft, ("recipe", "lr_mult"), 1.0)
+
+
 def expected_cell(key: str, base: dict) -> tuple[dict, list[str]]:
     exp = json.loads(json.dumps(base))
     hits = []
