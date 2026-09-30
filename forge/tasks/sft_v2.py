@@ -2057,6 +2057,17 @@ def run(
     gc.collect()
     _free_cuda()
 
+    # ---- PLACEHOLDER (release-candidate-v8; NOT IMPLEMENTED): >= 3 B large-model batch / LR rule ----
+    # Nothing here runs: >= 3 B tasks train exactly as in 7024722 (tests/test_route_snapshot_v8.py). The slot waits on
+    # replay-bench phase-ba (research/20260923-replay-bench/phase-ba; arms C alpha 0.5 cap 2.0, D alpha 0, E alpha 0.75
+    # cap 1.5 vs c1f7501's alpha 0.75 cap 2.0, which failed the blow-up guard on 522e0294 at +2.3 %). If an arm is chosen
+    # (DEV-VERDICT.json, then TEST confirmation), port c1f7501 here: forge/tuning/large_model_rule.py (+ tests) and its
+    # sft_v2.run block at exactly this point (after the timing probe, before the adaptive batch), gated by
+    # `field and recipe_key and not cheap_full and not _g2c and strategy == "full" and t_per_step and _lr_override > 0
+    # and not field_calibration and large_model_rule.applies(params_b)`, with LR_ALPHA / LR_FACTOR_MAX set to the chosen
+    # (alpha, cap) as constants (the c919e4c env knobs stay research-only). c1f7501's two phase-ao planner fixes
+    # (starved_finish_reserve, dev_pass_with_oom_retry) are separate and run at every size on the full-FT route: port
+    # them as their own commit. NONE_ELIGIBLE -> this block stays empty. See research/20260930-release-candidate-v8.
     # ---- adaptive effective batch: guarantee enough optimizer updates in short tasks ----
     # (not on the field route: the champion keeps its bucket and trains fewer steps)
     if t_per_step and not field:
