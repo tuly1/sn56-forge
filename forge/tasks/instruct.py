@@ -817,6 +817,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     damaged_base_route = False
     clean_small_qwen_route = False
     clean_small_lfm2_route = False
+    _base_damage = None  # damage verdict (set below when detection runs); sft_v2.run reads it for hyperparameters only
+    _base_clean_ref = None
     if _v2_strategy in ("lora", "full"):
         # Both v2 paths are validated on long-row tasks only (Smol-jb median 392,
         # Gemma 762, ru-AAQG 302). On short-row open-ended data production's
@@ -987,6 +989,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 clean_small_lfm2_route=clean_small_lfm2_route,
                 recipe_key=fullft_recipe,
                 cheap_full=rung == "cheap_full",
+                base_damage=_base_damage,
+                base_clean_ref=_base_clean_ref,
             )
             return
         except BaseException as exc:  # noqa: BLE001

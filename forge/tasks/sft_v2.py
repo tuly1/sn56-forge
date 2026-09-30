@@ -398,6 +398,56 @@ def damaged_minicpm5_admits(model_type: str | None, base_damage: str | None, par
     return base_damage == "damaged" and damaged_minicpm5_shape(model_type, params_b, vocab_size)
 
 
+# Clean MiniCPM5-1B LR (release-candidate-v8, 2026-09-30; a directive-8 CONDITIONAL rule). On the full-FT default route
+# the "minicpm5" recipe trains at LR = clamp(analytic, 2e-5, 1e-4) x CLEAN_MINICPM5_LR_MULT (x0.5) instead of x1.0 ONLY
+# when the damage detectors read the base "clean" AND the one public reference that verdict names is exactly
+# openbmb/MiniCPM5-1B (fingerprint table revision 87179e5c; forge.routing.damage.reference_id form). Every other verdict
+# ("damaged", "unknown", no detection pass, a clean verdict naming another or no reference) keeps the release x1.0: a
+# false "clean" costs ~+5 % (the damaged pairs), a false "not clean" only forgoes the ~2-3 % clean gain.
+# Evidence: replay-bench phase-bc (research/20260923-replay-bench/phase-bc/CARD.md closeout, results/DEV-VERDICTS.json,
+# image 7024722, arm lrh = FORGE_V2_FIELD_LR_MULT=0.5) with phase-ay (evidence/SUPPLEMENT-DEV-VERDICTS.json): clean
+# dsum s7 -3.02 %, dsum s11 -1.94 %, wealth -1.97 % DEV, all PASS; damaged dsum +6.14 %, wealth +3.76 % DEV, both REJECT
+# (so the rule is conditional, not general). Detector on MiniCPM5 (7024722 code, CPU): public openbmb/MiniCPM5-1B ->
+# clean (prefix_identity, fingerprint name+norms); 5/5 validator-style augmented copies (scaling multi-layer 0.7,
+# pruning all-layer 0.3, noise all-layer 0.05, layer re-init multi-layer 0.05, noise single-layer 0.02) and the phase-y
+# custody damaged base -> damaged (prefix_mismatch) (research/20260927-new-pool-compat/minicpm5-1b/results/
+# damage-probe.json; phase-ay/base/DAMAGE-DETECTOR-CHECK.json). There is no exact per-tensor identity table for
+# MiniCPM5 (identity detector "unknown"), so "clean" rests on the first-16 KiB prefix of all 219 tensors plus full
+# hashes of the 49 1-D tensors. FORGE_V2_CLEAN_MINICPM5_LR=0 restores 7024722; an explicit FORGE_V2_FIELD_LR_MULT wins.
+# Applied in run_field_recipe (after the family recipe), so it never touches another recipe's multiplier.
+CLEAN_MINICPM5_LR_DEFAULT = "1"
+CLEAN_MINICPM5_LR_MULT = 0.5
+CLEAN_MINICPM5_REFERENCES = frozenset({"openbmb/minicpm5-1b"})
+
+
+def clean_minicpm5_lr_rule(recipe_key: str | None, base_damage: str | None,
+                           base_clean_ref: str | None) -> tuple[float | None, str]:
+    """(LR multiplier default, reason) of the clean MiniCPM5-1B rule; None = the release recipe's own multiplier."""
+    if recipe_key != "minicpm5":
+        return None, "not_minicpm5_recipe"
+    if os.environ.get("FORGE_V2_CLEAN_MINICPM5_LR", CLEAN_MINICPM5_LR_DEFAULT).strip() != "1":
+        return None, "switch_off"
+    if base_damage != "clean":
+        return None, f"verdict_{base_damage or 'not_assessed'}"
+    from forge.routing.damage import reference_id
+
+    if not base_clean_ref or reference_id(base_clean_ref) not in CLEAN_MINICPM5_REFERENCES:
+        return None, "clean_reference_not_minicpm5"
+    return CLEAN_MINICPM5_LR_MULT, "clean_minicpm5"
+
+
+def _explicit_field_lr_mult() -> bool:
+    """FORGE_V2_FIELD_LR_MULT is set to a number (it then wins over every default, as in _field_lr_mult)."""
+    raw = os.environ.get("FORGE_V2_FIELD_LR_MULT", "").strip()
+    if not raw:
+        return False
+    try:
+        float(raw)
+    except ValueError:
+        return False
+    return True
+
+
 def damage_detection_enabled(model_type: str | None, *, vocab_size: int | None = None,
                              params_b: float | None = None) -> bool:
     """Whether the dispatcher should run damage detection for this family at all (for llama: only the damaged
@@ -917,10 +967,13 @@ def llama_recipe_precision(recipe: dict[str, Any], params_b: float) -> dict[str,
 
 def run_field_recipe(model_type: str | None, params_b: float, *, field: bool, recipe_key: str | None = None,
                      damaged_base_route: bool = False, clean_small_qwen_route: bool = False,
-                     clean_small_lfm2_route: bool = False) -> dict[str, Any]:
+                     clean_small_lfm2_route: bool = False, base_damage: str | None = None,
+                     base_clean_ref: str | None = None) -> dict[str, Any]:
     """The recipe dict sft_v2.run applies for its routing kwargs (precision, LR multiplier, bucket). Extracted verbatim
     from run (release-candidate-v8, no behaviour change) so the route snapshot test (tests/test_route_snapshot_v8.py) can
-    compare what every dispatched cell would train with against 7024722 without a GPU."""
+    compare what every dispatched cell would train with against 7024722 without a GPU. ``base_damage`` /
+    ``base_clean_ref`` (the dispatcher's damage verdict and the reference a "clean" verdict names) select
+    hyperparameters only (clean_minicpm5_lr_rule)."""
     family_recipe = bool(field and recipe_key in ("family", "minicpm5"))  # full-FT default: the family's measured row
     generic_recipe = bool(field and recipe_key == "generic")
     damaged_recipe = bool(field and (damaged_base_route or clean_small_qwen_route or family_recipe))
@@ -929,6 +982,9 @@ def run_field_recipe(model_type: str | None, params_b: float, *, field: bool, re
                           generic=generic_recipe, recipe_key=recipe_key if field else None)
     if field and recipe_key == "llama":
         recipe = llama_recipe_precision(recipe, params_b)
+    cm5_mult = clean_minicpm5_lr_rule(recipe_key if field else None, base_damage, base_clean_ref)[0]
+    if cm5_mult is not None and not _explicit_field_lr_mult():
+        recipe = {**recipe, "lr_mult": float(cm5_mult)}  # clean MiniCPM5-1B (v8, phase-bc; detector-conditional)
     return recipe
 
 
@@ -1488,10 +1544,14 @@ def run(
     clean_small_lfm2_route: bool = False,
     recipe_key: str | None = None,
     cheap_full: bool = False,
+    base_damage: str | None = None,
+    base_clean_ref: str | None = None,
 ) -> None:
     """``recipe_key`` (default_recipe_key, full-FT default route): which measured recipe the FIELD route trains with.
     ``cheap_full`` (fallback rung 2): bf16 weights + paged 8-bit AdamW at any size, half the micro-batch, checkpointing
-    on, no Gemma2 champion geometry. Raises ZeroTrainedStepsError when no optimizer step was taken."""
+    on, no Gemma2 champion geometry. ``base_damage`` / ``base_clean_ref``: the dispatcher's damage verdict and the
+    reference a "clean" verdict names (hyperparameters only: clean_minicpm5_lr_rule). Raises ZeroTrainedStepsError when
+    no optimizer step was taken."""
     import torch
     from datasets import Dataset
     from transformers import Trainer, TrainerCallback, TrainingArguments
@@ -1649,7 +1709,8 @@ def run(
     _recipe = run_field_recipe(str(getattr(getattr(model, "config", None), "model_type", "") or ""), params_b,
                                field=field, recipe_key=recipe_key, damaged_base_route=damaged_base_route,
                                clean_small_qwen_route=clean_small_qwen_route,
-                               clean_small_lfm2_route=clean_small_lfm2_route)
+                               clean_small_lfm2_route=clean_small_lfm2_route, base_damage=base_damage,
+                               base_clean_ref=base_clean_ref)
     if field:
         _event_and_print("sft_v2_field_recipe", damaged_base=bool(damaged_base_route),
                          clean_small_qwen=bool(clean_small_qwen_route), recipe_key=recipe_key, cheap_full=bool(cheap_full),
@@ -1857,6 +1918,12 @@ def run(
         _event_and_print("sft_v2_route_lr", prior_lr=prior_lr, route_lr=route_lr)
         prior_lr = route_lr
         _lr_override = route_lr
+    if field and recipe_key == "minicpm5":
+        # clean MiniCPM5-1B rule: the detector verdict it read and the LR this run applies (release-candidate-v8)
+        _cm5_mult, _cm5_reason = clean_minicpm5_lr_rule(recipe_key, base_damage, base_clean_ref)
+        _event_and_print("sft_v2_minicpm5_lr_rule", verdict=base_damage, clean_ref=base_clean_ref, reason=_cm5_reason,
+                         rule_mult=_cm5_mult, lr_mult=_recipe["lr_mult"], lr=prior_lr,
+                         env_lr_mult=os.environ.get("FORGE_V2_FIELD_LR_MULT") or None, cheap_full=bool(cheap_full))
 
     # A separate opt-in FIELD experiment owns its bounded probes. Suppress the
     # older generic sweep even when conflicting experiment flags are rejected.

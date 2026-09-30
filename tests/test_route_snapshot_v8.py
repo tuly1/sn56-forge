@@ -176,6 +176,17 @@ def test_each_declared_change_hits_cells(snapshots):
         assert any(pred(k, base[k]) for k in base), name
 
 
+# commit "MiniCPM5 clean LR": full-FT default "minicpm5" recipe, clean verdict naming openbmb/MiniCPM5-1B, x1 -> x0.5
+def _minicpm5_clean_fullft(key: str, base: dict) -> bool:
+    _model, _data, _rows, verdict, switch = key.split("|")
+    kw = base.get("kw") or {}
+    # the harness's "clean" double names the entry's own id as the reference (openbmb/MiniCPM5-1B for the MiniCPM5 cell)
+    return switch == "default" and verdict == "clean" and kw.get("recipe_key") == "minicpm5"
+
+
+CHANGES["minicpm5_clean_lr_x05"] = (_minicpm5_clean_fullft, ("recipe", "lr_mult"), 0.5)
+
+
 if __name__ == "__main__":
     if "--write-baseline" in sys.argv:
         assert not CHANGES, "the baseline is 7024722 routing: write it with no declared changes"
