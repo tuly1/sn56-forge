@@ -1588,6 +1588,12 @@ def run(
         examples = prompts.build_instruct_examples(rows, spec.instruct)
         tokenized = tokenize.tokenize_instruct(examples, tokenizer, EVAL_CAP)
     n_raw = len(tokenized)
+    # ---- PLACEHOLDER (release-candidate-v9; NOT IMPLEMENTED): phase-bg exposure arm slot (1 of 2) ----
+    # Nothing here runs; the exact dedup below is 854bf7a's. The slot waits on replay-bench phase-bg
+    # (research/20260923-replay-bench/phase-bg: LFM2.5-1.2B arms B keep exact duplicates, C 4-epoch cap + no DEV overfit
+    # stop + no epoch-cap extension, D = B + C; research knobs on research-bg-exposure-20260930 @ 32984fb). If an arm is
+    # chosen on DEV and passes the directive-8 suite check, port the knob here (keep exact duplicates) as its own commit,
+    # scoped by an observable condition (not a model ID) and with its own route-snapshot declaration and disclosure.
     tokenized = exact_dedup(tokenized)
     if not tokenized:
         raise RuntimeError("no trainable examples after tokenization")
@@ -2401,6 +2407,8 @@ def run(
                 state["overfit"] = 0
             elif loss > state["best"] * 1.05 and state["phase_evals"] > 1:
                 state["overfit"] += 1
+                # PLACEHOLDER (release-candidate-v9; NOT IMPLEMENTED): phase-bg exposure arm slot (2 of 2): arms C/D
+                # suppress this DEV overfit stop (FORGE_V2_NO_OVERFIT_STOP on 32984fb). Nothing here runs; see slot 1.
                 if state["overfit"] >= 3:
                     _event_and_print("sft_v2_early_stop", step=step, best=state["best"], best_step=state["best_step"])
                     state["stopped_overfit"] = True
