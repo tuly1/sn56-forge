@@ -2790,9 +2790,14 @@ def run(
                 _event_and_print("sft_v2_dev_pass_done", rows=len(dev_ex), lr=lr * _dp_mult, pass_index=_k + 1)
                 _keep_stage(f"devpass{_k + 1}")
             except Exception as exc:
-                _event_and_print("sft_v2_dev_pass_failed", error=f"{type(exc).__name__}: {exc}")
-                if pool.best() is not None:
-                    chosen_state = pool.best()["state"]
+                # v9.1: restore the weights chosen BEFORE this pass. _dp_pre (set above) is the in-memory chosen state
+                # (the accepted soup, or pool.best when the soup lost or did not run) and falls back to pool.best only
+                # when nothing was chosen; d44a582 reloaded pool.best unconditionally here and lost an accepted soup.
+                _event_and_print("sft_v2_dev_pass_failed", error=f"{type(exc).__name__}: {exc}",
+                                 restored=("chosen" if chosen_state is not None
+                                           else "pool_best" if _dp_pre is not None else "none"))
+                if _dp_pre is not None:
+                    chosen_state = _dp_pre
                     selection.load_state(model, chosen_state)
                 break
 
