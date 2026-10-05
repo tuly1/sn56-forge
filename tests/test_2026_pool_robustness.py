@@ -216,11 +216,13 @@ def test_floor_best_export_and_non_sft_handlers_remain_unchanged():
         # v9.2 (2026-10-05, owner decision "real mini fine-tune, else fail"): fallback.py is the minimal fine-tune (both
         # untrained rungs and the plain copy are gone), save_adapter / write_artifact_truth refuse the FLOOR label, and
         # dpo.py / grpo.py no longer write a pre-training adapter and raise on a zero-step trainer; pins refreshed.
+        # v9.2 repair (2026-10-05, RESP-106 C2): fallback.py admits a further step against the slowest attempt of any
+        # kind, records the clock facts in its receipt and states that the save reserve is best-effort; pin refreshed.
         "forge/tasks/common.py": (
             "3f6491c522ec93f1ff0b8b88d51f513fa93a1b284227ee0fe5f2f7f3ec9f0a72"
         ),
         "forge/tasks/fallback.py": (
-            "1bbcdacebe6257dd31ff4b4993a2c85528a7c288c3d58ae3b6545ebb8d9fbd32"
+            "a3e4ef2dbdc1b271ac7ff30011380b6ad7142fce70952c701aed51006bd19de8"
         ),
         "forge/tasks/dpo.py": (
             "ce7933d5810b5aa4a0709b03a3b641a9cbc340e405ea225b15d180a23931a0c8"

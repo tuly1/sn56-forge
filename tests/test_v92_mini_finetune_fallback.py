@@ -300,6 +300,87 @@ def test_failure_inside_the_export_reserve_still_trains(env, monkeypatch):
     assert _event("mini_finetune_start")["train_window_s"] <= 170.0 - fallback.MINI_SAVE_RESERVE_S
 
 
+class _Clock:
+    """fallback's view of time.monotonic, with a manual offset; forge.clock keeps the real clock."""
+
+    def __init__(self):
+        import time as real_time
+
+        self._real, self.offset = real_time.monotonic, 0.0
+
+    def monotonic(self) -> float:
+        return self._real() + self.offset
+
+
+def _slow_forward(monkeypatch, clock: _Clock, plan: dict[int, tuple[float, bool]]):
+    """Model call k (1-based) advances fallback's clock by plan[k][0] seconds and, if plan[k][1], returns a NaN loss."""
+    import transformers
+
+    real, calls = transformers.LlamaForCausalLM.forward, []
+
+    def forward(self, *a, **kw):
+        calls.append(1)
+        out = real(self, *a, **kw)
+        seconds, nan = plan.get(len(calls), (0.0, False))
+        clock.offset += seconds
+        if nan:
+            out.loss = out.loss * float("nan")
+        return out
+
+    monkeypatch.setattr(transformers.LlamaForCausalLM, "forward", forward)
+    monkeypatch.setattr(fallback, "time", clock)
+    return calls
+
+
+def test_a_slow_failed_attempt_counts_in_the_step_admission(env, monkeypatch):
+    """RESP-106 C2: the admission estimate is the slowest attempt of any kind, not only the last applied step.
+
+    Attempt 1 is slow and non-finite (no step), attempt 2 is fast and applies a step. A third attempt would need
+    2 x 1500 s before train_end and only ~1900 s are left, so the loop stops with exactly one step and saves it.
+    37eece2 looked only at the last applied step (fast) and went on to all 24 rows."""
+    _fail_handler(monkeypatch)
+    calls = _slow_forward(monkeypatch, _Clock(), {1: (1500.0, True)})
+    assert env.run() == 0  # 1 h: train_end = the soft stop, 3420 s away
+    calls = len(calls)  # before assert_trained, which runs the model again
+    done = assert_trained(env)
+    assert done["steps"] == 1 and done["skipped_nonfinite"] == 1 and calls == 2
+    assert done["first_attempt_s"] >= 1500.0 and done["slowest_attempt_s"] >= 1500.0
+    assert done["train_end_margin_s"] > 0.0
+
+
+def test_nothing_trained_yet_keeps_trying_until_train_end(env, monkeypatch):
+    """With no applied step there is nothing for the save reserve to protect: slow failed attempts do not end the run."""
+    _fail_handler(monkeypatch)
+    calls = _slow_forward(monkeypatch, _Clock(), {1: (1500.0, True), 2: (1500.0, True)})
+    assert env.run() == 0
+    calls = len(calls)
+    done = assert_trained(env)
+    assert done["steps"] == 1 and done["skipped_nonfinite"] == 2 and calls == 3
+
+
+def test_first_step_overrun_into_the_save_reserve_is_recorded(env, monkeypatch):
+    """The reserve is best-effort: a first step cannot be pre-empted. If it runs past train_end the receipt says so
+    (negative train_end_margin_s) and no further step starts; the save still runs because the hard stop is not reached."""
+    _fail_handler(monkeypatch)
+    clock = _Clock()
+    calls = _slow_forward(monkeypatch, clock, {1: (140.0, False)})  # 170 s task: train_end is 125 s away, hard stop 170 s
+    assert env.run(hours=170.0 / 3600.0) == 0
+    calls = len(calls)
+    done = assert_trained(env)
+    assert done["steps"] == 1 and calls == 1
+    assert done["train_end_margin_s"] < 0.0 and done["first_attempt_s"] >= 140.0
+    assert done["save_reserve_s"] == fallback.MINI_SAVE_RESERVE_S and done["save_s"] >= 0.0
+
+
+def test_receipt_records_the_clock_facts(env, monkeypatch):
+    _fail_handler(monkeypatch)
+    assert env.run() == 0
+    done = assert_trained(env)
+    for key in ("load_s", "first_attempt_s", "slowest_attempt_s", "train_end_margin_s", "save_s", "remaining_hard_s"):
+        assert isinstance(done[key], float) and done[key] == done[key], key
+    assert 0.0 < done["first_attempt_s"] <= done["slowest_attempt_s"]
+
+
 # ---- the real instruct handler: every rung of the ladder fails --------------------------------------------------------
 
 def test_full_cheap_full_and_adapter_rungs_all_fail(env, monkeypatch):

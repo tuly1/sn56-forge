@@ -10,7 +10,7 @@ The mini fine-tune:
     (the adapter is the crash fallback of last resort, owner directive 4);
   * tokenizes a seeded sample of the task's TRAIN rows with the same prompt / chat-template code as the main handlers;
   * takes real AdamW steps, one row per step, at a short sequence cap, bounded by MINI_MAX_STEPS and by the clock (the
-    final save keeps MINI_SAVE_RESERVE_S before the validator's hard stop);
+    final save aims to keep MINI_SAVE_RESERVE_S before the validator's hard stop: best-effort, see _run_mini_finetune);
   * verifies that a finite loss was computed, that at least one optimizer step was applied, that the trainable weights
     changed and that they are finite;
   * exports through the production save path, labelled PARTIAL_TRAINED_BEST with the number of applied steps.
@@ -42,7 +42,7 @@ MINI_GRAD_CLIP = 1.0
 MINI_SEQ_CAPS = (512, 1024, 2048)  # the first cap that keeps at least one row is used; an OOM halves the row length
 MINI_SCAN_ROWS = 2048           # TRAIN rows sampled (seed 7) to find MINI_MAX_STEPS usable examples
 MINI_MIN_ENTRY_S = 60.0         # below this much wall clock the run is not started
-MINI_SAVE_RESERVE_S = 45.0      # kept before the hard stop for the adapter save
+MINI_SAVE_RESERVE_S = 45.0      # aimed at, before the hard stop, for the adapter save (best-effort, not guaranteed)
 MINI_SUPPORTED_TASK_TYPES = ("InstructTextTask", "ChatTask", "DpoTask")
 
 _TRUTH_FILE = "forge_artifact_truth.json"
@@ -163,6 +163,12 @@ def run_mini_finetune(spec: TaskSpec, deadline: Deadline) -> dict[str, Any]:
 
 
 def _run_mini_finetune(spec: TaskSpec, deadline: Deadline) -> dict[str, Any]:
+    """The save reserve is BEST-EFFORT. Nothing here is preemptible: the load, the tokenization, one attempt (forward,
+    backward, optimizer step, or an OOM / non-finite attempt), the verification and the save each run to the end once
+    started. The first attempt is admitted with no timing at all, so it can start just before train_end and run past it.
+    Later attempts are admitted against the slowest attempt seen so far (of any kind), which is an estimate. A run that
+    overruns the reserve is killed by the validator before or during the save: nothing is uploaded and the task fails.
+    The receipt records load_s, first_attempt_s, slowest_attempt_s, train_end_margin_s, save_s and remaining_hard_s."""
     from forge import telemetry
 
     if spec.task_type not in MINI_SUPPORTED_TASK_TYPES:
@@ -209,12 +215,21 @@ def _run_mini_finetune(spec: TaskSpec, deadline: Deadline) -> dict[str, Any]:
     steps = 0
     skipped = 0
     losses: list[float] = []
-    step_s = 0.0
+    slowest_s = 0.0    # the slowest attempt so far of ANY kind: applied step, non-finite skip, or OOM and its cleanup
+    first_attempt_s = None
+    t_step = None
     index = 0
     while index < len(examples) and steps < MINI_MAX_STEPS:
-        if time.monotonic() + 2.0 * step_s >= train_end:
+        now = time.monotonic()
+        if t_step is not None:
+            slowest_s = max(slowest_s, now - t_step)
+            if first_attempt_s is None:
+                first_attempt_s = now - t_step
+        # with nothing trained yet the save reserve protects nothing, so an attempt needs only now < train_end; once a
+        # step is applied, another attempt starts only if twice the slowest attempt so far still fits before train_end
+        if now >= train_end or (steps >= 1 and now + 2.0 * slowest_s >= train_end):
             break
-        t_step = time.monotonic()
+        t_step = now
         example = examples[index]
         index += 1
         try:
@@ -252,8 +267,13 @@ def _run_mini_finetune(spec: TaskSpec, deadline: Deadline) -> dict[str, Any]:
             continue
         steps += 1
         losses.append(float(loss.detach()))
-        step_s = time.monotonic() - t_step
 
+    t_train_done = time.monotonic()
+    if t_step is not None:
+        slowest_s = max(slowest_s, t_train_done - t_step)
+        if first_attempt_s is None:
+            first_attempt_s = t_train_done - t_step
+    train_end_margin_s = train_end - t_train_done    # negative: the last attempt ran into the save reserve
     if steps < 1 or not losses:
         raise MiniFinetuneError(f"no optimizer step was applied ({skipped} non-finite, {index} rows tried)")
     changed = any(bool((p.detach() != b).any()) for p, b in zip(params, before))
@@ -265,6 +285,7 @@ def _run_mini_finetune(spec: TaskSpec, deadline: Deadline) -> dict[str, Any]:
         raise MiniFinetuneError("non-finite trainable weights after training")
 
     model.eval()
+    t_save = time.monotonic()
     save_adapter(model, tokenizer, spec.output_dir, artifact_truth=ARTIFACT_PARTIAL_TRAINED_BEST,
                  optimizer_step=steps, truth_reason="mini_finetune")
     if not output_is_trained(spec.output_dir):
@@ -272,7 +293,10 @@ def _run_mini_finetune(spec: TaskSpec, deadline: Deadline) -> dict[str, Any]:
     receipt = dict(steps=steps, skipped_nonfinite=skipped, first_loss=round(losses[0], 5),
                    last_loss=round(losses[-1], 5), mean_loss=round(sum(losses) / len(losses), 5),
                    seq_cap=seq_cap, objective=objective, lora_r=MINI_LORA_R, lr=MINI_LR,
-                   load_s=round(load_s, 1), remaining_hard_s=round(deadline.remaining_hard(), 1))
+                   load_s=round(load_s, 1), first_attempt_s=round(first_attempt_s or 0.0, 3),
+                   slowest_attempt_s=round(slowest_s, 3), train_end_margin_s=round(train_end_margin_s, 1),
+                   save_s=round(time.monotonic() - t_save, 2), save_reserve_s=MINI_SAVE_RESERVE_S,
+                   remaining_hard_s=round(deadline.remaining_hard(), 1))
     telemetry.event("mini_finetune_done", **receipt)
     telemetry.write_into(spec.output_dir)
     return receipt
