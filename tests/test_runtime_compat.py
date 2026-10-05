@@ -38,6 +38,10 @@ def test_compat_kwargs_rejects_unreviewed_unknown_fields():
 
 
 def test_fallback_uses_transformers5_dtype_keyword():
-    source = inspect.getsource(fallback._emit_lora_adapter)
-    assert '"dtype": torch.float32' in source
-    assert '"torch_dtype":' not in source
+    # v9.2: the minimal fine-tune loads through forge.model.load_base (Transformers 5 ``dtype`` keyword)
+    from forge import model as forge_model
+
+    assert "load_base(spec.cached_model_dir" in inspect.getsource(fallback._run_mini_finetune)
+    source = inspect.getsource(forge_model.load_base)
+    assert "dtype=dtype" in source
+    assert "torch_dtype" not in source

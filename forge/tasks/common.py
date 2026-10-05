@@ -238,7 +238,7 @@ def safe_train(trainer: Any, *, min_batch: int = 1) -> None:
     also be strictly smaller. Trainers such as GRPO that derive sampler geometry
     from the construction-time batch are never mutated in place; they require a
     future trainer-factory retry. Otherwise the original OOM propagates and the
-    already-written floor/best artifact remains available to the CLI fallback.
+    already-persisted trained artifact (if any) is kept by the CLI; with none, the CLI runs the minimal fine-tune.
     """
     try:
         trainer.train()
@@ -532,9 +532,16 @@ ARTIFACT_COMPLETE_BEST = "COMPLETE_BEST"
 _TRUTHS = {ARTIFACT_FLOOR, ARTIFACT_PARTIAL_TRAINED_BEST, ARTIFACT_COMPLETE_BEST}
 
 
+class UntrainedArtifactError(ValueError):
+    """An untrained artifact was about to be written to the output path (owner decision 2026-10-05: never)."""
+
+
 def _write_truth(path: str, truth: str, step: int, reason: str) -> None:
     if truth not in _TRUTHS or int(step) < 0:
         raise ValueError("invalid artifact truth")
+    if truth == ARTIFACT_FLOOR:
+        # ARTIFACT_FLOOR stays a readable label (old outputs, the step-0 value of instruct._truth); it is never written
+        raise UntrainedArtifactError("refusing to label an output artifact FLOOR (untrained)")
     with open(path, "w", encoding="utf-8") as fh:
         json.dump({"schema": 1, "truth": truth, "optimizer_step": int(step), "reason": str(reason)}, fh, sort_keys=True, separators=(",", ":"))
         fh.write("\n")
@@ -572,6 +579,8 @@ def save_adapter(
     rollback journal (``.old``); :func:`_recover_artifact_dirs` restores it on
     the next call if a process dies between portable renames.
     """
+    if artifact_truth == ARTIFACT_FLOOR:
+        raise UntrainedArtifactError("refusing to save an artifact labelled FLOOR (untrained)")
     final = output_dir.rstrip("/")
     tmp = final + ".tmp"
     _recover_artifact_dirs(final)

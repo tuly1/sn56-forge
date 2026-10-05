@@ -6,7 +6,7 @@ re-initialised layers), and a low-rank adapter cannot undo that. Full-weight
 training can. This handler is used for non-KL InstructTextTask on one GPU when
 the model is small enough; everything else stays on the validated LoRA path.
 
-Pipeline: floor artifact -> tokenize at the evaluator cap -> exact dedup ->
+Pipeline: tokenize at the evaluator cap -> exact dedup ->
 adaptive max length + prompt-side truncation -> stratified dev split ->
 learning-rate prior + short sweep -> time-aware epochs -> train with dev
 evaluation every 1/8 epoch (validator statistic), best-checkpoint persistence,
@@ -802,8 +802,8 @@ def legacy_adapter_fixes_enabled(*, fallback: bool, crash_exception_route: bool,
 
 
 class ZeroTrainedStepsError(RuntimeError):
-    """sft_v2 finished without a single optimizer step. The output holds only the untrained floor, which must never be
-    shipped while a cheaper rung can still train: the dispatcher catches this and moves to the next rung."""
+    """sft_v2 finished without a single optimizer step. Nothing is at the output path: the dispatcher catches this and
+    moves to the next rung."""
 
 
 FULLFT_EXTEND_MIN_WINDOW_S = 300.0
@@ -843,7 +843,7 @@ def fullft_epoch_cap_extension(*, recipe_key: str | None, phase: int, extended: 
 
 class PersistFailedError(RuntimeError):
     """sft_v2 trained but no trained artifact could be written (release defect D5). Raised on the full-FT default route
-    only, so the dispatcher's ladder retries instead of shipping the untrained floor with a clean exit."""
+    and every other sft_v2 route, so the dispatcher's ladder retries instead of exiting cleanly with no trained artifact."""
 
 
 CHEAP_FULL_MIN_REMAINING_S = 900.0  # a cheaper full-FT retry needs a reload + tokenization + at least a few hundred steps
@@ -1568,16 +1568,12 @@ def run(
     from datasets import Dataset
     from transformers import Trainer, TrainerCallback, TrainingArguments
 
-    from forge.tasks.fallback import emit_untrained_copy
-
     t_start = time.monotonic()
     model = loaded.model
     loaded.model = None
     _event_and_print("sft_v2_selected", params_b=round(params_b, 3), hours_remaining=round(deadline.remaining_hard() / 3600, 3))
 
-    # ---- floor first: a valid untrained adapter at the output path ----
-    emit_untrained_copy(spec)
-    write_artifact_truth(spec.output_dir, ARTIFACT_FLOOR, optimizer_step=0, reason="pretraining_floor")
+    # No pre-training floor (owner decision 2026-10-05): the output path stays empty until the first trained persist.
 
     # ---- data ----
     assert spec.instruct is not None
@@ -2692,13 +2688,12 @@ def run(
     _event_and_print("sft_v2_train_end", step=final_step, best=state["best"], best_step=state["best_step"],
                      phases=phase, remaining_s=round(deadline.remaining_hard(), 1))
     if final_step <= 0:
-        # never ship the untrained floor while a cheaper rung can still train (owner directive 4): fail loudly. Only on
-        # the in-scope full-FT default route (recipe_key set, D3); every other route keeps cab930c (return, floor kept)
+        # zero optimizer steps: nothing trained exists and nothing is at the output path. Fail loudly on every route, so
+        # the dispatcher's ladder (cheaper full FT, adapter) or the CLI's minimal fine-tune takes over (owner directive 4,
+        # owner decision 2026-10-05)
         _event_and_print("sft_v2_zero_trained_steps", phases=phase, remaining_s=round(deadline.remaining_hard(), 1),
-                         cheap_full=bool(cheap_full), raised=bool(recipe_key))
-        if recipe_key:
-            raise ZeroTrainedStepsError("sft_v2 took no optimizer step")
-        return  # cab930c: out-of-scope routes return with the floor kept
+                         cheap_full=bool(cheap_full), raised=True)
+        raise ZeroTrainedStepsError("sft_v2 took no optimizer step")
 
     if two_seed_result is not None:
         # the chosen candidate (single seed or the exact two-seed soup) is loaded in the model
@@ -2807,10 +2802,9 @@ def run(
         return
     final_state = chosen_state if chosen_state is not None else selection.snapshot_trainable(model)
     ok = persist(model, final_state, chosen_step or final_step, truth, "sft_v2_final")
-    if not ok and recipe_key and not trained_artifact_present(spec):
-        # D5: trained weights exist but nothing trained reached the output (only the floor would ship with a clean exit).
-        # In-scope full-FT route: raise so the dispatcher's ladder retries (cheap full FT, then the adapter) or the task
-        # fails loudly. Out-of-scope routes keep cab930c.
+    if not ok and not trained_artifact_present(spec):
+        # D5: trained weights exist but nothing trained reached the output (the output path is empty). Raise on every
+        # route so the dispatcher's ladder retries (cheap full FT, then the adapter) or the CLI's minimal fine-tune runs.
         _event_and_print("sft_v2_persist_failed_no_artifact", step=final_step, remaining_s=round(deadline.remaining_hard(), 1))
         raise PersistFailedError("sft_v2 trained but could not save any trained artifact")
     _event_and_print("sft_v2_final", saved=ok, chosen_loss=chosen_loss, chosen_step=chosen_step, truth=truth,

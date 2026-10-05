@@ -212,7 +212,6 @@ def test_actual_handler_training_timing_and_dev_keep_their_respective_views(monk
     monkeypatch.setattr(sft_v2.telemetry,"make_trainer_callback",lambda *a:object())
     monkeypatch.setattr(sft_v2,"write_artifact_truth",lambda *a,**k:None)
     monkeypatch.setattr(sft_v2,"save_adapter",lambda *a,**k:None)
-    monkeypatch.setattr(fallback,"emit_untrained_copy",lambda spec:None)
     def dev(model,rs,collator,**kw):
         dev_batches.append(collator(rs)); return .5,[]
     monkeypatch.setattr(selection,"per_example_dev_loss",dev)

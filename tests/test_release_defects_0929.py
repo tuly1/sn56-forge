@@ -111,11 +111,10 @@ def test_run_logs_pool_k_and_cgroup(monkeypatch, tmp_path):
 
 # ---- D3: the zero-step raise is in-scope only -------------------------------------------------------------------------
 
-def test_zero_steps_out_of_scope_keeps_cab930c(monkeypatch, tmp_path):
-    ev, _ = _run(monkeypatch, tmp_path, steps=0)  # recipe_key None = not the full-FT default route
-    z = lfm._ev(ev, "sft_v2_zero_trained_steps")
-    assert len(z) == 1 and z[0]["raised"] is False
-    assert lfm._ev(ev, "sft_v2_final") == []  # returned before the final save, floor kept (cab930c)
+def test_zero_steps_out_of_scope_raises_too(monkeypatch, tmp_path):
+    # v9.2 (owner decision 2026-10-05): no floor exists, so zero steps raises on every route (cab930c returned)
+    with pytest.raises(sft_v2.ZeroTrainedStepsError):
+        _run(monkeypatch, tmp_path, steps=0)  # recipe_key None = not the full-FT default route
 
 
 def test_zero_steps_in_scope_raises(monkeypatch, tmp_path):
@@ -138,9 +137,10 @@ def test_persist_failure_raises_in_scope(monkeypatch, tmp_path):
         _run(monkeypatch, tmp_path, late=_failing_save, recipe_key="family")
 
 
-def test_persist_failure_out_of_scope_keeps_cab930c(monkeypatch, tmp_path):
-    ev, _ = _run(monkeypatch, tmp_path, late=_failing_save)
-    assert lfm._ev(ev, "sft_v2_final")[0]["saved"] is False
+def test_persist_failure_out_of_scope_raises_too(monkeypatch, tmp_path):
+    # v9.2: with no floor, a failed final save and no trained artifact raises on every route (cab930c returned)
+    with pytest.raises(sft_v2.PersistFailedError):
+        _run(monkeypatch, tmp_path, late=_failing_save)
 
 
 def test_persist_failure_with_partial_artifact_keeps_it(monkeypatch, tmp_path):

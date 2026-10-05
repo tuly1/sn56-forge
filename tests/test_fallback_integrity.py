@@ -72,25 +72,17 @@ def test_bin_validation_is_nonexecuting_and_rejects_arbitrary_bytes(tmp_path):
     assert fallback._has_weights(str(out)) is False
 
 
-def test_plain_copy_reports_only_a_structurally_valid_model(tmp_path):
-    src, dst = tmp_path / "src", tmp_path / "dst"
-    src.mkdir()
-    (src / "config.json").write_text("{}")
-    (src / "pytorch_model.bin").write_bytes(b"corrupt")
-    assert fallback._emit_plain_copy(str(src), str(dst)) is False
-    _pytorch_zip(src / "pytorch_model.bin")
-    assert fallback._emit_plain_copy(str(src), str(dst)) is True
-
-
-def test_fallback_recovers_interrupted_previous_generation(tmp_path):
+def test_output_check_recovers_interrupted_previous_generation(tmp_path):
     final = tmp_path / "output"
     old = tmp_path / "output.old"
     old.mkdir()
     (old / "config.json").write_text("{}")
     _safetensors(old / "model.safetensors")
-    spec = SimpleNamespace(
-        output_dir=str(final), cached_model_dir=str(tmp_path / "missing-base")
-    )
-    fallback.emit_untrained_copy(spec)
+    assert fallback.output_is_trained(str(final)) is True
     assert fallback._has_weights(str(final)) is True
     assert not old.exists()
+
+
+def test_untrained_rungs_are_gone():
+    for name in ("emit_untrained_copy", "_emit_lora_adapter", "_emit_perturbed_copy", "_emit_plain_copy"):
+        assert not hasattr(fallback, name)

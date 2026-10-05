@@ -624,16 +624,7 @@ def _run_bloomz_promotion(
     loaded.model = None
     telemetry.event("model_loaded", rows=len(rows))
 
-    from forge.tasks.fallback import emit_untrained_copy
-
-    telemetry.event("full_ft_floor")
-    emit_untrained_copy(spec)
-    write_artifact_truth(
-        spec.output_dir,
-        ARTIFACT_FLOOR,
-        optimizer_step=0,
-        reason="pretraining_floor",
-    )
+    # No pre-training floor (owner decision 2026-10-05): the output path stays empty until the first cadence save.
 
     assert spec.instruct is not None
     examples = prompts.build_instruct_examples(rows, spec.instruct)
@@ -706,8 +697,9 @@ def _run_bloomz_promotion(
                 truth_reason="bloomz_fixed_schedule_complete",
             )
     else:
-        # Keep the latest validated cadence generation (or the eager LoRA floor
-        # before step 64); never replace either with an arbitrary partial step.
+        # Keep the latest validated cadence generation; never replace it with an
+        # arbitrary partial step. Before the first cadence save (step 64) the
+        # output path is empty and the CLI runs the minimal fine-tune.
         telemetry.event(
             "bloomz_schedule_incomplete",
             final_step=final_step,
@@ -1006,9 +998,9 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
                 telemetry.write_into(spec.output_dir)
                 return
             if not fullft_route and deadline.remaining() < 900:
-                # out-of-scope routes keep cab930c: no time for a second recipe, keep the floor
-                telemetry.write_into(spec.output_dir)
-                return
+                # out-of-scope routes: no time for a second recipe. Nothing trained is at the output path, so
+                # re-raise: the CLI runs the minimal fine-tune or fails the task (owner decision 2026-10-05)
+                raise
             retry_cheap = (fullft_route and rung == "full" and isinstance(exc, Exception)
                            and deadline.remaining() >= sft_v2.CHEAP_FULL_MIN_REMAINING_S)
             v2_fallback = not retry_cheap
@@ -1136,30 +1128,11 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
 
     telemetry.event("model_loaded", rows=len(rows))
 
-    # Floor first, before the minutes-long tokenization of a large dataset: write
-    # a valid (untrained) artifact so a kill anywhere in setup still leaves a
-    # scoreable model at the output path. Training overwrites it (the atomic swap
-    # replaces the whole dir).
-    #
-    # For LoRA the untrained adapter is a valid finetune (adapter_config.json is
-    # always detected as a finetune). For FULL-FT, saving the untrained full model
-    # would be byte-identical to the base — which the evaluator scores as
-    # non-finetuned AND which would trap the fallback (its _has_weights guard
-    # keeps it). So use the LoRA-adapter floor (loaded from the cached base on CPU,
-    # zero GPU cost): a valid, non-identical finetune until real training lands.
-    if strategy == "full":
-        from forge.tasks.fallback import emit_untrained_copy
-
-        # A `fallback_emitted` event here is the intentional floor, not a failure —
-        # a real fallback would have no later `train_end`.
-        telemetry.event("full_ft_floor")
-        emit_untrained_copy(spec)
-        write_artifact_truth(
-            spec.output_dir, ARTIFACT_FLOOR, optimizer_step=0, reason="pretraining_floor"
-        )
-    else:
-        save_adapter(model, tokenizer, spec.output_dir, artifact_truth=ARTIFACT_FLOOR,
-                     optimizer_step=0, truth_reason="pretraining_floor")
+    # No pre-training floor (owner decision 2026-10-05). Earlier releases wrote an
+    # untrained adapter here so a kill during setup still left a scoreable model.
+    # An untrained artifact is never written now: the output path stays empty
+    # until the first trained save (periodic mirror / best checkpoint), and a
+    # failure before that goes to the CLI's minimal fine-tune or fails the task.
 
     # Start at G.O.D's evaluator-equivalent cap. If measured memory rejects every
     # full-cap geometry, later rungs may use smaller caps, but only when those
@@ -1175,9 +1148,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             spec.chat.chat_template, tokenizer
         )
         if template_resolution.degraded:
-            # The valid floor already exists. Persist the compatibility choice
-            # before processing rows so even a kill during tokenization explains
-            # why native/ChatML semantics replaced the requested future name.
+            # Recorded in the flight recorder; it reaches the output path with
+            # the first trained save (no output directory exists before that).
             telemetry.write_into(spec.output_dir)
         def tokenize_one(source_index: int, candidate: int) -> list:
             return tokenize.tokenize_chat_resolved(
@@ -1415,20 +1387,14 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             **_plan_identity(plan),
             **training_view.identity(),
         )
-        write_artifact_truth(
-            spec.output_dir,
-            ARTIFACT_FLOOR,
-            optimizer_step=0,
-            reason="zero_progress_oom_ladder_exhausted",
-        )
-        telemetry.write_into(spec.output_dir)
-        return
+        # nothing trained and nothing at the output path: fail the handler so the CLI runs the minimal fine-tune
+        raise RuntimeError("zero_progress_oom_ladder_exhausted: no optimizer step on any training geometry")
     model = trainer.model
     final_step = int(getattr(trainer.state, "global_step", 0) or 0)
     truth = _truth(final_step, int(getattr(trainer.state, "max_steps", 0) or 0))
     if truth == ARTIFACT_FLOOR:
-        write_artifact_truth(spec.output_dir, truth, optimizer_step=0, reason="no_progress")
-        return
+        # the trainer returned without an optimizer step: nothing trained, nothing at the output path
+        raise RuntimeError("no_progress: the trainer returned without an optimizer step")
     selected_step = final_step
     if should_final_save(tracker, final_step=final_step):
         save_adapter(model, tokenizer, spec.output_dir, artifact_truth=truth,

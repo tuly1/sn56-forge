@@ -76,7 +76,7 @@ def disable_hub_kernels_offline() -> bool:
     is importable (it is in the trainer image), Transformers 5.12 asks the Hub for
     ``kernels-community/*`` and only catches FileNotFoundError, so under
     HF_HUB_OFFLINE=1 the whole ``from_pretrained`` raises OfflineModeIsEnabled and
-    the task falls back to an untrained copy (phase-bf, Falcon-H1-0.5B-Base).
+    the task used to lose its trained route (phase-bf, Falcon-H1-0.5B-Base).
     Marking Hub kernels unavailable routes ``lazy_load_kernel`` to its local-import
     branch: the image's compiled ``causal_conv1d`` is used when importable, and
     otherwise the model's pure-torch path. Returns True when the switch was made.

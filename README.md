@@ -37,11 +37,11 @@ the output path continuously so a kill always leaves a scoreable model.
 
 ## Layout
 
-- `forge/cli.py` — argument parsing; funnels every failure to the fallback
+- `forge/cli.py` — argument parsing; a handler failure goes to the minimal fine-tune, else a non-zero exit
 - `forge/clock.py` — wall-clock accounting and pacing math
 - `forge/data/` — dataset loading, dataset-type parsing, prompt assembly, tokenisation
 - `forge/model.py` — cache-only base-model resolution + LoRA
-- `forge/tasks/` — one handler per task type, plus the fallback floor
+- `forge/tasks/` — one handler per task type, plus the crash fallback (`fallback.py`: a real minimal fine-tune)
 - `forge/tuning/` — hyperparameter plans, the deadline callback, the KL trainer
 - `ops/docker/` — the CUDA submission image and a CPU twin for smoke testing
 
@@ -51,9 +51,11 @@ the output path continuously so a kill always leaves a scoreable model.
    enough reserve to write the final model before the kill.
 2. **Train how you're scored.** Match the eval objective, including the KL term
    and the same DPO/GRPO trainers the evaluator uses.
-3. **Never forfeit.** A non-zero exit uploads nothing (scored −1); any handler
-   failure degrades to a valid LoRA adapter over the base, so we always submit
-   something scoreable.
+3. **Trained, or nothing.** The output path only ever holds a trained model. A
+   handler failure runs a real minimal fine-tune on the task's TRAIN rows
+   (a small LoRA, real optimizer steps, verified). If that cannot train either,
+   the output path is cleared and the process exits non-zero: a failed task.
+   Nothing untrained is submitted.
 
 ## Testing
 

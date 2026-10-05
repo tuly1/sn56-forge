@@ -368,13 +368,6 @@ def _stub_run_dependencies(monkeypatch, tmp_path: Path, *, promoted: bool):
     monkeypatch.setattr(instruct, "_make_best_checkpoint_callback", best)
     monkeypatch.setattr(instruct, "time_aware_epochs", probe)
     monkeypatch.setattr(instruct, "_save_bloomz_full_model", full_save)
-    from forge.tasks import fallback
-
-    monkeypatch.setattr(
-        fallback,
-        "emit_untrained_copy",
-        lambda spec: setattr(events, "floor", events.floor + 1),
-    )
     return captured, events
 
 
@@ -394,10 +387,9 @@ def test_promoted_run_uses_all_rows_fixed_schedule_and_no_internal_best(
     callbacks = captured.trainer.kwargs["callbacks"]
     assert callbacks[0] == "deadline" and callbacks[-1] == "telemetry"
     assert len(callbacks) == 3
-    assert (events.floor, events.full_save) == (1, 1)
+    assert (events.floor, events.full_save) == (0, 1)  # v9.2: no untrained floor before training
     assert (events.periodic, events.best, events.probe) == (0, 0, 0)
     assert [(truth, step) for truth, step, _reason in events.truths] == [
-        (instruct.ARTIFACT_FLOOR, 0),
         (instruct.ARTIFACT_COMPLETE_BEST, 256),
     ]
 
@@ -431,7 +423,7 @@ def test_non_bloom_run_retains_default_holdout_probe_and_callbacks(
     assert events.full_save == 0
 
 
-def test_training_failure_leaves_bloomz_lora_floor(
+def test_training_failure_leaves_no_untrained_bloomz_artifact(
     tmp_path: Path, monkeypatch
 ) -> None:
     _, events = _stub_run_dependencies(monkeypatch, tmp_path, promoted=True)
@@ -442,11 +434,9 @@ def test_training_failure_leaves_bloomz_lora_floor(
     monkeypatch.setattr(instruct, "safe_train", fail)
     with pytest.raises(RuntimeError, match="training failed"):
         instruct.run(_spec(), SimpleNamespace())
-    assert events.floor == 1
+    assert events.floor == 0  # v9.2: nothing untrained is written; the CLI runs the minimal fine-tune
     assert events.full_save == 0
-    assert [(truth, step) for truth, step, _reason in events.truths] == [
-        (instruct.ARTIFACT_FLOOR, 0)
-    ]
+    assert events.truths == []
 
 
 @pytest.mark.parametrize(

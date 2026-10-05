@@ -2,10 +2,13 @@
 handler for the task type. Kept deliberately thin: all real work lives in the
 task modules so this file stays a stable, readable contract surface.
 
-Guiding rule: never exit non-zero. The validator treats a non-zero exit before
-the wall-clock kill as a failure with no upload (scored -1), whereas any model
-left at the output path is uploaded and scored. So every failure path funnels
-into the fallback, which guarantees a valid artifact.
+Guiding rule (owner decision 2026-10-05): the output path holds a trained model
+or nothing. The validator uploads whatever is at the output path after a zero
+exit or a wall-clock kill, and uploads nothing after a non-zero exit. A handler
+failure therefore funnels into a real minimal fine-tune on the task's TRAIN
+rows (forge.tasks.fallback); if that cannot train either, the output path is
+cleared and the process exits non-zero (a failed task). No untrained artifact
+is written at any point.
 """
 
 from __future__ import annotations
@@ -20,8 +23,8 @@ from forge.clock import Deadline
 from forge.data.schema import TaskSpec
 
 # The task types the validator sends for text tournaments. We validate softly:
-# an unknown value is routed to the fallback rather than crashing argparse, so a
-# spec bump mid-tournament degrades instead of forfeiting.
+# an unknown value reaches dispatch rather than crashing argparse. A type with no
+# handler and no supervised TRAIN schema fails honestly (non-zero exit).
 _KNOWN_TASK_TYPES = ("InstructTextTask", "ChatTask", "DpoTask", "GrpoTask", "EnvTask")
 
 # Reserve a slice of the wall clock for final export so a kill never catches us
@@ -36,7 +39,7 @@ def _parse(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--dataset", default=None)
     p.add_argument("--dataset-type", default=None)
     # No `choices=`: we accept any value and let dispatch decide, so an unseen
-    # task type falls through to the fallback instead of an argparse exit(2).
+    # task type is reported by our own telemetry instead of an argparse exit(2).
     p.add_argument("--task-type", required=True)
     p.add_argument("--file-format", default="s3")
     p.add_argument("--expected-repo-name", required=True)
@@ -84,8 +87,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     # Building the spec parses --dataset-type, which can raise on a payload whose
     # required column is absent (e.g. a valid completion-style instruct task with
-    # field_output=null) or on malformed JSON. That must degrade to the fallback,
-    # not forfeit — so it's inside the guard, with a bare spec as the floor.
+    # field_output=null) or on malformed JSON. It is inside the guard so the
+    # failure is recorded; a bare spec has no column schema, so no fine-tune can
+    # run on it and the task then fails with a non-zero exit.
     try:
         spec = TaskSpec.build(
             task_id=args.task_id,
@@ -100,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
             kl_coef=kl_coef,
         )
     except BaseException as exc:  # noqa: BLE001
-        _log(f"spec build failed ({type(exc).__name__}: {exc}); using bare spec + fallback")
+        _log(f"spec build failed ({type(exc).__name__}: {exc}); using bare spec")
         telemetry.event("spec_build_failed", error=f"{type(exc).__name__}: {exc}")
         spec = TaskSpec(
             task_id=args.task_id,
@@ -112,72 +116,101 @@ def main(argv: list[str] | None = None) -> int:
             file_format=args.file_format,
         )
 
-    _run(spec, deadline)
-    return 0
+    return _run(spec, deadline)
 
 
-def _run(spec: TaskSpec, deadline: Deadline) -> None:
-    """Dispatch to a handler, degrading to the fallback on any failure.
+def _run(spec: TaskSpec, deadline: Deadline) -> int:
+    """Dispatch to a handler. Returns the process exit code.
+
+    0 only when a trained artifact is at the output path: the handler's own, or
+    the minimal fine-tune's after a handler failure / a missing handler. 1 with
+    an empty output path when neither could train.
 
     We import the handler lazily so heavy ML deps don't load for a task type
-    this build doesn't implement, and we catch everything: a handler that raises
-    on the validator's GPU must still leave a scoreable model behind.
+    this build doesn't implement, and we catch everything, so a handler that
+    raises on the validator's GPU still gets the minimal fine-tune.
     """
     handler = None
     try:
         from forge.tasks import dispatch
 
         handler = dispatch.for_task(spec.task_type)
-    except Exception as exc:  # dispatch import problems must not forfeit
+    except Exception as exc:
         _log(f"dispatch failed for {spec.task_type!r}: {exc!r}")
         telemetry.event("dispatch_failed", error=repr(exc))
 
+    handler_ok = False
     if handler is not None:
         try:
             handler(spec, deadline)
-            # This is a separately reviewed, family/task-gated post-handler
-            # operation. The handler's model/trainer locals are gone, so the
-            # full export loads a fresh base and cannot destructively merge the
-            # live training model. Export failures are diagnostic and must leave
-            # the selected adapter for the uploader; they must never enter the
-            # fallback path below. LFM export keeps its existing opt-out, while
-            # Gemma 4 E2B export is on by default and accepts
-            # FORGE_GEMMA4_FULL_EXPORT=0 as its opt-out.
-            try:
-                from forge.tasks.lfm25_full_export import maybe_export
-
-                maybe_export(spec, deadline)
-            except BaseException as exc:  # noqa: BLE001
-                _log(f"post-handler full export failed ({type(exc).__name__}: {exc})")
-                telemetry.event(
-                    "lfm_moe_full_export_failed",
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-            try:
-                from forge.tasks.gemma4_full_export import maybe_export as maybe_export_gemma4
-
-                maybe_export_gemma4(spec, deadline)
-            except BaseException as exc:  # noqa: BLE001
-                _log(f"Gemma 4 post-handler export failed ({type(exc).__name__}: {exc})")
-                telemetry.event(
-                    "gemma4_full_export_failed",
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-            telemetry.event("run_complete")
-            telemetry.write_into(spec.output_dir)
-            return
+            handler_ok = True
         except BaseException as exc:  # noqa: BLE001 — includes SystemExit/KeyboardInterrupt
-            _log(f"handler raised ({type(exc).__name__}: {exc}); using fallback")
+            _log(f"handler raised ({type(exc).__name__}: {exc})")
             telemetry.event("handler_failed", error=f"{type(exc).__name__}: {exc}")
+    else:
+        telemetry.event("handler_missing", task_type=spec.task_type)
 
+    from forge.tasks.fallback import clear_output, output_is_trained, run_mini_finetune
+
+    trained = _safe_output_is_trained(output_is_trained, spec)
+    if handler_ok and trained:
+        # This is a separately reviewed, family/task-gated post-handler
+        # operation. The handler's model/trainer locals are gone, so the
+        # full export loads a fresh base and cannot destructively merge the
+        # live training model. Export failures are diagnostic and must leave
+        # the selected adapter for the uploader. LFM export keeps its existing
+        # opt-out, while Gemma 4 E2B export is on by default and accepts
+        # FORGE_GEMMA4_FULL_EXPORT=0 as its opt-out.
+        try:
+            from forge.tasks.lfm25_full_export import maybe_export
+
+            maybe_export(spec, deadline)
+        except BaseException as exc:  # noqa: BLE001
+            _log(f"post-handler full export failed ({type(exc).__name__}: {exc})")
+            telemetry.event(
+                "lfm_moe_full_export_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        try:
+            from forge.tasks.gemma4_full_export import maybe_export as maybe_export_gemma4
+
+            maybe_export_gemma4(spec, deadline)
+        except BaseException as exc:  # noqa: BLE001
+            _log(f"Gemma 4 post-handler export failed ({type(exc).__name__}: {exc})")
+            telemetry.event(
+                "gemma4_full_export_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        trained = _safe_output_is_trained(output_is_trained, spec)
+
+    if trained:
+        # the handler's trained artifact (complete, or a trained checkpoint persisted before a late failure)
+        telemetry.event("run_complete" if handler_ok else "handler_failed_kept_trained_artifact")
+        telemetry.write_into(spec.output_dir)
+        return 0
+
+    # Nothing trained is at the output path. Whatever is there (a partial write) is removed before anything else.
+    telemetry.event("no_trained_artifact", handler_ok=handler_ok, handler_missing=handler is None)
+    clear_output(spec.output_dir)
     try:
-        from forge.tasks.fallback import emit_untrained_copy
+        receipt = run_mini_finetune(spec, deadline)
+        _log(f"minimal fine-tune exported: {receipt}")
+        telemetry.event("run_complete_mini_finetune", steps=int(receipt.get("steps", 0)))
+        telemetry.write_into(spec.output_dir)
+        return 0
+    except BaseException as exc:  # noqa: BLE001
+        clear_output(spec.output_dir)
+        _log(f"minimal fine-tune failed ({type(exc).__name__}: {exc}); no artifact, failing the task")
+        telemetry.event("task_failed_no_artifact", error=f"{type(exc).__name__}: {exc}")
+        return 1
 
-        emit_untrained_copy(spec)
-    except Exception as exc:  # the floor itself failing is all we can log
-        _log(f"fallback failed: {exc!r}")
-        telemetry.event("fallback_failed", error=repr(exc))
-    telemetry.write_into(spec.output_dir)
+
+def _safe_output_is_trained(check, spec: TaskSpec) -> bool:
+    try:
+        return bool(check(spec.output_dir))
+    except Exception as exc:
+        telemetry.event("output_check_failed", error=repr(exc))
+        return False
 
 
 def _log(msg: str) -> None:

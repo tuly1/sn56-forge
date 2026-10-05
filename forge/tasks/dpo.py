@@ -97,7 +97,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         loaded.model, r=plan.lora_r, alpha=plan.lora_alpha, dropout=plan.lora_dropout
     )
 
-    save_adapter(model, tokenizer, spec.output_dir)  # floor before training
+    # No pre-training floor (owner decision 2026-10-05): nothing untrained is written to the output path.
 
     dataset = Dataset.from_list(train_examples)
     # Current baseline DPO stats do not expose prompt length independently:
@@ -171,6 +171,8 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
 
     safe_train(trainer)
     final_step = int(getattr(trainer.state, "global_step", 0) or 0)
+    if final_step <= 0:
+        raise RuntimeError("DPO trainer returned without an optimizer step")
     if should_final_save(tracker, final_step=final_step):
         save_adapter(model, tokenizer, spec.output_dir)
     else:

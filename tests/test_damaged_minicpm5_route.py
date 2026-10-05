@@ -269,7 +269,6 @@ def _run(monkeypatch, tmp_path, *, damaged: bool, env=None, rms=1.0):
     monkeypatch.setattr(sft_v2.telemetry, "make_trainer_callback", lambda *a: object())
     monkeypatch.setattr(sft_v2, "write_artifact_truth", lambda *a, **k: None)
     monkeypatch.setattr(sft_v2, "save_adapter", lambda *a, **k: None)
-    monkeypatch.setattr(fallback, "emit_untrained_copy", lambda spec: None)
     monkeypatch.setattr(selection, "per_example_dev_loss", lambda model, rs, collator, **kw: (0.5, []))
     monkeypatch.setattr(selection, "available_ram", lambda: 10 ** 12)
     monkeypatch.setattr(sft_v2.lr_probe, "measure_step_time", lambda model, batches, **kw: (1.0, [1.0]))

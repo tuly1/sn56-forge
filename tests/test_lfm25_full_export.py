@@ -256,10 +256,12 @@ def test_cli_export_exception_does_not_enter_fallback(monkeypatch, tmp_path):
 
     monkeypatch.setattr(dispatch, "for_task", lambda _task: handler)
     monkeypatch.setattr(export, "maybe_export", bad_export)
-    monkeypatch.setattr(fallback, "emit_untrained_copy", lambda *_a, **_k: calls.__setitem__("fallback", 1))
+    monkeypatch.setattr(fallback, "run_mini_finetune", lambda *_a, **_k: calls.__setitem__("fallback", 1))
+    monkeypatch.setattr(fallback, "output_is_trained", lambda _dir: True)  # the handler's (stub) trained artifact
+    monkeypatch.setattr(fallback, "clear_output", lambda _dir: calls.__setitem__("fallback", 1))
     monkeypatch.setattr(cli.telemetry, "event", lambda *_a, **_k: None)
     monkeypatch.setattr(cli.telemetry, "write_into", lambda *_a, **_k: None)
     monkeypatch.setattr(cli, "_log", lambda *_a, **_k: None)
-    cli._run(spec, SimpleNamespace())
+    assert cli._run(spec, SimpleNamespace()) == 0
     assert marker.read_bytes() == b"selected"
     assert calls["fallback"] == 0

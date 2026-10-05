@@ -1,161 +1,281 @@
-"""Last-resort output.
+"""Crash fallback: a real minimal fine-tune, or an honest failure.
 
-If a task type has no handler, or training raises on the validator's GPU, we
-still owe the validator a scoreable model at the output path. A non-zero exit
-uploads nothing and scores -1; any valid model gets uploaded and scored. This
-module makes a best effort through a structurally validated degrading ladder:
+Owner decision, 2026-10-05 (history/owner-directives-20260928/OWNER-QUOTES.md): when a handler fails, or a supported text
+task type has no handler, the task gets a genuine minimal fine-tune on its own TRAIN rows. If even that cannot run, the
+process exits non-zero with nothing at the output path and takes the missed-task penalty. Nothing untrained is ever
+written to the output path, at any point of any run.
 
-  1. Write a real (untrained) LoRA adapter over the base. The evaluator detects
-     the adapter and treats the submission as a finetune, sidestepping the
-     "non-finetuned submission" penalty, and an adapter dir is never byte-
-     identical to the base.
-  2. If torch/peft can't load and the base uses safetensors, copy the base and
-     nudge one representable floating-point value.
-  3. If even that fails, copy the base as-is and label it honestly as a plain
-     floor. A missing or structurally corrupt cache can still leave no artifact.
+The mini fine-tune:
+  * loads the task's base from the validator-staged local directory (no network), attaches a small-rank LoRA adapter
+    (the adapter is the crash fallback of last resort, owner directive 4);
+  * tokenizes a seeded sample of the task's TRAIN rows with the same prompt / chat-template code as the main handlers;
+  * takes real AdamW steps, one row per step, at a short sequence cap, bounded by MINI_MAX_STEPS and by the clock (the
+    final save keeps MINI_SAVE_RESERVE_S before the validator's hard stop);
+  * verifies that a finite loss was computed, that at least one optimizer step was applied, that the trainable weights
+    changed and that they are finite;
+  * exports through the production save path, labelled PARTIAL_TRAINED_BEST with the number of applied steps.
 
-This is a floor, never a strategy.
+Any failure (no time, no base, no TRAIN rows, no supervised target, load error, OOM with no shorter row left, no
+finite step, save error) raises MiniFinetuneError. The caller then clears the output path and exits non-zero.
+
+Does NOT run (raises) for GrpoTask: its TRAIN file has prompts and reward functions but no target text, so there is no
+supervised step to take; and for task types this build has no data schema for (EnvTask, unknown).
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
+import random
+import time
+from typing import Any
 
+from forge.clock import Deadline
 from forge.data.schema import TaskSpec
-from forge.model import (
-    _load_model_native_first,
-    _load_tokenizer_native_first,
-    _preflight_model_dir,
-    resolve_model_dir,
-)
 from forge.tasks.common import _valid_pytorch_zip, _valid_safetensors_header
 
+MINI_LORA_R = 8
+MINI_LORA_ALPHA = 16
+MINI_LR = 1e-4                  # linear decay to 0 over the planned steps
+MINI_MAX_STEPS = 64             # optimizer steps, one TRAIN row each
+MINI_GRAD_CLIP = 1.0
+MINI_SEQ_CAPS = (512, 1024, 2048)  # the first cap that keeps at least one row is used; an OOM halves the row length
+MINI_SCAN_ROWS = 2048           # TRAIN rows sampled (seed 7) to find MINI_MAX_STEPS usable examples
+MINI_MIN_ENTRY_S = 60.0         # below this much wall clock the run is not started
+MINI_SAVE_RESERVE_S = 45.0      # kept before the hard stop for the adapter save
+MINI_SUPPORTED_TASK_TYPES = ("InstructTextTask", "ChatTask", "DpoTask")
 
-def emit_untrained_copy(spec: TaskSpec) -> None:
+_TRUTH_FILE = "forge_artifact_truth.json"
+
+
+class MiniFinetuneError(RuntimeError):
+    """The minimal fine-tune could not train or could not save. The task must fail: no artifact, non-zero exit."""
+
+
+def output_is_trained(output_dir: str) -> bool:
+    """True when the output path holds a structurally complete artifact that is not labelled FLOOR (untrained).
+
+    No code path writes an untrained artifact: every pre-training floor is removed, save_adapter and
+    write_artifact_truth refuse the FLOOR label, and each handler saves only after an optimizer step. So a complete
+    artifact here was written after training. The structural check is the one save_adapter applies before it promotes
+    an artifact, so anything a handler promoted passes it. The FLOOR label is still read, so an untrained artifact from
+    any older writer is never kept; other labels (PARTIAL_TRAINED_BEST, COMPLETE_BEST, the Qwen3.5 fixed-average
+    midpoint label) and unlabelled trained saves (DPO / GRPO) are trained artifacts."""
+    from forge.tasks.common import _is_structurally_complete_artifact, _recover_artifact_dirs
+
+    try:
+        _recover_artifact_dirs(output_dir.rstrip("/"))
+    except Exception:
+        pass
+    if not _is_structurally_complete_artifact(output_dir):
+        return False
+    try:
+        with open(os.path.join(output_dir, _TRUTH_FILE), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError):
+        return True  # no (readable) label: a trained save that does not label, see above
+    return not (isinstance(payload, dict) and payload.get("truth") == "FLOOR")
+
+
+def clear_output(output_dir: str) -> None:
+    """Remove the output directory and its staging siblings so a failed task leaves nothing to upload."""
+    import shutil
+
+    final = output_dir.rstrip("/")
+    for path in (final, final + ".tmp", final + ".old"):
+        try:
+            if os.path.islink(path) or os.path.isfile(path):
+                os.unlink(path)
+            elif os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def _examples(spec: TaskSpec, tokenizer: Any, model: Any) -> tuple[list[dict[str, list[int]]], int, str]:
+    """Tokenized TRAIN examples for the mini fine-tune: (examples, sequence cap, objective)."""
+    from forge.data import loader, prompts, tokenize
+    from forge.model import effective_sft_seq_len
+
+    if spec.task_type not in MINI_SUPPORTED_TASK_TYPES:
+        raise MiniFinetuneError(f"no supervised mini fine-tune for task type {spec.task_type!r}")
+    rows = loader.load_rows(spec.cached_dataset_path, dataset_arg=spec.dataset, file_format=spec.file_format)
+    if not rows:
+        raise MiniFinetuneError("no TRAIN rows")
+    if len(rows) > MINI_SCAN_ROWS:
+        picked = sorted(random.Random(7).sample(range(len(rows)), MINI_SCAN_ROWS))
+        rows = [rows[i] for i in picked]
+
+    if spec.chat is not None:
+        objective = "chat_sft"
+        items = prompts.build_chat_conversations(rows, spec.chat)
+        resolution = tokenize.resolve_chat_template(spec.chat.chat_template, tokenizer)
+
+        def tok(cap: int) -> list:
+            return tokenize.tokenize_chat_resolved(items, tokenizer, cap, resolution=resolution)
+    elif spec.instruct is not None and spec.instruct.output is None:
+        objective = "completion_sft"
+        items = prompts.build_completion_documents(rows, spec.instruct)
+
+        def tok(cap: int) -> list:
+            return tokenize.tokenize_completion(items[:MINI_MAX_STEPS], tokenizer, cap)
+    elif spec.instruct is not None:
+        objective = "instruct_sft"
+        items = prompts.build_instruct_examples(rows, spec.instruct)
+
+        def tok(cap: int) -> list:
+            return tokenize.tokenize_instruct(items, tokenizer, cap)
+    elif spec.dpo is not None:
+        # supervised proxy for a preference task: the prompt with the CHOSEN response as the target
+        objective = "dpo_chosen_sft"
+        items = [{"prompt_text": ex["prompt"], "completion_text": ex["chosen"]}
+                 for ex in prompts.build_dpo_examples(rows, spec.dpo)]
+
+        def tok(cap: int) -> list:
+            return tokenize.tokenize_instruct(items, tokenizer, cap)
+    else:
+        raise MiniFinetuneError("task has no column schema (spec build failed)")
+    if not items:
+        raise MiniFinetuneError("no trainable TRAIN rows")
+
+    for requested in MINI_SEQ_CAPS:
+        cap = effective_sft_seq_len(model, requested)
+        examples = tok(cap)
+        if examples:
+            return examples[:MINI_MAX_STEPS], cap, objective
+        if cap < requested:
+            break  # the model's own context limit already binds
+    raise MiniFinetuneError("no TRAIN row fits the mini fine-tune sequence caps")
+
+
+def run_mini_finetune(spec: TaskSpec, deadline: Deadline) -> dict[str, Any]:
+    """Train a small LoRA adapter on the task's TRAIN rows and export it. Returns the receipt; raises MiniFinetuneError."""
     from forge import telemetry
 
-    dst = spec.output_dir
-    # Repair a portable directory-promotion interruption before deciding whether
-    # a trained artifact already exists.  This is a lazy import to keep the
-    # fallback module independent during normal startup.
     try:
-        from forge.tasks.common import _recover_artifact_dirs
+        return _run_mini_finetune(spec, deadline)
+    except MiniFinetuneError as exc:
+        telemetry.event("mini_finetune_failed", error=str(exc)[:400])
+        raise
+    except BaseException as exc:  # noqa: BLE001 - OOM, load errors, interrupts: all mean "could not train"
+        telemetry.event("mini_finetune_failed", error=f"{type(exc).__name__}: {exc}"[:400])
+        raise MiniFinetuneError(f"{type(exc).__name__}: {exc}") from exc
 
-        _recover_artifact_dirs(dst)
-    except Exception as exc:
-        telemetry.event(
-            "fallback_recovery_failed", error=f"{type(exc).__name__}: {exc}"
-        )
-    # If training already mirrored a real adapter here (periodic save), keep it —
-    # a late handler failure must not downgrade a trained model to the floor.
-    if _has_weights(dst):
-        telemetry.event("fallback_kept_existing_weights")
-        return
 
-    os.makedirs(dst, exist_ok=True)
+def _run_mini_finetune(spec: TaskSpec, deadline: Deadline) -> dict[str, Any]:
+    from forge import telemetry
+
+    if spec.task_type not in MINI_SUPPORTED_TASK_TYPES:
+        raise MiniFinetuneError(f"no supervised mini fine-tune for task type {spec.task_type!r}")
+    entry_remaining = deadline.remaining_hard()
+    if entry_remaining < MINI_MIN_ENTRY_S:
+        raise MiniFinetuneError(f"only {entry_remaining:.0f}s of wall clock left (< {MINI_MIN_ENTRY_S:.0f}s)")
+    # steps stop at the soft stop when it is still ahead (the export reserve stays whole); a handler that failed inside
+    # the export reserve leaves only the reserve itself, of which the adapter save keeps MINI_SAVE_RESERVE_S
+    train_end = deadline.hard_stop - MINI_SAVE_RESERVE_S
+    if deadline.remaining() > 0.0:
+        train_end = min(train_end, deadline.soft_stop)
+    telemetry.event("mini_finetune_start", remaining_hard_s=round(entry_remaining, 1),
+                    train_window_s=round(train_end - time.monotonic(), 1))
+
+    import torch
+
+    from forge.data import tokenize
+    from forge.model import attach_lora, load_base
+    from forge.tasks.common import ARTIFACT_PARTIAL_TRAINED_BEST, _free_cuda, _is_oom, save_adapter
+
+    _free_cuda()
+    t_load = time.monotonic()
+    loaded = load_base(spec.cached_model_dir, for_generation=False)
+    tokenizer = loaded.tokenizer
+    examples, seq_cap, objective = _examples(spec, tokenizer, loaded.model)
+    model = attach_lora(loaded.model, r=MINI_LORA_R, alpha=MINI_LORA_ALPHA, dropout=0.0)
+    loaded.model = None
+    load_s = time.monotonic() - t_load
+    if time.monotonic() >= train_end:
+        raise MiniFinetuneError(f"no time left to train after a {load_s:.0f}s load")
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    before = [p.detach().clone() for p in params]
+    optimizer = torch.optim.AdamW(params, lr=MINI_LR, weight_decay=0.0)
+    collator = tokenize.PadCollator(tokenizer.pad_token_id)
     try:
-        src = resolve_model_dir(spec.cached_model_dir)
+        device = model.get_input_embeddings().weight.device
     except Exception:
-        telemetry.event("fallback_no_base_model")
-        return  # no base staged; nothing we can honestly emit
+        device = params[0].device
+    model.train()
 
-    # Each rung starts from a clean dst so a partial write from a failed rung
-    # (e.g. adapter_config.json without weights) can't shadow the next rung.
-    if _emit_lora_adapter(src, dst):
-        telemetry.event("fallback_emitted", rung="lora_adapter")
-        return
-    _clear_dir(dst)
-    if _emit_perturbed_copy(src, dst):
-        telemetry.event("fallback_emitted", rung="perturbed_copy")
-        return
-    _clear_dir(dst)
-    if _emit_plain_copy(src, dst):
-        telemetry.event("fallback_emitted", rung="plain_copy")
-    else:
-        telemetry.event("fallback_plain_copy_invalid")
+    planned = len(examples)
+    steps = 0
+    skipped = 0
+    losses: list[float] = []
+    step_s = 0.0
+    index = 0
+    while index < len(examples) and steps < MINI_MAX_STEPS:
+        if time.monotonic() + 2.0 * step_s >= train_end:
+            break
+        t_step = time.monotonic()
+        example = examples[index]
+        index += 1
+        try:
+            batch = {k: v.to(device) for k, v in collator([example]).items()}
+            loss = model(**batch).loss
+            if loss is None or not bool(torch.isfinite(loss)):
+                optimizer.zero_grad(set_to_none=True)
+                skipped += 1
+                continue
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(params, MINI_GRAD_CLIP)
+            if not bool(torch.isfinite(grad_norm)):
+                optimizer.zero_grad(set_to_none=True)
+                skipped += 1
+                continue
+            for group in optimizer.param_groups:
+                group["lr"] = MINI_LR * max(0.0, 1.0 - steps / float(planned))
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+        except Exception as exc:
+            if not _is_oom(exc):
+                raise
+            # continue on the remaining rows that are at most half as long; with none left the attempt ends
+            optimizer.zero_grad(set_to_none=True)
+            batch = loss = None
+            _free_cuda()
+            seq_cap = len(example["input_ids"]) // 2
+            examples = [ex for ex in examples[index:] if len(ex["input_ids"]) <= seq_cap]
+            index = 0
+            telemetry.event("mini_finetune_oom", new_seq_cap=seq_cap, steps=steps, rows_left=len(examples))
+            if not examples:
+                if steps >= 1:
+                    break  # keep the steps already applied
+                raise MiniFinetuneError("out of memory and no shorter TRAIN row left") from exc
+            continue
+        steps += 1
+        losses.append(float(loss.detach()))
+        step_s = time.monotonic() - t_step
 
+    if steps < 1 or not losses:
+        raise MiniFinetuneError(f"no optimizer step was applied ({skipped} non-finite, {index} rows tried)")
+    changed = any(bool((p.detach() != b).any()) for p, b in zip(params, before))
+    finite = all(bool(torch.isfinite(p.detach()).all()) for p in params)
+    del before
+    if not changed:
+        raise MiniFinetuneError("the trainable weights did not change")
+    if not finite:
+        raise MiniFinetuneError("non-finite trainable weights after training")
 
-def _clear_dir(path: str) -> None:
-    if os.path.isdir(path):
-        shutil.rmtree(path, ignore_errors=True)
-    os.makedirs(path, exist_ok=True)
-
-
-def _emit_lora_adapter(src: str, dst: str) -> bool:
-    """Preferred floor: an untrained LoRA adapter + tokenizer."""
-    try:
-        import torch
-        from peft import LoraConfig, get_peft_model
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-
-        config_data = _preflight_model_dir(src)
-        tokenizer = _load_tokenizer_native_first(AutoTokenizer, src, config_data)
-        model = _load_model_native_first(
-            AutoModelForCausalLM,
-            src,
-            config_data=config_data,
-            common={
-                "local_files_only": True,
-                "dtype": torch.float32,
-                "low_cpu_mem_usage": True,
-            },
-        )
-        peft_model = get_peft_model(
-            model,
-            LoraConfig(
-                r=8, lora_alpha=16, lora_dropout=0.0, bias="none",
-                task_type="CAUSAL_LM", target_modules="all-linear",
-            ),
-        )
-        peft_model.save_pretrained(dst, safe_serialization=True)
-        tokenizer.save_pretrained(dst)
-        return _has_weights(dst)
-    except Exception:
-        return False
-
-
-def _emit_perturbed_copy(src: str, dst: str) -> bool:
-    """Copy the base, then nudge one weight tensor so it isn't byte-identical."""
-    try:
-        import torch
-        from safetensors.torch import load_file, save_file
-
-        source_shard = _first_safetensors(src)
-        if source_shard is None:
-            # Avoid copying a multi-gigabyte .bin model twice merely to discover
-            # that this rung cannot rewrite it safely.
-            return False
-        shutil.copytree(src, dst, dirs_exist_ok=True)
-        shard = os.path.join(dst, os.path.relpath(source_shard, src))
-        tensors = load_file(shard)
-        changed = False
-        for name, tensor in tensors.items():
-            if tensor.is_floating_point() and tensor.numel() > 0:
-                replacement = tensor.clone()
-                flat = replacement.reshape(-1)
-                old = flat[0]
-                if not torch.isfinite(old):
-                    old = torch.zeros_like(old)
-                flat[0] = torch.nextafter(old, torch.full_like(old, float("inf")))
-                tensors[name] = replacement
-                changed = bool(flat[0].item() != tensor.reshape(-1)[0].item())
-                break
-        if not changed:
-            return False
-        save_file(tensors, shard)
-        return _has_weights(dst)
-    except Exception:
-        return False
-
-
-def _emit_plain_copy(src: str, dst: str) -> bool:
-    try:
-        shutil.copytree(src, dst, dirs_exist_ok=True)
-    except Exception:
-        return False
-    return _has_weights(dst)
+    model.eval()
+    save_adapter(model, tokenizer, spec.output_dir, artifact_truth=ARTIFACT_PARTIAL_TRAINED_BEST,
+                 optimizer_step=steps, truth_reason="mini_finetune")
+    if not output_is_trained(spec.output_dir):
+        raise MiniFinetuneError("the saved adapter failed validation")
+    receipt = dict(steps=steps, skipped_nonfinite=skipped, first_loss=round(losses[0], 5),
+                   last_loss=round(losses[-1], 5), mean_loss=round(sum(losses) / len(losses), 5),
+                   seq_cap=seq_cap, objective=objective, lora_r=MINI_LORA_R, lr=MINI_LR,
+                   load_s=round(load_s, 1), remaining_hard_s=round(deadline.remaining_hard(), 1))
+    telemetry.event("mini_finetune_done", **receipt)
+    telemetry.write_into(spec.output_dir)
+    return receipt
 
 
 def _has_weights(path: str) -> bool:
@@ -238,11 +358,3 @@ def _valid_weight_container(path: str) -> bool:
     if path.endswith(".bin"):
         return _valid_pytorch_zip(path)
     return False
-
-
-def _first_safetensors(path: str) -> str | None:
-    for root, _dirs, files in os.walk(path):
-        for f in sorted(files):
-            if f.endswith(".safetensors"):
-                return os.path.join(root, f)
-    return None

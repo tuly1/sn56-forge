@@ -781,8 +781,10 @@ def test_truth_relabel_is_atomic_and_does_not_change_weights(tmp_path):
 def test_frozen_recipe_files_are_unchanged():
     expected = {
         "forge/tuning/plan.py": "6f0c0307a3db7b7d0780a77b7e07aa01a1ab808045ff3202b5ba2512c3f47435",
-        "forge/tasks/dpo.py": "25bb3d48c2ff1a568d434d3983d4384af1e060967072429cbab68a0b74e1ccd5",
-        "forge/tasks/grpo.py": "16ecd365a984b807b7849eb86337092b789ea5bea1e2585768fd5f7cdc92897d",
+        # v9.2 (2026-10-05): the pre-training untrained adapter floor is removed from both handlers and a trainer that
+        # returns without an optimizer step raises (owner decision: nothing untrained at the output path); pins refreshed.
+        "forge/tasks/dpo.py": "ce7933d5810b5aa4a0709b03a3b641a9cbc340e405ea225b15d180a23931a0c8",
+        "forge/tasks/grpo.py": "9ff67f0aa140dae644d4cd42c50d5d7e6f794dce7ab2ce7457d5cfce46b268b6",
     }
     for path, digest in expected.items():
         with open(path, "rb") as handle:

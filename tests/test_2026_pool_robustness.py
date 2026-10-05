@@ -197,7 +197,8 @@ def test_floor_best_export_and_non_sft_handlers_remain_unchanged():
     source = inspect.getsource(instruct.run)
     route = source.index("conservative_qwen35_plan(loaded.model, plan)")
     lora = source.index("model = attach_lora(")
-    floor = source.index("truth_reason=\"pretraining_floor\"")
+    assert "pretraining_floor" not in source and "emit_untrained_copy" not in source  # v9.2: no untrained floor
+    floor = source.index("No pre-training floor (owner decision 2026-10-05)")
     tokenize_start = source.index("initial_seq_len = effective_sft_seq_len(")
     trainer_policy = source.index("return _make_trainer(")
     train = source.index("_train_ladder(")
@@ -212,17 +213,20 @@ def test_floor_best_export_and_non_sft_handlers_remain_unchanged():
         # Qwen3.5-style bases, tensor names) with the base so the validator's is_finetune check passes
         # (forge.tasks.export_compat; tests/test_export_validator_finetune.py). Adapter exports are untouched.
         # RESP-072-1: an unverifiable alignment rollback (ExportAlignmentError) now fails the staging.
+        # v9.2 (2026-10-05, owner decision "real mini fine-tune, else fail"): fallback.py is the minimal fine-tune (both
+        # untrained rungs and the plain copy are gone), save_adapter / write_artifact_truth refuse the FLOOR label, and
+        # dpo.py / grpo.py no longer write a pre-training adapter and raise on a zero-step trainer; pins refreshed.
         "forge/tasks/common.py": (
-            "3ba13433cfc2fc541532e16ab33887d657c28986d2556278fffa442eaa617bd3"
+            "3f6491c522ec93f1ff0b8b88d51f513fa93a1b284227ee0fe5f2f7f3ec9f0a72"
         ),
         "forge/tasks/fallback.py": (
-            "16a556b7c5104f45584b0bdc24bb2f050835eb2945be496a9e659cef6e9ceed0"
+            "1bbcdacebe6257dd31ff4b4993a2c85528a7c288c3d58ae3b6545ebb8d9fbd32"
         ),
         "forge/tasks/dpo.py": (
-            "25bb3d48c2ff1a568d434d3983d4384af1e060967072429cbab68a0b74e1ccd5"
+            "ce7933d5810b5aa4a0709b03a3b641a9cbc340e405ea225b15d180a23931a0c8"
         ),
         "forge/tasks/grpo.py": (
-            "16ecd365a984b807b7849eb86337092b789ea5bea1e2585768fd5f7cdc92897d"
+            "9ff67f0aa140dae644d4cd42c50d5d7e6f794dce7ab2ce7457d5cfce46b268b6"
         ),
         "forge/tuning/plan.py": (
             "6f0c0307a3db7b7d0780a77b7e07aa01a1ab808045ff3202b5ba2512c3f47435"

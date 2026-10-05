@@ -122,9 +122,9 @@ def test_out_of_scope_keeps_cab930c_failure_handling(monkeypatch):
     big = _entry("Qwen/Qwen3-14B")  # 2 GPUs: cab930c's multi-GPU v2 adapter route
     calls, events, legacy = ladder(monkeypatch, big, outcomes=[RuntimeError("boom")], n_gpus=2, rows="long")
     assert [c.get("cheap") for c in calls] == [False] and legacy  # no cheap rung outside the scope
-    calls, events, legacy = ladder(monkeypatch, big, outcomes=[RuntimeError("boom")], hours=0.2, n_gpus=2,
-                                   rows="long")
-    assert not legacy and "sft_v2_fallback_to_lora" not in [n for n, _ in events]  # cab930c: floor under 900 s
+    # under 900 s there is no second recipe; v9.2 re-raises so the CLI runs the minimal fine-tune (cab930c kept a floor)
+    with pytest.raises(RuntimeError, match="boom"):
+        ladder(monkeypatch, big, outcomes=[RuntimeError("boom")], hours=0.2, n_gpus=2, rows="long")
 
 
 def test_quality_exceptions_keep_their_adapter_recipe(monkeypatch):

@@ -3,7 +3,9 @@
 The validator ships reward functions as Python source inside `--dataset-type`.
 We materialise them into callables and hand them to TRL's GRPOTrainer (the same
 class the evaluator uses). GRPO is generation-heavy and the riskiest path, so
-anything that goes wrong here still degrades to the fallback via the CLI wrapper.
+anything that goes wrong here is caught by the CLI wrapper. GRPO has no supervised
+target, so there is no minimal fine-tune for it: a GRPO failure with no trained
+checkpoint at the output path fails the task (non-zero exit, no artifact).
 """
 
 from __future__ import annotations
@@ -80,7 +82,7 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
         loaded.model, r=plan.lora_r, alpha=plan.lora_alpha, dropout=plan.lora_dropout
     )
 
-    save_adapter(model, tokenizer, spec.output_dir)  # floor before training
+    # No pre-training floor (owner decision 2026-10-05): nothing untrained is written to the output path.
 
     base_kwargs = build_training_kwargs(spec, plan)
     # GRPO requires the global batch to be divisible by num_generations.
@@ -154,4 +156,6 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     # Floor the OOM-retry batch at num_generations so a retry can't break TRL's
     # global-batch-divisible-by-num_generations requirement.
     safe_train(trainer, min_batch=_NUM_GENERATIONS)
+    if int(getattr(trainer.state, "global_step", 0) or 0) <= 0:
+        raise RuntimeError("GRPO trainer returned without an optimizer step")
     save_adapter(model, tokenizer, spec.output_dir)

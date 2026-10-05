@@ -63,8 +63,13 @@ def prepare(monkeypatch, tmp_path, model_type, *, n_rows=20000, long_rows=True):
 
     def unexpected_fallback(*args):
         observed["events"].append(("UNEXPECTED_FALLBACK", {}))
+        return {"steps": 1}
 
-    monkeypatch.setattr(fallback, "emit_untrained_copy", unexpected_fallback)
+    # v9.2: the CLI's crash path is the minimal fine-tune. The stubbed handlers write no artifact, so the output check
+    # is stubbed "trained" and any entry into the minimal fine-tune is recorded as unexpected.
+    monkeypatch.setattr(fallback, "run_mini_finetune", unexpected_fallback)
+    monkeypatch.setattr(fallback, "output_is_trained", lambda output_dir: True)
+    monkeypatch.setattr(fallback, "clear_output", lambda output_dir: None)
 
     def stop_v2(spec, deadline, rows, loaded_arg, tokenizer, **kw):
         observed["routes"].append({

@@ -182,12 +182,11 @@ _CHATML_TEMPLATE = _load_axolotl_template("chatml")
 def _degrade_unknown_chat_template(
     requested: str, tokenizer: Any, *, reason: str
 ) -> ChatTemplateResolution:
-    """Keep a newly named upstream template from flooring the whole task.
+    """Keep a newly named upstream template from failing the whole task.
 
     The pinned registry remains the parity path.  If G.O.D starts sending a name
     that this build does not yet bundle, tokenizer-native rendering is a safer
-    compatibility fallback than aborting after the untrained adapter floor has
-    already been written.  A model without a native template falls back once
+    compatibility fallback than aborting the task.  A model without a native template falls back once
     more to our pinned ChatML template so the task still trains, with telemetry
     making the parity degradation explicit in either case.
     """

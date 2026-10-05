@@ -462,15 +462,18 @@ def test_instruct_system_format_applied():
 
 
 def test_main_never_raises_on_malformed_dataset_type():
-    # The never-exit-nonzero guarantee: a broken --dataset-type must not raise
-    # out of main(); it degrades (here the fallback no-ops because no /cache).
+    # A broken --dataset-type must not raise out of main(). v9.2 (owner decision 2026-10-05): with no column schema
+    # and no /cache nothing can train, so the task fails honestly: non-zero exit code, no artifact.
     rc = cli.main([
         "--task-id", "t", "--model", "no/such-model", "--dataset", "s3://x",
         "--dataset-type", "{not valid json",
         "--task-type", "InstructTextTask", "--expected-repo-name", "r",
         "--hours-to-complete", "0.01",
     ])
-    assert rc == 0
+    assert rc == 1
+    import os
+
+    assert not os.path.exists("/app/checkpoints/t/r")
 
 
 # --- tokenization ----------------------------------------------------------

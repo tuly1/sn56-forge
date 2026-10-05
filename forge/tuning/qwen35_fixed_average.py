@@ -118,7 +118,7 @@ def eligible_route(
     ]
     if drift:
         # Anything short of the exact endpoint trains on the ordinary route. Raising here
-        # used to reach cli's handler fallback and submit an UNTRAINED copy: the validator
+        # would abandon the ordinary route for the CLI's crash handling: the validator
         # re-saves the config of every damaged ("augmented") base, so a damaged Qwen3.5-4B
         # loads as the exact class/shape while its payload hash differs.
         from forge import telemetry
