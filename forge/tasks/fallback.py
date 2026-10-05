@@ -166,9 +166,9 @@ def _run_mini_finetune(spec: TaskSpec, deadline: Deadline) -> dict[str, Any]:
     """The save reserve is BEST-EFFORT. Nothing here is preemptible: the load, the tokenization, one attempt (forward,
     backward, optimizer step, or an OOM / non-finite attempt), the verification and the save each run to the end once
     started. The first attempt is admitted with no timing at all, so it can start just before train_end and run past it.
-    Later attempts are admitted against the slowest attempt seen so far (of any kind), which is an estimate. A run that
-    overruns the reserve is killed by the validator before or during the save: nothing is uploaded and the task fails.
-    The receipt records load_s, first_attempt_s, slowest_attempt_s, train_end_margin_s, save_s and remaining_hard_s."""
+    Later attempts are admitted against the slowest attempt seen so far (of any kind), which is an estimate. An overrun
+    that still ends before the hard stop exports normally. Only a hard-stop kill before the adapter is promoted leaves
+    an empty output path (failed task); after promotion the trained adapter stays. The receipt records the clock facts."""
     from forge import telemetry
 
     if spec.task_type not in MINI_SUPPORTED_TASK_TYPES:
@@ -177,7 +177,7 @@ def _run_mini_finetune(spec: TaskSpec, deadline: Deadline) -> dict[str, Any]:
     if entry_remaining < MINI_MIN_ENTRY_S:
         raise MiniFinetuneError(f"only {entry_remaining:.0f}s of wall clock left (< {MINI_MIN_ENTRY_S:.0f}s)")
     # steps stop at the soft stop when it is still ahead (the export reserve stays whole); a handler that failed inside
-    # the export reserve leaves only the reserve itself, of which the adapter save keeps MINI_SAVE_RESERVE_S
+    # the export reserve leaves only the reserve itself, of which the adapter save aims to keep MINI_SAVE_RESERVE_S
     train_end = deadline.hard_stop - MINI_SAVE_RESERVE_S
     if deadline.remaining() > 0.0:
         train_end = min(train_end, deadline.soft_stop)

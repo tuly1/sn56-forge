@@ -218,11 +218,12 @@ def test_floor_best_export_and_non_sft_handlers_remain_unchanged():
         # dpo.py / grpo.py no longer write a pre-training adapter and raise on a zero-step trainer; pins refreshed.
         # v9.2 repair (2026-10-05, RESP-106 C2): fallback.py admits a further step against the slowest attempt of any
         # kind, records the clock facts in its receipt and states that the save reserve is best-effort; pin refreshed.
+        # v9.2 repair 2 (2026-10-05, RESP-111 C3): docstring / comment wording only (what an overrun leads to); pin refreshed.
         "forge/tasks/common.py": (
             "3f6491c522ec93f1ff0b8b88d51f513fa93a1b284227ee0fe5f2f7f3ec9f0a72"
         ),
         "forge/tasks/fallback.py": (
-            "a3e4ef2dbdc1b271ac7ff30011380b6ad7142fce70952c701aed51006bd19de8"
+            "5316b9a28b00ef9648d2837de319a302dce09ad0a8235db1d281ea0bb69ab4e8"
         ),
         "forge/tasks/dpo.py": (
             "ce7933d5810b5aa4a0709b03a3b641a9cbc340e405ea225b15d180a23931a0c8"
