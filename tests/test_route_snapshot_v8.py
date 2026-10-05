@@ -5,7 +5,7 @@ the production switches (no env) and with FORGE_V2_FULLFT_DEFAULT=0 (the cab930c
 (forge.tasks.instruct.run, via the tests/test_fullft_default_route_table.py harness) runs to the handler call. Each cell
 records the handler, the routing kwargs sft_v2.run receives and the recipe run() would apply
 (sft_v2.run_field_recipe: precision, LR multiplier, bucket). The committed baseline
-tests/data/route_snapshot_7024722.json.gz was generated from this harness on 7024722's routing (commit "v8 prep", which
+tests/data/route_snapshot_7024722.json (plain JSON, one cell per line) was generated from this harness on 7024722's routing (commit "v8 prep", which
 only extracts run_field_recipe). Its canonical sha256 is the route hash ROUTE_SHA_7024722.
 
 Each release-candidate-v8 change declares the cells it changes (CHANGES below, one entry per commit). The test FAILS if
@@ -16,7 +16,6 @@ Regenerate the baseline (only on 7024722 routing, i.e. with CHANGES empty):
 """
 from __future__ import annotations
 
-import gzip
 import hashlib
 import inspect
 import json
@@ -31,8 +30,8 @@ import test_fullft_default_route_table as rt  # noqa: E402  (the release route-t
 
 from forge.tasks import sft_v2  # noqa: E402
 
-BASELINE = Path(__file__).resolve().parent / "data" / "route_snapshot_7024722.json.gz"
-# canonical sha256 of the uncompressed baseline (json.dumps(sort_keys=True, separators=(",", ":")))
+BASELINE = Path(__file__).resolve().parent / "data" / "route_snapshot_7024722.json"
+# canonical sha256 of the baseline (json.dumps(sort_keys=True, separators=(",", ":")) of the parsed file)
 ROUTE_SHA_7024722 = "ebdc33e82e7d6e2d6e510a8b625fa1186fa63a49037bbf6f01fb2b4bf3f6a4b6"
 VERDICTS = ("clean", "damaged", "unknown")
 SWITCHES = (None, "0")  # production default; FORGE_V2_FULLFT_DEFAULT=0 (cab930c research switch)
@@ -109,8 +108,15 @@ def route_sha(snap: dict) -> str:
     return hashlib.sha256(canonical(snap)).hexdigest()
 
 
+def readable(snap: dict) -> bytes:
+    """Plain, readable baseline bytes: one cell per line, keys sorted. Parsing it and re-serialising with canonical()
+    gives the route hash, so the stored layout is free (v9.2, F5: no compressed file in the submitted tree)."""
+    lines = [json.dumps(k) + ":" + canonical(snap[k]).decode() for k in sorted(snap)]
+    return ("{\n" + ",\n".join(lines) + "\n}\n").encode()
+
+
 def load_baseline() -> dict[str, dict]:
-    return json.loads(gzip.decompress(BASELINE.read_bytes()))
+    return json.loads(BASELINE.read_text(encoding="utf-8"))
 
 
 ENTRY = {e["model"]: e for e in rt.POOL}
@@ -192,7 +198,7 @@ if __name__ == "__main__":
         assert not CHANGES, "the baseline is 7024722 routing: write it with no declared changes"
         snap = build_snapshot()
         BASELINE.parent.mkdir(parents=True, exist_ok=True)
-        BASELINE.write_bytes(gzip.compress(canonical(snap), mtime=0))
+        BASELINE.write_bytes(readable(snap))
         print(BASELINE, len(snap), route_sha(snap))
     else:
         snap = build_snapshot()

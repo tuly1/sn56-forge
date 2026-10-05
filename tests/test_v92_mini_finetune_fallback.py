@@ -533,3 +533,17 @@ def test_no_untrained_writer_is_left_in_the_training_path():
         assert "write_artifact_truth(spec.output_dir, ARTIFACT_FLOOR" not in body
         assert not re.search(r"(?<![a-z_])artifact_truth=ARTIFACT_FLOOR", body)
     assert "zero_progress_oom_ladder_exhausted" in text[root / "tasks" / "instruct.py"]
+
+
+# ---- F5: no packed file in the submitted tree --------------------------------------------------------------------------
+
+def test_no_compressed_or_binary_file_is_tracked():
+    import subprocess
+
+    root = Path(inspect.getfile(cli)).parent.parent
+    try:
+        listed = subprocess.run(["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True).stdout.split()
+    except Exception:
+        listed = [str(p.relative_to(root)) for p in root.rglob("*") if p.is_file() and ".git" not in p.parts]
+    packed = (".gz", ".zip", ".tar", ".tgz", ".bz2", ".xz", ".7z", ".pyc", ".pkl", ".bin", ".npy", ".pt", ".safetensors")
+    assert [name for name in listed if name.endswith(packed)] == []

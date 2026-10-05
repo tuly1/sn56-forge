@@ -12,7 +12,7 @@ cell for the v9 changes that act at run time or load time rather than in the dis
   hub_kernels_guard   forge.model.load_base runs disable_hub_kernels_offline before construction (process-level, every
                       cell that loads a base; behaviour differs only where Transformers reaches lazy_load_kernel).
 
-The committed baseline tests/data/route_snapshot_854bf7a.json.gz was generated with this file on 854bf7a (every rule
+The committed baseline tests/data/route_snapshot_854bf7a.json (plain JSON, one cell per line) was generated with this file on 854bf7a (every rule
 False). Each v9 commit declares the cells it changes in CHANGES; any other difference FAILS.
 
 Regenerate the baseline (only on 854bf7a, i.e. with CHANGES empty):
@@ -22,7 +22,6 @@ Write the delta table:
 """
 from __future__ import annotations
 
-import gzip
 import hashlib
 import json
 import sys
@@ -38,8 +37,8 @@ import test_route_snapshot_v8 as v8  # noqa: E402
 from forge import model as forge_model  # noqa: E402
 from forge.tasks import sft_v2  # noqa: E402
 
-BASELINE = Path(__file__).resolve().parent / "data" / "route_snapshot_854bf7a.json.gz"
-ROUTE_SHA_854BF7A = "06067b89ee444bb8894efd37ec567512507cd4b2f9672a98c4d3bd927111f58e"  # canonical sha256 of the uncompressed baseline
+BASELINE = Path(__file__).resolve().parent / "data" / "route_snapshot_854bf7a.json"
+ROUTE_SHA_854BF7A = "06067b89ee444bb8894efd37ec567512507cd4b2f9672a98c4d3bd927111f58e"  # canonical sha256 of the baseline
 RULE_KEYS = ("large_model_batch", "planner_fixes", "hub_kernels_guard")
 
 
@@ -88,7 +87,7 @@ ENTRY = v8.ENTRY
 
 
 def load_baseline() -> dict[str, dict]:
-    return json.loads(gzip.decompress(BASELINE.read_bytes()))
+    return json.loads(BASELINE.read_text(encoding="utf-8"))
 
 
 # ---- declared changes (one entry per release-candidate-v9 commit) -----------------------------------------------------
@@ -190,7 +189,7 @@ if __name__ == "__main__":
         assert not CHANGES, "the baseline is 854bf7a: write it with no declared changes"
         snap = build_snapshot()
         BASELINE.parent.mkdir(parents=True, exist_ok=True)
-        BASELINE.write_bytes(gzip.compress(canonical(snap), mtime=0))
+        BASELINE.write_bytes(v8.readable(snap))
         print(BASELINE, len(snap), route_sha(snap))
     elif "--delta" in sys.argv:
         out = Path(sys.argv[sys.argv.index("--delta") + 1])
