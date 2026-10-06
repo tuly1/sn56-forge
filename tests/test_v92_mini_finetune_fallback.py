@@ -381,6 +381,137 @@ def test_receipt_records_the_clock_facts(env, monkeypatch):
     assert 0.0 < done["first_attempt_s"] <= done["slowest_attempt_s"]
 
 
+# ---- Mamba hybrids (Falcon-H1): PEFT refuses LoRA on out_proj / conv1d (phase-bw S5, Falcon-H1-3B-Base: HONEST_FAIL) ----
+
+# tiiuae/Falcon-H1-0.5B-Base config.json (model_type falcon_h1; the multipliers, Mamba flags and head layout are the real
+# ones), with the widths, depth, vocabulary and context shrunk so that it trains on CPU in a second.
+FALCON_H1_05B = dict(
+    attention_bias=False, attention_dropout=0.0, attention_in_multiplier=1.0, attention_out_multiplier=0.9375,
+    embedding_multiplier=5.656854249492381, hidden_act="silu", initializer_range=0.02, key_multiplier=0.39062499999999994,
+    lm_head_multiplier=0.0390625, mamba_conv_bias=True, mamba_d_conv=4, mamba_expand=2, mamba_n_groups=1,
+    mamba_norm_before_gate=False, mamba_proj_bias=False, mamba_rms_norm=False, mamba_use_mlp=True, mlp_bias=False,
+    mlp_expansion_factor=8, projectors_bias=False, rms_norm_eps=1e-05, ssm_in_multiplier=1.25,
+    ssm_out_multiplier=0.23570226039551587, tie_word_embeddings=False, time_step_max=0.1, time_step_min=0.001, use_cache=False)
+FALCON_H1_SHRUNK = dict(hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                        head_dim=16, mamba_d_ssm=96, mamba_d_state=16, mamba_n_heads=6, mamba_d_head=16, mamba_chunk_size=16,
+                        vocab_size=VOCAB, max_position_embeddings=256, pad_token_id=0, bos_token_id=1, eos_token_id=2)
+
+
+def _make_falcon_base(base: Path) -> None:
+    """Replace the tiny Llama weights in `base` with a tiny random Falcon-H1 (the tokenizer files stay)."""
+    from transformers import FalconH1Config, FalconH1ForCausalLM
+
+    for f in base.glob("*.safetensors"):
+        f.unlink()
+    cfg = FalconH1Config(**FALCON_H1_05B, **FALCON_H1_SHRUNK)
+    cfg.architectures = ["FalconH1ForCausalLM"]
+    torch.manual_seed(0)
+    FalconH1ForCausalLM(cfg).save_pretrained(base)
+    assert json.loads((base / "config.json").read_text())["model_type"] == "falcon_h1"
+
+
+def _adapter_targets(e) -> set:
+    """Leaf names of the adapter's targets (PEFT stores 'all-linear' expanded to full module paths)."""
+    return {t.split(".")[-1] for t in json.loads((e.out / "adapter_config.json").read_text())["target_modules"]}
+
+
+def test_all_linear_lora_is_refused_on_falcon_h1_and_leaves_the_model_half_wrapped(env):
+    """The cause of the S5 failure, on the pinned PEFT: 37eece2..cd7e45f attached 'all-linear' and had no way out."""
+    from transformers import AutoModelForCausalLM
+
+    from forge.model import attach_lora
+
+    _make_falcon_base(env.base)
+    model = AutoModelForCausalLM.from_pretrained(str(env.base), dtype=torch.float32)
+    with pytest.raises(ValueError, match="incompatible with Mamba-based models"):
+        attach_lora(model, r=8, alpha=16, dropout=0.0)
+    assert any("lora_" in name for name, _ in model.named_modules())  # so the safe list must be chosen BEFORE attaching
+    names = fallback._linear_leaf_names(AutoModelForCausalLM.from_pretrained(str(env.base), dtype=torch.float32))
+    assert {"out_proj", "in_proj", "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"} <= set(names)
+
+
+def test_falcon_h1_handler_failure_trains_an_adapter_without_the_refused_layers(env, monkeypatch):
+    _make_falcon_base(env.base)
+    _fail_handler(monkeypatch)
+    assert env.run() == 0
+    done = assert_trained(env)  # steps >= 1, non-zero lora_B, merged logits differ, vendored model_is_a_finetune True
+    assert done["lora_targets"] == "safe-list:-out_proj" and done["steps"] == 24
+    targets = _adapter_targets(env)
+    assert targets == {"in_proj", "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+    assert not targets & {"out_proj", "conv1d", "lm_head"}
+    ev = _event("mini_finetune_lora_targets")
+    assert ev["how"] == "safe-list:-out_proj" and "out_proj" in ev["linear_leaf_names"]
+
+
+def test_falcon_h1_still_trains_when_peft_has_no_compatibility_helper(env, monkeypatch):
+    """The pinned table in fallback.py stands in when PEFT's private check is missing or renamed."""
+    import peft.tuners.tuners_utils as tu
+
+    monkeypatch.delattr(tu, "_check_lora_target_modules_mamba")
+    monkeypatch.setattr("peft.tuners.tuners_utils.BaseTuner._check_target_module_compatiblity", lambda *a, **k: None, raising=False)
+    _make_falcon_base(env.base)
+    _fail_handler(monkeypatch)
+    assert env.run() == 0
+    assert assert_trained(env)["lora_targets"] == "safe-list:-out_proj" and "out_proj" not in _adapter_targets(env)
+
+
+def test_non_mamba_models_attach_exactly_as_before(env, monkeypatch):
+    """Every other family: forge.model.attach_lora is called once with the same arguments; no safe list, no extra event."""
+    from forge import model as forge_model
+
+    _fail_handler(monkeypatch)
+    real, calls = forge_model.attach_lora, []
+
+    def spy(model, **kw):
+        calls.append(kw)
+        return real(model, **kw)
+
+    monkeypatch.setattr(forge_model, "attach_lora", spy)
+    assert env.run() == 0
+    done = assert_trained(env)
+    assert calls == [dict(r=fallback.MINI_LORA_R, alpha=fallback.MINI_LORA_ALPHA, dropout=0.0)]
+    assert done["lora_targets"] == "all-linear" and "mini_finetune_lora_targets" not in _events()
+    assert _adapter_targets(env) == {"q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+
+
+def test_an_unpredicted_incompatible_refusal_reloads_the_base_and_retries_without_the_named_layers(env, monkeypatch):
+    from forge import model as forge_model
+
+    _fail_handler(monkeypatch)
+    loads, real_load = [], forge_model.load_base
+
+    def counting_load(*a, **k):
+        loads.append(1)
+        return real_load(*a, **k)
+
+    def refusing(model, **kw):
+        raise ValueError("[PEFT:LORA] Module 'q_proj' is incompatible with Foo-based models. Incompatible modules: {'q_proj', 'zzz'}.")
+
+    monkeypatch.setattr(forge_model, "load_base", counting_load)
+    monkeypatch.setattr(forge_model, "attach_lora", refusing)
+    assert env.run() == 0
+    done = assert_trained(env)
+    assert done["lora_targets"] == "safe-list-reloaded:-q_proj" and len(loads) == 2
+    assert _adapter_targets(env) == {"k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
+
+
+@pytest.mark.parametrize("message", ["boom", "Module 'not_a_layer' is incompatible with X"])
+def test_any_other_attach_error_still_fails_honestly(env, monkeypatch, message):
+    from forge import model as forge_model
+
+    _fail_handler(monkeypatch)
+    monkeypatch.setattr(forge_model, "attach_lora", lambda model, **kw: (_ for _ in ()).throw(ValueError(message)))
+    assert_failed_clean(env, env.run())
+    assert message in _event("mini_finetune_failed")["error"]
+
+
+def test_no_lora_compatible_layer_fails_honestly(env, monkeypatch):
+    _fail_handler(monkeypatch)
+    monkeypatch.setattr(fallback, "_lora_incompatible_names", lambda model, names: list(names))
+    assert_failed_clean(env, env.run())
+    assert "no LoRA-compatible linear layer" in _event("mini_finetune_failed")["error"]
+
+
 # ---- the real instruct handler: every rung of the ladder fails --------------------------------------------------------
 
 def test_full_cheap_full_and_adapter_rungs_all_fail(env, monkeypatch):

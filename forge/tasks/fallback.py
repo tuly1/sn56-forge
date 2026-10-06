@@ -195,7 +195,7 @@ def _run_mini_finetune(spec: TaskSpec, deadline: Deadline) -> dict[str, Any]:
     loaded = load_base(spec.cached_model_dir, for_generation=False)
     tokenizer = loaded.tokenizer
     examples, seq_cap, objective = _examples(spec, tokenizer, loaded.model)
-    model = attach_lora(loaded.model, r=MINI_LORA_R, alpha=MINI_LORA_ALPHA, dropout=0.0)
+    model, lora_targets = _attach_mini_lora(spec, loaded, attach_lora, load_base)  # all-linear, or a safe list (Mamba)
     loaded.model = None
     load_s = time.monotonic() - t_load
     if time.monotonic() >= train_end:
@@ -292,7 +292,7 @@ def _run_mini_finetune(spec: TaskSpec, deadline: Deadline) -> dict[str, Any]:
         raise MiniFinetuneError("the saved adapter failed validation")
     receipt = dict(steps=steps, skipped_nonfinite=skipped, first_loss=round(losses[0], 5),
                    last_loss=round(losses[-1], 5), mean_loss=round(sum(losses) / len(losses), 5),
-                   seq_cap=seq_cap, objective=objective, lora_r=MINI_LORA_R, lr=MINI_LR,
+                   seq_cap=seq_cap, objective=objective, lora_r=MINI_LORA_R, lr=MINI_LR, lora_targets=lora_targets,
                    load_s=round(load_s, 1), first_attempt_s=round(first_attempt_s or 0.0, 3),
                    slowest_attempt_s=round(slowest_s, 3), train_end_margin_s=round(train_end_margin_s, 1),
                    save_s=round(time.monotonic() - t_save, 2), save_reserve_s=MINI_SAVE_RESERVE_S,
@@ -300,6 +300,97 @@ def _run_mini_finetune(spec: TaskSpec, deadline: Deadline) -> dict[str, Any]:
     telemetry.event("mini_finetune_done", **receipt)
     telemetry.write_into(spec.output_dir)
     return receipt
+
+
+_MAMBA_MODEL_TYPES = ("falcon_h1", "mamba", "mamba2", "falcon_mamba")  # PEFT 0.19.1 _check_lora_target_modules_mamba
+_MAMBA_LORA_INCOMPATIBLE = ("out_proj", "conv1d")
+_LORA_HEADS = ("lm_head", "score")
+
+
+def _linear_leaf_names(model: Any) -> list[str]:
+    import torch
+
+    return sorted({name.split(".")[-1] for name, module in model.named_modules()
+                   if isinstance(module, torch.nn.Linear) and name.split(".")[-1] not in _LORA_HEADS})
+
+
+def _lora_incompatible_names(model: Any, names: list[str]) -> list[str]:
+    """Linear leaf names PEFT refuses as LoRA targets on this architecture (Mamba hybrids: out_proj, conv1d).
+
+    PEFT's own check is asked first; the pinned table above covers a PEFT build without that helper."""
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    banned = {n for n in names if model_type in _MAMBA_MODEL_TYPES and n in _MAMBA_LORA_INCOMPATIBLE}
+    try:
+        from peft import LoraConfig
+        from peft.tuners.tuners_utils import _check_lora_target_modules_mamba as check
+
+        probe = LoraConfig(r=MINI_LORA_R, lora_alpha=MINI_LORA_ALPHA, task_type="CAUSAL_LM", target_modules=["probe"])
+        for n in names:
+            try:
+                check(probe, model, n)
+            except ValueError:
+                banned.add(n)
+    except Exception:  # noqa: BLE001 - helper absent or changed: the pinned table stands
+        pass
+    return sorted(banned)
+
+
+def _names_in_error(exc: BaseException) -> set[str]:
+    """Module names a PEFT 'incompatible' error mentions (quoted identifiers), for an architecture the table misses."""
+    import re
+
+    text = str(exc)
+    return set(re.findall(r"'([A-Za-z_][A-Za-z0-9_]*)'", text)) if "ncompatible" in text else set()
+
+
+def _attach_listed_lora(model: Any, names: list[str]) -> Any:
+    """LoRA on exactly these linear leaf names (same rank / alpha / no dropout / no bias as forge.model.attach_lora)."""
+    from peft import LoraConfig, get_peft_model
+
+    if not names:
+        raise MiniFinetuneError("no LoRA-compatible linear layer on this architecture")
+    peft_model = get_peft_model(model, LoraConfig(r=MINI_LORA_R, lora_alpha=MINI_LORA_ALPHA, lora_dropout=0.0, bias="none",
+                                                  task_type="CAUSAL_LM", target_modules=list(names)))
+    if sum(int(p.numel()) for p in peft_model.parameters() if getattr(p, "requires_grad", False)) <= 0:
+        raise MiniFinetuneError("LoRA attachment produced no trainable parameters")
+    if hasattr(peft_model, "enable_input_require_grads"):
+        peft_model.enable_input_require_grads()
+    return peft_model
+
+
+def _attach_mini_lora(spec: TaskSpec, loaded: Any, attach_lora: Any, load_base: Any) -> tuple[Any, str]:
+    """Attach the mini fine-tune's adapter. Returns (peft model, how the targets were chosen).
+
+    * No linear layer PEFT refuses (every non-Mamba family): forge.model.attach_lora, exactly as before -> "all-linear".
+    * PEFT refuses some linear leaf names on this architecture (Falcon-H1 and other Mamba hybrids: out_proj, conv1d): the
+      adapter targets every other linear layer (attention and MLP projections, the Mamba in_proj), chosen BEFORE the first
+      attach, because a refused attach leaves half-injected LoRA layers in the model -> "safe-list:-out_proj".
+    * An 'incompatible' refusal the table did not predict: the base is loaded again (clean) and the adapter targets the
+      linear layers the error does not name -> "safe-list-reloaded:-<names>". Any other error propagates (the task fails).
+    The steps, the verification (weights changed, finite) and the export are the same in all three cases."""
+    from forge import telemetry
+
+    names = _linear_leaf_names(loaded.model)
+    banned = _lora_incompatible_names(loaded.model, names)
+    if banned:
+        how = "safe-list:-" + ",-".join(banned)
+        model = _attach_listed_lora(loaded.model, [n for n in names if n not in banned])
+    else:
+        try:
+            return attach_lora(loaded.model, r=MINI_LORA_R, alpha=MINI_LORA_ALPHA, dropout=0.0), "all-linear"
+        except ValueError as exc:
+            refused = sorted(_names_in_error(exc) & set(names))
+            if not refused:
+                raise
+            from forge.tasks.common import _free_cuda
+
+            loaded.model = None
+            _free_cuda()
+            how = "safe-list-reloaded:-" + ",-".join(refused)
+            model = _attach_listed_lora(load_base(spec.cached_model_dir, for_generation=False).model,
+                                        [n for n in names if n not in refused])
+    telemetry.event("mini_finetune_lora_targets", how=how, linear_leaf_names=names)
+    return model, how
 
 
 def _has_weights(path: str) -> bool:
