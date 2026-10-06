@@ -477,12 +477,19 @@ def test_non_mamba_models_attach_exactly_as_before(env, monkeypatch):
 def test_an_unpredicted_incompatible_refusal_reloads_the_base_and_retries_without_the_named_layers(env, monkeypatch):
     from forge import model as forge_model
 
+    import weakref
+
     _fail_handler(monkeypatch)
-    loads, real_load = [], forge_model.load_base
+    loads, real_load, first = [], forge_model.load_base, []
 
     def counting_load(*a, **k):
         loads.append(1)
-        return real_load(*a, **k)
+        if first:  # RESP-120 C1: the reload must start only after the first model is gone (no double residency)
+            assert first[0]() is None, "the refused model is still alive when the base is loaded again"
+        out = real_load(*a, **k)
+        if not first:
+            first.append(weakref.ref(out.model))
+        return out
 
     def refusing(model, **kw):
         raise ValueError("[PEFT:LORA] Module 'q_proj' is incompatible with Foo-based models. Incompatible modules: {'q_proj', 'zzz'}.")
@@ -492,6 +499,7 @@ def test_an_unpredicted_incompatible_refusal_reloads_the_base_and_retries_withou
     assert env.run() == 0
     done = assert_trained(env)
     assert done["lora_targets"] == "safe-list-reloaded:-q_proj" and len(loads) == 2
+    assert first and first[0]() is None
     assert _adapter_targets(env) == {"k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"}
 
 

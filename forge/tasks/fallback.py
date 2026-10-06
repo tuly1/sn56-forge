@@ -365,8 +365,9 @@ def _attach_mini_lora(spec: TaskSpec, loaded: Any, attach_lora: Any, load_base: 
     * PEFT refuses some linear leaf names on this architecture (Falcon-H1 and other Mamba hybrids: out_proj, conv1d): the
       adapter targets every other linear layer (attention and MLP projections, the Mamba in_proj), chosen BEFORE the first
       attach, because a refused attach leaves half-injected LoRA layers in the model -> "safe-list:-out_proj".
-    * An 'incompatible' refusal the table did not predict: the base is loaded again (clean) and the adapter targets the
-      linear layers the error does not name -> "safe-list-reloaded:-<names>". Any other error propagates (the task fails).
+    * An 'incompatible' refusal the table did not predict: the refused model is released first, then the base is loaded
+      again (clean) and the adapter targets the linear layers the error does not name -> "safe-list-reloaded:-<names>".
+      Any other error propagates (the task fails).
     The steps, the verification (weights changed, finite) and the export are the same in all three cases."""
     from forge import telemetry
 
@@ -379,16 +380,21 @@ def _attach_mini_lora(spec: TaskSpec, loaded: Any, attach_lora: Any, load_base: 
         try:
             return attach_lora(loaded.model, r=MINI_LORA_R, alpha=MINI_LORA_ALPHA, dropout=0.0), "all-linear"
         except ValueError as exc:
-            refused = sorted(_names_in_error(exc) & set(names))
+            refused = sorted(_names_in_error(exc) & set(names))  # names only: nothing here may keep the model alive
             if not refused:
                 raise
-            from forge.tasks.common import _free_cuda
+        # Outside the handler on purpose: inside it the traceback holds the failed attach frame and with it the model, so
+        # the old weights could not be freed before the second load (two models resident at once).
+        import gc
 
-            loaded.model = None
-            _free_cuda()
-            how = "safe-list-reloaded:-" + ",-".join(refused)
-            model = _attach_listed_lora(load_base(spec.cached_model_dir, for_generation=False).model,
-                                        [n for n in names if n not in refused])
+        from forge.tasks.common import _free_cuda
+
+        loaded.model = None
+        gc.collect()  # the refused attach leaves reference cycles (half-built PEFT wrappers) around the old model
+        _free_cuda()
+        how = "safe-list-reloaded:-" + ",-".join(refused)
+        model = _attach_listed_lora(load_base(spec.cached_model_dir, for_generation=False).model,
+                                    [n for n in names if n not in refused])
     telemetry.event("mini_finetune_lora_targets", how=how, linear_leaf_names=names)
     return model, how
 

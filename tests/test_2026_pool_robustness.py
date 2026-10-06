@@ -221,11 +221,13 @@ def test_floor_best_export_and_non_sft_handlers_remain_unchanged():
         # v9.2 repair 2 (2026-10-05, RESP-111 C3): docstring / comment wording only (what an overrun leads to); pin refreshed.
         # v9.2 repair 3 (2026-10-05, phase-bw S5): the minimal fine-tune leaves out the linear layers PEFT refuses on
         # Mamba hybrids (Falcon-H1: out_proj); every other family attaches through forge.model.attach_lora as before.
+        # v9.2 repair 4 (2026-10-06, RESP-120 C1): the unpredicted-refusal reload runs outside the except block, after
+        # the refused model is released (no two models resident at once).
         "forge/tasks/common.py": (
             "3f6491c522ec93f1ff0b8b88d51f513fa93a1b284227ee0fe5f2f7f3ec9f0a72"
         ),
         "forge/tasks/fallback.py": (
-            "af15c9297b2f4228401332de014b9a5f1874a16a0499c7f1861ec60af00aa198"
+            "5b42c0037fd53ac7fceff5d4f69d2d27da92373e98feb809b28779e498f7b393"
         ),
         "forge/tasks/dpo.py": (
             "ce7933d5810b5aa4a0709b03a3b641a9cbc340e405ea225b15d180a23931a0c8"
