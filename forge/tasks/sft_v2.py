@@ -2860,7 +2860,9 @@ def run(
     if final_step <= 0:
         return
     final_state = chosen_state if chosen_state is not None else selection.snapshot_trainable(model)
-    ok = persist(model, final_state, chosen_step or final_step, truth, "sft_v2_final")
+    # run S labels its one save with its generation marker: the selector reads it back to know which run is exported
+    ok = persist(model, final_state, chosen_step or final_step, truth,
+                 "sft_v2_final" if geometry_select is None else geometry_select.truth_reason)
     if not ok and not trained_artifact_present(spec):
         # D5: trained weights exist but nothing trained reached the output (the output path is empty). Raise on every
         # route so the dispatcher's ladder retries (cheap full FT, then the adapter) or the CLI's minimal fine-tune runs.

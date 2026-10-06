@@ -138,6 +138,11 @@ def test_dev_fingerprint_depends_on_rows_and_order():
     assert len(fp) == 64 and fp == gs.dev_fingerprint(copy.deepcopy(rows))
     assert fp != gs.dev_fingerprint(rows[::-1]) and fp != gs.dev_fingerprint(rows[:1])
     assert fp != gs.dev_fingerprint([dict(input_ids=[1, 2]), dict(input_ids=[3, 4, 5])])   # same tokens, other row cut
+    # the label mask decides which tokens the loss counts: same ids with another mask is another DEV
+    a = [dict(input_ids=[1, 2, 3], labels=[-100, 2, 3])]
+    assert gs.dev_fingerprint(a) == gs.dev_fingerprint(copy.deepcopy(a))
+    assert gs.dev_fingerprint(a) != gs.dev_fingerprint([dict(input_ids=[1, 2, 3], labels=[-100, -100, 3])])
+    assert gs.dev_fingerprint(a) != gs.dev_fingerprint([dict(input_ids=[1, 2, 3])])
 
 
 # ---- (c) the time gates on receipt numbers -----------------------------------------------------------------------------
@@ -257,6 +262,16 @@ def rows(n):
     return out
 
 
+class Tok:
+    pad_token_id = 0
+
+    def save_pretrained(self, d):
+        import os
+
+        with open(os.path.join(d, "tokenizer.json"), "w") as fh:
+            fh.write("{}")
+
+
 class Harness:
     """sft_v2.run on CPU with the real geometry code; the trainer is a recorder that completes its plan in 3 steps."""
 
@@ -294,7 +309,15 @@ class Harness:
             monkeypatch.setattr(sft_v2.telemetry, name, lambda *a, **k: None)
         monkeypatch.setattr(sft_v2.telemetry, "make_trainer_callback", lambda *a: object())
         monkeypatch.setattr(sft_v2, "write_artifact_truth", lambda *a, **k: None)
-        monkeypatch.setattr(sft_v2, "save_adapter", lambda m, tok, out, **k: h.saves.append(k.get("truth_reason")))
+        from forge.tasks import common
+
+        real_save = common.save_adapter                      # the REAL staged / validated / exchanged save, on disk
+
+        def recording_save(m, tok, out, **k):
+            h.saves.append(k.get("truth_reason"))
+            return real_save(m, tok, out, **k)
+
+        monkeypatch.setattr(sft_v2, "save_adapter", recording_save)
         monkeypatch.setattr(selection, "per_example_dev_loss", lambda model, rs, collator, **kw: (h.dev_loss["value"], []))
         monkeypatch.setattr(selection, "available_ram", lambda: 10 ** 12)
         monkeypatch.setattr(sft_v2.lr_probe, "measure_step_time", lambda model, batches, **kw: (0.01, [1.0]))
@@ -340,7 +363,7 @@ class Harness:
 
     def run(self, *, deadline=None, model=None, **kw):
         loaded = NS(model=model if model is not None else tiny_llama())
-        sft_v2.run(self.spec, deadline or self.deadline(), self.source, loaded, NS(pad_token_id=0), **self.kwargs, **kw)
+        sft_v2.run(self.spec, deadline or self.deadline(), self.source, loaded, Tok(), **self.kwargs, **kw)
         assert loaded.model is None
 
 
@@ -350,10 +373,13 @@ def test_run_a_records_what_the_selector_needs_and_trains_as_before(monkeypatch,
     h = Harness(monkeypatch, tmp_path / "armed")
     first: dict = {}
     h.run(result=first)
-    # same geometry, LR, trainer arguments and saves as the call without a result dict (= 9504136)
+    # same geometry, LR, trainer arguments and saves as the call without a result dict (= 9504136); not a claim of equal
+    # wall-clock behaviour: anything the run decides from measured seconds can differ between two executions
     assert h.trainers == plain.trainers and h.saves == plain.saves and h.meta == plain.meta
     strip = lambda evs: [(n, {k: v for k, v in d.items() if not k.endswith("_s") and k not in ("eval_s", "available_ram")
-                              and not k.startswith("cgroup")}) for n, d in evs if n != "sft_v2_dev_fingerprint"]  # noqa: E731
+                              and not k.startswith("cgroup")}) for n, d in evs
+                         if n not in ("sft_v2_dev_fingerprint", "sft_v2_eval_governor", "sft_v2_eval_governor_slack")]  # noqa: E731
+    # (the eval governor fires from measured eval / save seconds: clock-dependent, not a training difference)
     assert [n for n, _ in strip(h.events)] == [n for n, _ in strip(plain.events)]
     assert plain.ev("sft_v2_dev_fingerprint") == [] and len(h.ev("sft_v2_dev_fingerprint")) == 1
     assert first["completed"] and first["saved"] and first["field"] and first["strategy"] == "full"
@@ -394,7 +420,9 @@ def test_run_s_trains_at_about_32_rows_on_the_same_dev_rows_and_saves_only_after
     cmp_ = h.ev("sft_v2_geometry_select_compare")[0]
     assert (cmp_["first_dev"], cmp_["second_dev"], cmp_["margin"]) == (1.0, 0.9, 0.005)
     assert sel.record["pick"] == "S" and sel.defer_persist is False
-    assert h.saves == saves_a + ["sft_v2_final"]                      # exactly one save by run S: its final one
+    assert h.saves == saves_a + [sel.truth_reason]                    # exactly one save by run S: its final one, with its marker
+    assert sel.truth_reason.startswith(gs.GENERATION_PREFIX) and len(sel.nonce) == 16
+    assert gs.read_export(h.spec.output_dir)["reason"] == sel.truth_reason
     assert res["completed"] and res["saved"] and res["rows_per_step"] == 32
 
 
@@ -481,7 +509,7 @@ def orchestrate(h, first, *, deadline=None, run_fn=None, load_base=None, present
 
     def default_load(path, **kw):
         loads.append(path)
-        return NS(model=tiny_llama(), tokenizer=NS(pad_token_id=0))
+        return NS(model=tiny_llama(), tokenizer=Tok())
 
     tele = tele or Tele()
     rec = gs.maybe_second_run(h.spec, deadline or h.deadline(), h.source, first=first, run_kwargs=h.kwargs,
@@ -500,7 +528,9 @@ def test_second_run_wins_and_replaces_the_artifact(monkeypatch, tmp_path):
     assert (rec["first_dev"], rec["second_dev"], rec["margin"], rec["internal_rel_pct"]) == (1.0, 0.95, 0.005, -5.0)
     assert rec["time_gate_stage1"]["fits"] and rec["time_gate_stage2"]["fits"] and rec["alternate"]["rows_per_step"] == 32
     assert rec["second_rows_per_step"] == 32 and rec["first_rows_per_step"] == 192 and rec["dev_fingerprint"] == first["dev_fingerprint"]
-    assert h.saves[-1] == "sft_v2_final" and h.saves.count("sft_v2_final") == 2
+    assert h.saves[-1] == rec["second_marker"] and h.saves[-1].startswith(gs.GENERATION_PREFIX) and h.saves.count("sft_v2_final") == 1
+    assert rec["exported_generation"] == "S" and rec["final_export"]["reason"] == rec["second_marker"]
+    assert rec["first_export"]["reason"] == "sft_v2_final" and len(rec["final_export"]["weights_sha256"]) == 64
     assert tele.meta[gs.META_KEY]["pick"] == "S" and tele.restored == [] and tele.written[-1] == h.spec.output_dir
     assert h.ev("sft_v2_geometry_select")[-1]["pick"] == "S" and rec["seconds"] >= 0
 
@@ -513,6 +543,7 @@ def test_second_run_loses_and_the_first_artifact_stays(monkeypatch, tmp_path):
     rec, loads, tele = orchestrate(h, first)
     assert rec["ran"] and rec["pick"] == "A" and rec["reason"] == "second_not_lower_by_margin"
     assert rec["second_dev"] == 1.04 and rec["internal_rel_pct"] == 4.0 and h.saves == saves_a
+    assert rec["exported_generation"] == "A" and rec["final_export"] == rec["first_export"] and rec["final_export"]["reason"] == "sft_v2_final"
     assert tele.snaps == 1 and len(tele.restored) == 1 and tele.meta[gs.META_KEY]["pick"] == "A"
 
 
@@ -641,7 +672,7 @@ def test_the_first_model_is_released_before_the_base_is_loaded_again(monkeypatch
         alive_at_reload.append(ref_a() is not None)
         m = tiny_llama()
         second_refs.append(weakref.ref(m))
-        return NS(model=m, tokenizer=NS(pad_token_id=0))
+        return NS(model=m, tokenizer=Tok())
 
     h.dev_loss["value"] = 1.2
     rec, _, _ = orchestrate(h, first, load_base=load)
@@ -678,6 +709,164 @@ def test_the_first_model_is_released_even_when_it_sits_in_a_reference_cycle(monk
         if was_enabled:
             gc.enable()
     assert alive == [False]
+
+
+# ---- (f2) the commit boundary of run S's save (Codex RESP-135-1 B1): the record follows the DISK ----------------------
+
+def linux_exchange(monkeypatch, faults):
+    """common._rename_exchange as on Linux (the two directory names swap in one step; macOS has no renameat2), with fault
+    injection around the commit point. faults: {"before": exc} raises instead of exchanging; {"fsync": exc} raises from the
+    first parent fsync AFTER the exchange; {"cleanup": exc} raises when the prior generation is removed after it."""
+    import os
+
+    from forge.tasks import common
+
+    state = {"armed": False, "exchanged": False}
+    real_fsync, real_rmtree = common._fsync_dir, common._rmtree
+
+    def exchange(left, right):
+        if state["armed"] and "before" in faults:
+            raise faults["before"]
+        os.rename(right, right + ".swap"); os.rename(left, right); os.rename(right + ".swap", left)
+        state["exchanged"] = state["armed"]
+
+    def fsync_dir(path):
+        if state["exchanged"] and "fsync" in faults and not state.get("fsync_done"):
+            state["fsync_done"] = True
+            raise faults["fsync"]
+        return real_fsync(path)
+
+    def rmtree(path):
+        if state["exchanged"] and "cleanup" in faults and path.endswith(".tmp") and not state.get("cleanup_done"):
+            state["cleanup_done"] = True
+            raise faults["cleanup"]
+        return real_rmtree(path)
+
+    monkeypatch.setattr(common, "_rename_exchange", exchange)
+    monkeypatch.setattr(common, "_fsync_dir", fsync_dir)
+    monkeypatch.setattr(common, "_rmtree", rmtree)
+    return state
+
+
+def io_error():
+    import errno
+
+    return OSError(errno.EIO, "injected")
+
+
+def no_space():
+    import errno
+
+    return OSError(errno.ENOSPC, "injected")
+
+
+def boundary(monkeypatch, tmp_path, faults, *, exchange=True):
+    h = Harness(monkeypatch, tmp_path)
+    state = linux_exchange(monkeypatch, faults) if exchange else None
+    first = run_a(h)
+    a_export = gs.read_export(h.spec.output_dir)
+    assert a_export["reason"] == "sft_v2_final"
+    h.dev_loss["value"] = 0.9                                         # run S wins the comparison and goes on to its save
+    if state is not None:
+        state["armed"] = True
+    rec, _, tele = orchestrate(h, first)
+    return h, rec, tele, a_export, gs.read_export(h.spec.output_dir)
+
+
+@pytest.mark.parametrize("fault", [io_error, no_space, KeyboardInterrupt, lambda: SystemExit(1)])
+def test_a_fault_before_the_exchange_leaves_run_a_exported_and_the_record_says_a(monkeypatch, tmp_path, fault):
+    h, rec, tele, a_export, on_disk = boundary(monkeypatch, tmp_path, {"before": fault()})
+    assert on_disk == a_export and rec["exported_generation"] == "A" and rec["pick"] == "A"
+    assert rec["reason"] in ("second_save_failed", "second_run_failed") and len(tele.restored) == 1
+    assert rec["final_export"] == a_export == rec["first_export"]
+
+
+@pytest.mark.parametrize("fault", [io_error, no_space, KeyboardInterrupt, lambda: SystemExit(1)])
+def test_a_fault_between_the_exchange_and_the_fsync_leaves_run_s_exported_and_the_record_says_s(monkeypatch, tmp_path, fault):
+    """The RESP-135-1 reproduction: the save reports failure (or an interrupt lands) AFTER the commit point."""
+    h, rec, tele, a_export, on_disk = boundary(monkeypatch, tmp_path, {"fsync": fault()})
+    assert on_disk["reason"] == rec["second_marker"] and on_disk["reason"].startswith(gs.GENERATION_PREFIX)
+    assert rec["exported_generation"] == "S" and rec["pick"] == "S" and rec["reason"] == "second_committed_despite_error"
+    assert rec["second_outcome"] in ("second_save_failed", "second_run_failed")
+    assert tele.restored == [] and tele.meta[gs.META_KEY]["pick"] == "S"         # telemetry describes the exported run S
+    assert rec["final_export"] == on_disk and rec["first_export"] == a_export
+    assert h.ev("sft_v2_geometry_select")[-1]["exported_generation"] == "S"
+
+
+@pytest.mark.parametrize("fault", [io_error, KeyboardInterrupt])
+def test_a_fault_after_the_exchange_during_cleanup_still_reports_run_s(monkeypatch, tmp_path, fault):
+    h, rec, tele, a_export, on_disk = boundary(monkeypatch, tmp_path, {"cleanup": fault()})
+    assert on_disk["reason"] == rec["second_marker"] and rec["pick"] == "S" and rec["exported_generation"] == "S"
+    assert tele.restored == []
+
+
+def test_no_fault_with_the_exchange_reports_run_s_kept(monkeypatch, tmp_path):
+    h, rec, tele, a_export, on_disk = boundary(monkeypatch, tmp_path, {})
+    assert rec["pick"] == "S" and rec["reason"] == "second_kept" and on_disk["reason"] == rec["second_marker"]
+
+
+def test_portable_rename_path_rolls_back_before_its_commit_and_reports_what_is_on_disk(monkeypatch, tmp_path):
+    """Without renameat2 (macOS; the default here): final -> .old, staged -> final. A failure of the second rename is rolled
+    back by save_adapter, so run A is exported; a failure of the fsync after it leaves run S exported."""
+    import os
+
+    from forge.tasks import common
+
+    h = Harness(monkeypatch, tmp_path)
+    first = run_a(h)
+    a_export = gs.read_export(h.spec.output_dir)
+    h.dev_loss["value"] = 0.9
+    real_replace, n = os.replace, {"calls": 0}
+
+    def replace(src, dst):
+        if str(src).endswith(".tmp") and str(dst) == h.spec.output_dir:
+            n["calls"] += 1
+            raise io_error()
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(common.os, "replace", replace)
+    rec, _, tele = orchestrate(h, first)
+    monkeypatch.setattr(common.os, "replace", real_replace)
+    assert n["calls"] == 1 and rec["pick"] == "A" and rec["exported_generation"] == "A"
+    assert gs.read_export(h.spec.output_dir) == a_export and len(tele.restored) == 1
+
+
+def test_an_unreadable_export_after_the_second_run_is_reported_unknown_not_guessed(monkeypatch, tmp_path):
+    import os
+
+    h = Harness(monkeypatch, tmp_path)
+    first = run_a(h)
+
+    def run_that_destroys_the_truth_file(spec, deadline, rows_, loaded, tokenizer, **kw):
+        os.unlink(os.path.join(spec.output_dir, gs.TRUTH_FILE))
+        raise RuntimeError("boom")
+
+    rec, _, tele = orchestrate(h, first, run_fn=run_that_destroys_the_truth_file)
+    assert rec["pick"] == "UNKNOWN" and rec["exported_generation"] == "UNKNOWN" and rec["reason"] == "exported_generation_unknown"
+    assert tele.restored == [] and rec["final_export"]["readable"] is False
+
+
+def test_changed_weights_under_run_a_truth_are_unknown_and_a_foreign_marker_is_not_s(tmp_path):
+    a = {"readable": True, "truth": "COMPLETE_BEST", "optimizer_step": 3, "reason": "sft_v2_final", "weight_files": ["model.safetensors"],
+         "weight_bytes": 10, "weights_sha256": "a" * 64}
+    mine = gs.GENERATION_PREFIX + "0123456789abcdef"
+    assert gs.generation_of(dict(a), second_reason=mine, first_export=a) == "A"
+    assert gs.generation_of(dict(a, weights_sha256="b" * 64), second_reason=mine, first_export=a) == "UNKNOWN"
+    assert gs.generation_of(dict(a, optimizer_step=4), second_reason=mine, first_export=a) == "UNKNOWN"
+    assert gs.generation_of(dict(a, reason=mine), second_reason=mine, first_export=a) == "S"
+    assert gs.generation_of(dict(a, reason=gs.GENERATION_PREFIX + "f" * 16), second_reason=mine, first_export=a) == "UNKNOWN"
+    assert gs.generation_of({"readable": False}, second_reason=mine, first_export=a) == "UNKNOWN"
+    assert gs.read_export(str(tmp_path / "missing"))["readable"] is False
+
+
+def test_no_second_run_when_the_first_export_cannot_be_read_back(monkeypatch, tmp_path):
+    import os
+
+    h = Harness(monkeypatch, tmp_path)
+    first = run_a(h)
+    os.unlink(os.path.join(h.spec.output_dir, gs.TRUTH_FILE))
+    rec, loads, _ = orchestrate(h, first)
+    assert loads == [] and rec["reason"] == "first_export_unreadable" and rec["pick"] == "A" and not rec["ran"]
 
 
 def test_real_telemetry_snapshot_and_restore():

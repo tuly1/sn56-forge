@@ -4,8 +4,15 @@
 dev pass, export; the artifact is on disk and complete). Only then, and only when the measured time says a second training
 fits, the base is loaded again and trained once more at about 32 rows per optimizer step (run S: the same code path the
 research knob FORGE_V2_FIELD_EFF_BATCH drives). Run S replaces run A's artifact only when its INTERNAL DEV loss (the same
-400 or so rows carved from TRAIN, verified by a fingerprint) is lower by at least MARGIN. Anything else keeps run A:
-no time, a refusal, a crash, an OOM, a timeout, a lost comparison, a failed save.
+400 or so rows carved from TRAIN, verified by a fingerprint) is lower by at least MARGIN. A refusal, no time, a crash, an
+OOM, a timeout or a lost comparison happen BEFORE run S writes anything, so run A stays.
+
+Which run is exported is read back from disk, never inferred from a return value (Codex RESP-135-1 B1). Run S saves once,
+through common.save_adapter: staged directory, validated, fsynced, ready marker, then ONE directory exchange / rename.
+That exchange is the commit point. Run S's truth file carries a per-run generation marker (SecondRun.truth_reason).
+After run S ends, however it ends, read_export() reads the truth file at the output path: the marker of this run = the
+export is run S's (even when a later fsync failed or an interrupt arrived); run A's recorded truth and weight hash = the
+export is run A's; anything else = UNKNOWN and is reported as such. The decision record and the telemetry follow that.
 
 Why (research/20261006-small-batch-separator/REPORT.md): always-S blew up on Qwen2.5-0.5B-I indic (+3.9 % DEV, board rank
 7 -> 14 of 16) while it gained 2.7 to 6.1 % on three other sub-1B cells. No start-of-run observable separates them. On the
@@ -50,6 +57,9 @@ MIN_REMAINING_S = 900.0          # = sft_v2.CHEAP_FULL_MIN_REMAINING_S: a reload
 MIN_DEV_ROWS = 200               # below this an internal DEV difference of 0.5 % is not read
 MIN_ROWS_RATIO = 1.5             # run A must take at least 1.5 x TARGET_ROWS rows per step, else there is no alternate
 BATCH_ENVS = ("FORGE_V2_FIELD_EFF_BATCH", "FORGE_V2_EFF_BATCH", "FORGE_V2_FIELD_PACKED_EFF_BATCH")
+GENERATION_PREFIX = "sft_v2_final+geometry_select_S:"   # + a per-run nonce: the truth_reason of an export written by run S
+TRUTH_FILE = "forge_artifact_truth.json"
+WEIGHT_SUFFIXES = (".safetensors", ".bin")
 META_KEY = "geometry_select"     # the decision record in forge_run.json meta (events are capped at 200 per run)
 
 
@@ -99,14 +109,58 @@ def armed(*, field_route: bool, strategy: str | None, rung: str = "full") -> boo
 
 
 def dev_fingerprint(dev_rows: list) -> str:
-    """sha256 over the DEV rows' token ids, in order. Equal fingerprints = the two runs were compared on the same rows."""
+    """sha256 over the DEV rows in order: token ids AND labels (the label mask decides which tokens the DEV loss counts).
+    Equal fingerprints = the two runs were scored on the same rows with the same loss positions."""
     h = hashlib.sha256()
     h.update(str(len(dev_rows)).encode())
     for ex in dev_rows:
         ids = ex["input_ids"] if isinstance(ex, dict) else ex
+        labels = ex.get("labels") if isinstance(ex, dict) else None
         h.update(b"|")
         h.update(",".join(str(int(t)) for t in ids).encode())
+        h.update(b"#")
+        h.update(b"none" if labels is None else ",".join(str(int(t)) for t in labels).encode())
     return h.hexdigest()
+
+
+def read_export(output_dir: str, *, hash_weights: bool = True) -> dict[str, Any]:
+    """What is at the output path NOW: the truth file and (optionally) a sha256 over the weight files. Never raises."""
+    out: dict[str, Any] = {"readable": False}
+    try:
+        import json
+
+        with open(os.path.join(output_dir, TRUTH_FILE), encoding="utf-8") as fh:
+            truth = json.load(fh)
+        out.update(readable=True, truth=truth.get("truth"), optimizer_step=truth.get("optimizer_step"), reason=truth.get("reason"))
+        names = sorted(n for n in os.listdir(output_dir) if n.endswith(WEIGHT_SUFFIXES) and os.path.isfile(os.path.join(output_dir, n)))
+        out["weight_files"] = names
+        out["weight_bytes"] = sum(os.path.getsize(os.path.join(output_dir, n)) for n in names)
+        if hash_weights:
+            h = hashlib.sha256()
+            for n in names:
+                h.update(n.encode() + b"\0")
+                with open(os.path.join(output_dir, n), "rb") as fh:
+                    for chunk in iter(lambda: fh.read(1 << 22), b""):
+                        h.update(chunk)
+            out["weights_sha256"] = h.hexdigest()
+    except BaseException as exc:  # noqa: BLE001
+        out.update(readable=False, error=f"{type(exc).__name__}: {exc}"[:200])
+    return out
+
+
+def generation_of(export: dict[str, Any], *, second_reason: str | None, first_export: dict[str, Any] | None) -> str:
+    """"S": the export carries this second run's marker. "A": it is byte-for-byte what was there before the second run
+    (truth, step, reason and weight hash). "UNKNOWN": unreadable or neither."""
+    if not export.get("readable"):
+        return "UNKNOWN"
+    if second_reason and export.get("reason") == second_reason:
+        return "S"
+    if str(export.get("reason") or "").startswith(GENERATION_PREFIX):
+        return "UNKNOWN"            # a second-run marker that is not this run's
+    keys = ("truth", "optimizer_step", "reason", "weight_files", "weight_bytes", "weights_sha256")
+    if first_export and first_export.get("readable") and all(export.get(k) == first_export.get(k) for k in keys):
+        return "A"
+    return "UNKNOWN"
 
 
 def _finite(x: Any) -> bool:
@@ -238,6 +292,12 @@ class SecondRun:
         self.log = log
         self.defer_persist = True        # nothing of run S reaches the output path until it has won
         self.record: dict[str, Any] = {}
+        self.nonce = os.urandom(8).hex()
+
+    @property
+    def truth_reason(self) -> str:
+        """The truth_reason run S's one save writes into the export: the generation marker read back after the run."""
+        return GENERATION_PREFIX + self.nonce
 
     @property
     def dev_n(self) -> int:
@@ -329,6 +389,11 @@ def _second_run(spec: Any, deadline: Any, rows: list, *, first: dict[str, Any], 
     except Exception as exc:  # a broken gate must never cost the exported run A
         return finish("gate_error", skipped=True, error=f"{type(exc).__name__}: {exc}"[:200])
 
+    # what is exported now (run A): truth file + weight hash, read from disk; the reference for the read-back after run S
+    first_export = read_export(spec.output_dir)
+    rec["first_export"] = first_export
+    if not first_export.get("readable") or str(first_export.get("reason") or "").startswith(GENERATION_PREFIX):
+        return finish("first_export_unreadable", skipped=True)
     snap = telemetry.snapshot() if telemetry is not None and hasattr(telemetry, "snapshot") else None
     second: SecondRun | None = None
     result: dict[str, Any] = {}
@@ -373,17 +438,29 @@ def _second_run(spec: Any, deadline: Any, rows: list, *, first: dict[str, Any], 
     rec["first_epochs_done"] = first.get("epochs_done")
     if error is not None:
         rec["error"] = error
-    kept_second = outcome == "second_kept"
-    rec["pick"] = "S" if kept_second else "A"
+    # The exported generation is READ BACK from disk. save_adapter's directory exchange is the commit point: a failure or an
+    # interrupt after it (parent fsync, cleanup, telemetry) leaves run S exported although the save reported failure, and a
+    # failure before it leaves run A untouched. The record says what is there, not what the return value suggested.
+    final_export = read_export(spec.output_dir)
+    generation = generation_of(final_export, second_reason=second.truth_reason if second is not None else None,
+                               first_export=first_export)
+    rec.update(final_export=final_export, exported_generation=generation, second_outcome=outcome,
+               second_marker=second.truth_reason if second is not None else None, pick=generation)
     present = False
     try:
         present = bool(artifact_present(spec))
     except Exception:
         pass
     rec["artifact_present"] = present
-    if not kept_second and snap is not None:
-        try:
-            telemetry.restore(snap)     # the shipped artifact is run A's: its meta and curves describe run A again
-        except Exception:
-            pass
-    return finish(outcome)
+    if generation == "S":
+        reason = "second_kept" if outcome == "second_kept" else "second_committed_despite_error"
+    elif generation == "A":
+        reason = "second_save_not_on_disk" if outcome == "second_kept" else outcome
+        if snap is not None:
+            try:
+                telemetry.restore(snap)     # the exported artifact is run A's: its meta and curves describe run A again
+            except Exception:
+                pass
+    else:
+        reason = "exported_generation_unknown"   # telemetry is left as it is; the record carries both exports
+    return finish(reason)
