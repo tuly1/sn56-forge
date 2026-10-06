@@ -186,6 +186,7 @@ def _run(spec: TaskSpec, deadline: Deadline) -> int:
     if trained:
         # the handler's trained artifact (complete, or a trained checkpoint persisted before a late failure)
         telemetry.event("run_complete" if handler_ok else "handler_failed_kept_trained_artifact")
+        _record_export_manifest(spec.output_dir)
         telemetry.write_into(spec.output_dir)
         return 0
 
@@ -203,6 +204,36 @@ def _run(spec: TaskSpec, deadline: Deadline) -> int:
         _log(f"minimal fine-tune failed ({type(exc).__name__}: {exc}); no artifact, failing the task")
         telemetry.event("task_failed_no_artifact", error=f"{type(exc).__name__}: {exc}")
         return 1
+
+
+def _record_export_manifest(output_dir: str) -> None:
+    """Independent custody record of what is exported (Codex RESP-136-1 C2): file names, sizes and sha256 of every file at
+    the output path except the flight recorder itself, written into forge_run.json meta as ``export_manifest``. Taken here,
+    after the handler has returned, by code that shares nothing with the geometry selector's own read-back. Only when a
+    second training may have started in this task (the selector's record exists and says so): no other task pays for it.
+    Never raises."""
+    try:
+        import hashlib
+
+        rec = (telemetry._data.get("meta") or {}).get("geometry_select")
+        if not isinstance(rec, dict) or not (rec.get("second_started") or rec.get("state") in ("second_run_started", "second_run_saving")):
+            return
+        files: dict[str, dict] = {}
+        for name in sorted(os.listdir(output_dir)):
+            path = os.path.join(output_dir, name)
+            if name == "forge_run.json" or name.endswith(".tmp") or not os.path.isfile(path):
+                continue
+            h = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 22), b""):
+                    h.update(chunk)
+            files[name] = {"bytes": os.path.getsize(path), "sha256": h.hexdigest()}
+        telemetry.set_meta(export_manifest={"captured_by": "forge.cli after the handler", "files": files})
+    except BaseException as exc:  # noqa: BLE001
+        try:
+            telemetry.event("export_manifest_failed", error=f"{type(exc).__name__}: {exc}"[:200])
+        except BaseException:  # noqa: BLE001
+            pass
 
 
 def _safe_output_is_trained(check, spec: TaskSpec) -> bool:

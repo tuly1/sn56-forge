@@ -14,6 +14,14 @@ After run S ends, however it ends, read_export() reads the truth file at the out
 export is run S's (even when a later fsync failed or an interrupt arrived); run A's recorded truth and weight hash = the
 export is run A's; anything else = UNKNOWN and is reported as such. The decision record and the telemetry follow that.
 
+Exit paths (Codex RESP-136-1 B1). maybe_second_run has ONE place that emits a pick: _finalize. From the moment the second
+run may start (state["second_started"]), every exit, whatever raised and wherever (run S, the cleanup after it, logging,
+telemetry, the reconciliation itself, KeyboardInterrupt / SystemExit included), goes through _finalize, which determines the
+pick by a disk read-back and retries when it is interrupted. If no read-back completes, the pick is UNKNOWN, never A.
+Before that moment nothing of a second run exists, and pick A is a fact, not a guess.
+Each export directory also carries its own record: run S writes no telemetry into the output path before its save, the
+copy staged with run S's export says S, and the copy in run A's directory says A.
+
 Why (research/20261006-small-batch-separator/REPORT.md): always-S blew up on Qwen2.5-0.5B-I indic (+3.9 % DEV, board rank
 7 -> 14 of 16) while it gained 2.7 to 6.1 % on three other sub-1B cells. No start-of-run observable separates them. On the
 12 recorded A / S pairs where a second run fits, "keep the lower internal DEV" picked the externally better arm 12 / 12
@@ -124,7 +132,8 @@ def dev_fingerprint(dev_rows: list) -> str:
 
 
 def read_export(output_dir: str, *, hash_weights: bool = True) -> dict[str, Any]:
-    """What is at the output path NOW: the truth file and (optionally) a sha256 over the weight files. Never raises."""
+    """What is at the output path NOW: the truth file and (optionally) sha256 of the weight files. Any failure inside gives
+    readable False (the caller reads again and, failing that, reports UNKNOWN)."""
     out: dict[str, Any] = {"readable": False}
     try:
         import json
@@ -136,13 +145,15 @@ def read_export(output_dir: str, *, hash_weights: bool = True) -> dict[str, Any]
         out["weight_files"] = names
         out["weight_bytes"] = sum(os.path.getsize(os.path.join(output_dir, n)) for n in names)
         if hash_weights:
-            h = hashlib.sha256()
+            per_file: dict[str, str] = {}
             for n in names:
-                h.update(n.encode() + b"\0")
+                h = hashlib.sha256()
                 with open(os.path.join(output_dir, n), "rb") as fh:
                     for chunk in iter(lambda: fh.read(1 << 22), b""):
                         h.update(chunk)
-            out["weights_sha256"] = h.hexdigest()
+                per_file[n] = h.hexdigest()
+            out["weight_sha256"] = per_file          # per file: comparable with an independently captured manifest
+            out["weights_sha256"] = hashlib.sha256("".join(f"{n}:{per_file[n]}\n" for n in names).encode()).hexdigest()
     except BaseException as exc:  # noqa: BLE001
         out.update(readable=False, error=f"{type(exc).__name__}: {exc}"[:200])
     return out
@@ -287,9 +298,10 @@ def alternate_value(*, params_b: float, unit_len: int, vocab: int, per_gpu_gb: f
 class SecondRun:
     """What sft_v2.run consults while it trains run S. One instance per second run."""
 
-    def __init__(self, first: dict[str, Any], *, log: Callable[..., None]) -> None:
+    def __init__(self, first: dict[str, Any], *, log: Callable[..., None], telemetry: Any = None) -> None:
         self.first = first
         self.log = log
+        self.telemetry = telemetry
         self.defer_persist = True        # nothing of run S reaches the output path until it has won
         self.record: dict[str, Any] = {}
         self.nonce = os.urandom(8).hex()
@@ -333,6 +345,13 @@ class SecondRun:
         if choice != "S":
             raise SecondRunRejected(reason)
         self.defer_persist = False
+        if self.telemetry is not None:
+            # the telemetry copy that save_adapter stages INSIDE run S's export must name run S (a kill after the commit
+            # point leaves that copy as the only record); _finalize replaces it with the full record. A non-final record
+            # carries no "pick": only a record with state "final" claims one
+            self.telemetry.set_meta(**{META_KEY: {"state": "second_run_saving", "provisional_generation": "S",
+                                                  "second_marker": self.truth_reason, "first_dev": self.first.get("chosen_loss"),
+                                                  "second_dev": self.record.get("second_dev"), "margin": MARGIN}})
 
 
 def _rel(first_dev: Any, second_dev: Any) -> float | None:
@@ -342,125 +361,177 @@ def _rel(first_dev: Any, second_dev: Any) -> float | None:
 
 
 def maybe_second_run(spec: Any, deadline: Any, rows: list, **kw: Any) -> dict[str, Any]:
-    """Called after run A returned normally (its artifact is exported). Never raises: every failure keeps run A.
-    Returns the decision record (also written to forge_run.json meta under META_KEY)."""
+    """Called after run A returned normally (its artifact is exported). Returns the decision record (also written to
+    forge_run.json meta under META_KEY). It handles every exception itself, BaseException included; the only way out by an
+    exception is an interrupt that lands on one of the few statements no handler can cover (the return below, the loop head
+    and the fallback of _finalize). Then NO pick is emitted, the CLI keeps the trained artifact that is on disk, and a
+    record without state "final" claims nothing.
+
+    The pick is emitted in ONE place, _finalize. Once the second run may have started, the pick is what a disk read-back
+    finds at the output path (S, A, or UNKNOWN when no read-back completes). It is never inferred from an exception, a
+    return value or the line an interrupt landed on."""
+    state: dict[str, Any] = {"t0": time.monotonic(), "second_started": False, "rec": {"ran": False}, "kw": kw, "spec": spec,
+                             "outcome": None, "error": None, "second": None, "result": {}, "first_export": None, "snap": None,
+                             "generation": None, "skip_reason": None}
     try:
-        return _second_run(spec, deadline, rows, **kw)
-    except BaseException as exc:  # noqa: BLE001  nothing in the selector may cost the exported run A
-        rec = {"ran": None, "pick": "A", "reason": "selector_error", "error": f"{type(exc).__name__}: {exc}"[:300]}
+        _run_second(state, spec, deadline, rows, **kw)
+    except BaseException as exc:  # noqa: BLE001  anything, from anywhere: the read-back in _finalize decides, not this handler
+        state["error"] = state["error"] or f"{type(exc).__name__}: {exc}"[:300]
+        state["outcome"] = state["outcome"] or ("second_run_failed" if state["second_started"] else "selector_error")
+    return _finalize(state)
+
+
+def _finalize(state: dict[str, Any]) -> dict[str, Any]:
+    """The only place a pick is emitted. Retries the reconciliation when it is interrupted; a pick that could not be read
+    back from disk after the second run may have started is UNKNOWN."""
+    attempts: list[str] = []
+    for _ in range(4):
         try:
-            kw["log"]("sft_v2_geometry_select", **rec)
-        except BaseException:  # noqa: BLE001
-            pass
-        return rec
+            return _reconcile(state, attempts)
+        except BaseException as exc:  # noqa: BLE001  e.g. KeyboardInterrupt between two statements of the reconciliation
+            attempts.append(f"{type(exc).__name__}: {exc}"[:120])
+    rec = dict(state.get("rec") or {})
+    if state["second_started"]:
+        gen = state.get("generation")                   # a read-back that completed in an interrupted attempt, else None
+        rec.update(pick=gen if gen in ("A", "S") else "UNKNOWN", exported_generation=gen or "UNKNOWN",
+                   reason="reconcile_interrupted_after_read_back" if gen in ("A", "S") else "exported_generation_unknown")
+    else:
+        rec.update(pick="A", exported_generation="A", reason=state.get("skip_reason") or "selector_error")
+    rec.update(state="final", second_started=bool(state["second_started"]), finalize_interruptions=attempts)
+    return rec
 
 
-def _second_run(spec: Any, deadline: Any, rows: list, *, first: dict[str, Any], run_kwargs: dict[str, Any],
+def _reconcile(state: dict[str, Any], attempts: list[str]) -> dict[str, Any]:
+    """Idempotent: may be called again after an interruption. Order: (1) read the export back and fix the pick,
+    (2) align the telemetry with it, (3) clean up, (4) log and write the record. Steps 2 to 4 cannot change the pick."""
+    kw, spec = state["kw"], state["spec"]
+    log, telemetry = kw.get("log"), kw.get("telemetry")
+    rec = state["rec"]
+    second, result = state["second"], state["result"]
+    if not state["second_started"]:
+        # nothing of a second run exists: the export is what run A wrote. Not a guess, and no read-back is needed.
+        rec.update(pick="A", exported_generation="A", reason=state.get("skip_reason") or state.get("outcome") or "selector_error",
+                   skipped=True)
+    else:
+        final_export: dict[str, Any] = {"readable": False}
+        for _ in range(3):                                # a read that fails once (I/O hiccup, interrupt) is read again
+            final_export = read_export(spec.output_dir)
+            if final_export.get("readable"):
+                break
+        marker = second.truth_reason if second is not None else None
+        generation = generation_of(final_export, second_reason=marker, first_export=state["first_export"])
+        state["generation"] = generation                 # from here on an interrupted attempt still knows the read-back
+        outcome = state.get("outcome") or "second_run_failed"
+        if generation == "S":
+            reason = "second_kept" if outcome == "second_kept" else "second_committed_despite_error"
+        elif generation == "A":
+            reason = "second_save_not_on_disk" if outcome == "second_kept" else outcome
+        else:
+            reason = "exported_generation_unknown"
+        if second is not None:
+            rec.update(second.record)
+        rec.update(final_export=final_export, exported_generation=generation, artifact_present=bool(final_export.get("readable")), second_outcome=outcome, second_marker=marker,
+                   pick=generation, reason=reason, second_dev=rec.get("second_dev", result.get("chosen_loss")),
+                   second_core_s=result.get("core_s"), second_tail_s=result.get("tail_s"),
+                   second_epochs_done=result.get("epochs_done"))
+        rec["internal_rel_pct"] = _rel(rec.get("first_dev"), rec.get("second_dev"))
+        # (2) telemetry follows the disk: run A exported -> run A's meta and curves again; S or UNKNOWN -> left as it is
+        if generation == "A" and state.get("snap") is not None and telemetry is not None:
+            try:
+                telemetry.restore(state["snap"])
+            except BaseException as exc:  # noqa: BLE001
+                rec["telemetry_restore_error"] = f"{type(exc).__name__}: {exc}"[:120]
+        # (3) cleanup: run S's model. Failures and interrupts here cannot change the pick (already read back above).
+        try:
+            state["loaded"] = None
+            gc.collect()
+            kw["free"]()
+        except BaseException as exc:  # noqa: BLE001
+            rec["cleanup_error"] = f"{type(exc).__name__}: {exc}"[:120]
+    if state.get("error") is not None:
+        rec["error"] = state["error"]
+    rec.update(state="final", second_started=bool(state["second_started"]), finalize_interruptions=list(attempts),
+               seconds=round(time.monotonic() - state["t0"], 1))
+    # (4) log + record into the flight recorder. Each step on its own: a failure of one is noted, never raised.
+    for step in ("log", "meta", "write"):
+        try:
+            if step == "log" and log is not None:
+                log("sft_v2_geometry_select", **rec)
+            elif step == "meta" and telemetry is not None:
+                telemetry.set_meta(**{META_KEY: dict(rec)})
+            elif step == "write" and telemetry is not None:
+                telemetry.write_into(spec.output_dir)
+        except BaseException as exc:  # noqa: BLE001
+            rec.setdefault("record_errors", []).append(f"{step}: {type(exc).__name__}: {exc}"[:120])
+    return rec
+
+
+def _run_second(state: dict[str, Any], spec: Any, deadline: Any, rows: list, *, first: dict[str, Any], run_kwargs: dict[str, Any],
                 run_fn: Callable[..., None], load_base: Callable[..., Any], free: Callable[[], None],
                 artifact_present: Callable[[Any], bool], load_s: float | None = None,
-                log: Callable[..., None], telemetry: Any = None) -> dict[str, Any]:
-    t0 = time.monotonic()
-    rec: dict[str, Any] = {"ran": False, "pick": "A", "margin": MARGIN, "target_rows": TARGET_ROWS,
-                           "first_dev": first.get("chosen_loss"), "first_rows_per_step": first.get("rows_per_step"),
-                           "first_core_s": first.get("core_s"), "first_tail_s": first.get("tail_s"),
-                           "dev_fingerprint": first.get("dev_fingerprint"), "dev_n": first.get("dev_n")}
+                log: Callable[..., None], telemetry: Any = None) -> None:
+    """Gates, then the second run. Emits NO pick and writes no final record: it only fills ``state``. May raise anything."""
+    rec = state["rec"]
+    rec.update(ran=False, margin=MARGIN, target_rows=TARGET_ROWS, first_dev=first.get("chosen_loss"),
+               first_rows_per_step=first.get("rows_per_step"), first_core_s=first.get("core_s"),
+               first_tail_s=first.get("tail_s"), dev_fingerprint=first.get("dev_fingerprint"), dev_n=first.get("dev_n"),
+               first_epochs_done=first.get("epochs_done"))
 
-    def finish(reason: str, **kw: Any) -> dict[str, Any]:
-        rec.update(reason=reason, seconds=round(time.monotonic() - t0, 1), **kw)
-        try:
-            log("sft_v2_geometry_select", **rec)
-            if telemetry is not None:
-                telemetry.set_meta(**{META_KEY: dict(rec)})
-                telemetry.write_into(spec.output_dir)
-        except Exception:
-            pass
-        return rec
+    def skip(reason: str, **kw: Any) -> None:
+        state["skip_reason"] = reason
+        rec.update(kw)
 
     try:
         refusal = first_run_refusal(first)
         if refusal is None and not artifact_present(spec):
             refusal = "first_artifact_missing"
         if refusal is not None:
-            return finish(refusal, skipped=True)
+            return skip(refusal)
         gate = time_gate_stage1(first, remaining_s=deadline.remaining_hard(), load_s=load_s)
         rec["time_gate_stage1"] = gate
         if not gate["fits"]:
-            return finish("time_gate_stage1", skipped=True)
+            return skip("time_gate_stage1")
     except Exception as exc:  # a broken gate must never cost the exported run A
-        return finish("gate_error", skipped=True, error=f"{type(exc).__name__}: {exc}"[:200])
+        return skip("gate_error", error=f"{type(exc).__name__}: {exc}"[:200])
 
-    # what is exported now (run A): truth file + weight hash, read from disk; the reference for the read-back after run S
+    # what is exported now (run A): truth file + weight hashes, read from disk; the reference for the read-back after run S
     first_export = read_export(spec.output_dir)
     rec["first_export"] = first_export
     if not first_export.get("readable") or str(first_export.get("reason") or "").startswith(GENERATION_PREFIX):
-        return finish("first_export_unreadable", skipped=True)
-    snap = telemetry.snapshot() if telemetry is not None and hasattr(telemetry, "snapshot") else None
-    second: SecondRun | None = None
-    result: dict[str, Any] = {}
-    outcome, error = "second_run_failed", None
+        return skip("first_export_unreadable")
+    state["first_export"] = first_export
+    state["snap"] = telemetry.snapshot() if telemetry is not None and hasattr(telemetry, "snapshot") else None
+    if telemetry is not None:
+        # run A's directory keeps a record that names run A while the second run trains (run S writes no telemetry into
+        # the output path before its save): a kill before run S's commit point leaves this record with run A's weights
+        telemetry.set_meta(**{META_KEY: {"state": "second_run_started", "provisional_generation": "A",
+                                         "first_export": first_export, "first_dev": first.get("chosen_loss"), "margin": MARGIN}})
+        telemetry.write_into(spec.output_dir)
     # Run A's model, pool and optimizer died with its frame; collect the reference cycles and the CUDA cache BEFORE the
     # base is loaded again (the reference-lifetime lesson of RESP-120-C1). Nothing below runs inside an except suite.
     gc.collect()
     free()
+    # ---- from here on a second run may exist: every exit goes through the disk read-back in _finalize ----
+    state["second_started"] = True
     rec["ran"] = True
+    state["outcome"] = "second_run_failed"
     try:
         from forge.clock import Deadline
 
         t_load = time.monotonic()
-        loaded = load_base(spec.cached_model_dir, for_generation=False)
+        state["loaded"] = load_base(spec.cached_model_dir, for_generation=False)
         rec["second_load_s"] = round(time.monotonic() - t_load, 1)
-        second = SecondRun(first, log=log)
+        state["second"] = second = SecondRun(first, log=log, telemetry=telemetry)
         earlier = Deadline(hard_stop=float(deadline.hard_stop) - DEADLINE_MARGIN_S,
                            export_reserve_s=float(deadline.export_reserve_s))
         log("sft_v2_geometry_select_second_start", remaining_s=round(deadline.remaining_hard(), 1),
             second_load_s=rec["second_load_s"], **{f"gate_{k}": v for k, v in rec["time_gate_stage1"].items()})
-        run_fn(spec, earlier, rows, loaded, loaded.tokenizer, **run_kwargs, geometry_select=second, result=result)
-        outcome = "second_kept" if result.get("saved") else "second_save_failed"
+        loaded, state["loaded"] = state["loaded"], None          # the run takes the model; this frame keeps no reference
+        run_fn(spec, earlier, rows, loaded, loaded.tokenizer, **run_kwargs, geometry_select=second, result=state["result"])
+        state["outcome"] = "second_kept" if state["result"].get("saved") else "second_save_failed"
     except SecondRunAbort as exc:
-        outcome = str(exc)
+        state["outcome"] = str(exc)
     except SecondRunRejected as exc:
-        outcome = str(exc)
-    except BaseException as exc:  # noqa: BLE001  crash, OOM, clock, zero steps, interrupt: run A is on disk and stays
-        outcome, error = "second_run_failed", f"{type(exc).__name__}: {exc}"[:300]
-    loaded = None
-    gc.collect()
-    try:
-        free()
-    except Exception:
-        pass
-    if second is not None:
-        rec.update(second.record)
-    rec["second_dev"] = rec.get("second_dev", result.get("chosen_loss"))
-    rec["internal_rel_pct"] = _rel(rec.get("first_dev"), rec.get("second_dev"))
-    rec["second_core_s"] = result.get("core_s")
-    rec["second_tail_s"] = result.get("tail_s")
-    rec["second_epochs_done"] = result.get("epochs_done")
-    rec["first_epochs_done"] = first.get("epochs_done")
-    if error is not None:
-        rec["error"] = error
-    # The exported generation is READ BACK from disk. save_adapter's directory exchange is the commit point: a failure or an
-    # interrupt after it (parent fsync, cleanup, telemetry) leaves run S exported although the save reported failure, and a
-    # failure before it leaves run A untouched. The record says what is there, not what the return value suggested.
-    final_export = read_export(spec.output_dir)
-    generation = generation_of(final_export, second_reason=second.truth_reason if second is not None else None,
-                               first_export=first_export)
-    rec.update(final_export=final_export, exported_generation=generation, second_outcome=outcome,
-               second_marker=second.truth_reason if second is not None else None, pick=generation)
-    present = False
-    try:
-        present = bool(artifact_present(spec))
-    except Exception:
-        pass
-    rec["artifact_present"] = present
-    if generation == "S":
-        reason = "second_kept" if outcome == "second_kept" else "second_committed_despite_error"
-    elif generation == "A":
-        reason = "second_save_not_on_disk" if outcome == "second_kept" else outcome
-        if snap is not None:
-            try:
-                telemetry.restore(snap)     # the exported artifact is run A's: its meta and curves describe run A again
-            except Exception:
-                pass
-    else:
-        reason = "exported_generation_unknown"   # telemetry is left as it is; the record carries both exports
-    return finish(reason)
+        state["outcome"] = str(exc)
+    except BaseException as exc:  # noqa: BLE001  crash, OOM, clock, zero steps, interrupt: _finalize reads the disk
+        state["outcome"], state["error"] = "second_run_failed", f"{type(exc).__name__}: {exc}"[:300]

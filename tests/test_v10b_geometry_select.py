@@ -305,9 +305,10 @@ class Harness:
         monkeypatch.setattr(sft_v2, "stratified_split", split)
         monkeypatch.setattr(sft_v2, "_event_and_print", lambda n, **d: h.events.append((n, d)))
         monkeypatch.setattr(sft_v2.telemetry, "set_meta", lambda **kw: h.meta.update(kw))
-        for name in ("eval_point", "write_into"):
-            monkeypatch.setattr(sft_v2.telemetry, name, lambda *a, **k: None)
-        monkeypatch.setattr(sft_v2.telemetry, "make_trainer_callback", lambda *a: object())
+        self.telemetry_writes, self.callback_dirs = [], []
+        monkeypatch.setattr(sft_v2.telemetry, "eval_point", lambda *a, **k: None)
+        monkeypatch.setattr(sft_v2.telemetry, "write_into", lambda out, *a, **k: h.telemetry_writes.append(out))
+        monkeypatch.setattr(sft_v2.telemetry, "make_trainer_callback", lambda out, *a: h.callback_dirs.append(out) or object())
         monkeypatch.setattr(sft_v2, "write_artifact_truth", lambda *a, **k: None)
         from forge.tasks import common
 
@@ -867,6 +868,330 @@ def test_no_second_run_when_the_first_export_cannot_be_read_back(monkeypatch, tm
     os.unlink(os.path.join(h.spec.output_dir, gs.TRUTH_FILE))
     rec, loads, _ = orchestrate(h, first)
     assert loads == [] and rec["reason"] == "first_export_unreadable" and rec["pick"] == "A" and not rec["ran"]
+
+
+# ---- (f3) every exit after the second run may have started ends in the disk read-back (Codex RESP-136-1 B1) -----------
+
+class Raiser:
+    """Raises `exc` from call number `first` on (1-based), for `times` calls; otherwise calls `real`."""
+
+    def __init__(self, real, exc, *, first=1, times=10 ** 9, active=None):
+        self.real, self.exc, self.first, self.times, self.n, self.raised = real, exc, first, times, 0, 0
+        self.active = active if active is not None else {"on": True}
+
+    def __call__(self, *a, **k):
+        if self.active["on"]:
+            self.n += 1
+            if self.n >= self.first and self.raised < self.times:
+                self.raised += 1
+                raise self.exc
+        return self.real(*a, **k)
+
+
+def committed(monkeypatch, tmp_path, *, s_wins=True):
+    """Run A, then arrange that run S wins and commits (the real save). Returns the harness and run A's result."""
+    h = Harness(monkeypatch, tmp_path)
+    first = run_a(h)
+    h.dev_loss["value"] = 0.9 if s_wins else 1.1
+    return h, first
+
+
+def disk_generation(h):
+    reason = str(gs.read_export(h.spec.output_dir, hash_weights=False).get("reason"))
+    return "S" if reason.startswith(gs.GENERATION_PREFIX) else "A"
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt("gc"), SystemExit(3), RuntimeError("gc"), MemoryError()])
+def test_interrupt_in_the_cleanup_after_a_committed_second_run_still_reports_s(monkeypatch, tmp_path, exc):
+    """Codex's reproduction: KeyboardInterrupt in the post-run gc.collect while the disk holds run S."""
+    h, first = committed(monkeypatch, tmp_path)
+    active = {"on": False}
+    real_run = sft_v2.run
+
+    def run_then_arm(*a, **k):
+        try:
+            return real_run(*a, **k)
+        finally:
+            active["on"] = True                                        # every gc.collect AFTER the second run raises
+
+    monkeypatch.setattr(gs, "gc", NS(collect=Raiser(gc.collect, exc, active=active)))
+    rec, _, tele = orchestrate(h, first, run_fn=run_then_arm)
+    assert disk_generation(h) == "S" and rec["pick"] == "S" and rec["exported_generation"] == "S" and rec["state"] == "final"
+    assert rec["reason"] == "second_kept" and type(exc).__name__ in rec["cleanup_error"] and tele.restored == []
+    assert tele.meta[gs.META_KEY]["pick"] == "S"
+
+
+@pytest.mark.parametrize("exc", [KeyboardInterrupt("free"), SystemExit(3), RuntimeError("cuda")])
+def test_interrupt_in_free_after_a_committed_second_run_still_reports_s(monkeypatch, tmp_path, exc):
+    h, first = committed(monkeypatch, tmp_path)
+    calls = {"n": 0}
+
+    def free():
+        calls["n"] += 1
+        if calls["n"] >= 2:                                           # the first call is before the reload
+            raise exc
+
+    tele = Tele()
+    rec = gs.maybe_second_run(h.spec, h.deadline(), h.source, first=first, run_kwargs=h.kwargs, run_fn=sft_v2.run,
+                              load_base=lambda path, **kw: NS(model=tiny_llama(), tokenizer=Tok()), free=free,
+                              artifact_present=lambda spec: True, load_s=1.0, log=lambda n, **d: h.events.append((n, d)),
+                              telemetry=tele)
+    assert disk_generation(h) == "S" and rec["pick"] == "S" and rec["state"] == "final" and "cleanup_error" in rec
+
+
+@pytest.mark.parametrize("where", ["log", "set_meta", "write_into"])
+@pytest.mark.parametrize("exc_type", [KeyboardInterrupt, SystemExit, RuntimeError])
+@pytest.mark.parametrize("s_wins", [True, False])
+def test_interrupt_in_the_final_logging_or_telemetry_does_not_change_the_pick(monkeypatch, tmp_path, where, exc_type, s_wins):
+    h, first = committed(monkeypatch, tmp_path, s_wins=s_wins)
+    tele = Tele()
+    armed = {"on": False}
+    real_run = sft_v2.run
+
+    def run_then_arm(*a, **k):
+        try:
+            return real_run(*a, **k)
+        finally:
+            armed["on"] = True
+
+    def log(name, **d):
+        if where == "log" and armed["on"] and name == "sft_v2_geometry_select":
+            raise exc_type("log")
+        h.events.append((name, d))
+
+    if where != "log":
+        setattr(tele, where, Raiser(getattr(tele, where), exc_type(where), active=armed))
+    rec = gs.maybe_second_run(h.spec, h.deadline(), h.source, first=first, run_kwargs=h.kwargs, run_fn=run_then_arm,
+                              load_base=lambda path, **kw: NS(model=tiny_llama(), tokenizer=Tok()), free=lambda: None,
+                              artifact_present=lambda spec: True, load_s=1.0, log=log, telemetry=tele)
+    want = "S" if s_wins else "A"
+    assert disk_generation(h) == want and rec["pick"] == want and rec["exported_generation"] == want and rec["state"] == "final"
+    assert any(e.startswith({"log": "log", "set_meta": "meta", "write_into": "write"}[where]) for e in rec["record_errors"])
+
+
+@pytest.mark.parametrize("s_wins", [True, False])
+def test_an_interrupted_read_back_is_retried(monkeypatch, tmp_path, s_wins):
+    h, first = committed(monkeypatch, tmp_path, s_wins=s_wins)
+    armed = {"on": False}
+    real_run = sft_v2.run
+
+    def run_then_arm(*a, **k):
+        try:
+            return real_run(*a, **k)
+        finally:
+            armed["on"] = True
+
+    monkeypatch.setattr(gs, "read_export", Raiser(gs.read_export, KeyboardInterrupt("read"), times=2, active=armed))
+    rec, _, _ = orchestrate(h, first, run_fn=run_then_arm)
+    want = "S" if s_wins else "A"
+    assert rec["pick"] == want == disk_generation(h) and len(rec["finalize_interruptions"]) == 2 and rec["state"] == "final"
+
+
+@pytest.mark.parametrize("s_wins", [True, False])
+def test_a_read_back_that_never_completes_is_unknown_never_a(monkeypatch, tmp_path, s_wins):
+    h, first = committed(monkeypatch, tmp_path, s_wins=s_wins)
+    armed = {"on": False}
+    real_run = sft_v2.run
+
+    def run_then_arm(*a, **k):
+        try:
+            return real_run(*a, **k)
+        finally:
+            armed["on"] = True
+
+    monkeypatch.setattr(gs, "read_export", Raiser(gs.read_export, KeyboardInterrupt("read"), active=armed))
+    rec, _, _ = orchestrate(h, first, run_fn=run_then_arm)
+    assert rec["pick"] == "UNKNOWN" and rec["exported_generation"] == "UNKNOWN" and rec["reason"] == "exported_generation_unknown"
+    assert rec["second_started"] is True and len(rec["finalize_interruptions"]) == 4 and rec["state"] == "final"
+
+
+def test_an_interrupt_before_the_second_run_can_start_is_a_fact_not_a_guess(monkeypatch, tmp_path):
+    h, first = committed(monkeypatch, tmp_path)
+    saves = list(h.saves)
+    monkeypatch.setattr(gs, "time_gate_stage1", Raiser(gs.time_gate_stage1, KeyboardInterrupt("gate")))
+    rec, loads, _ = orchestrate(h, first)
+    assert loads == [] and h.saves == saves and rec["second_started"] is False and rec["pick"] == "A" and rec["reason"] == "selector_error"
+
+
+def test_run_s_writes_no_telemetry_into_the_output_path_before_its_save(monkeypatch, tmp_path):
+    """Each export directory carries a record that names its own run: while run A's directory is at the output path, run S
+    writes nothing into it; the copy staged with run S's export says S; non-final records claim no pick."""
+    h, first = committed(monkeypatch, tmp_path, s_wins=False)
+    to_output = lambda: [w for w in h.telemetry_writes if w == h.spec.output_dir]  # noqa: E731  (staging writes go to out.tmp)
+    assert h.callback_dirs == [h.spec.output_dir] and len(to_output()) == 1                          # run A, as before
+    seen = []
+    tele = Tele()
+    real_set = tele.set_meta
+    tele.set_meta = lambda **kw: (seen.append(dict(kw.get(gs.META_KEY) or {})), real_set(**kw))[1]
+    rec, _, _ = orchestrate(h, first, tele=tele)
+    assert rec["pick"] == "A" and h.callback_dirs[1:] and all(d != h.spec.output_dir for d in h.callback_dirs[1:])
+    assert len(to_output()) == 1                                       # run S itself wrote nothing (it lost before its save)
+    assert [r.get("state") for r in seen] == ["second_run_started", "final"]
+    assert "pick" not in seen[0] and seen[0]["provisional_generation"] == "A" and seen[1]["pick"] == "A"
+
+
+def test_the_record_staged_with_run_s_names_run_s_and_claims_no_pick(monkeypatch, tmp_path):
+    h, first = committed(monkeypatch, tmp_path)
+    seen = []
+    tele = Tele()
+    real_set = tele.set_meta
+    tele.set_meta = lambda **kw: (seen.append(dict(kw.get(gs.META_KEY) or {})), real_set(**kw))[1]
+    rec, _, _ = orchestrate(h, first, tele=tele)
+    assert [r.get("state") for r in seen] == ["second_run_started", "second_run_saving", "final"]
+    assert seen[1]["provisional_generation"] == "S" and "pick" not in seen[1] and seen[1]["second_marker"] == rec["second_marker"]
+    # run S's own run() wrote nothing into the output path either: only into its staged directory, inside save_adapter
+    assert rec["pick"] == "S" and [w for w in h.telemetry_writes if w == h.spec.output_dir] == [h.spec.output_dir]
+
+
+# ---- property: a BaseException injected at EVERY statement boundary of the selector after the second run's save ----------
+
+def _property_run(tmp_path, template, k, *, commit, exc_type):
+    """One maybe_second_run with a fast second run (a real save_adapter commit, or a failure before it). A tracer raises
+    exc_type at the k-th executed line of geometry_select.py after the save. Returns (record | None, raised, where, disk)."""
+    import os
+    import shutil
+    import sys
+
+    from forge.tasks import common
+
+    root = tmp_path / f"{'c' if commit else 'n'}-{exc_type.__name__}-{k}"
+    shutil.copytree(template, root)
+    out = str(root / "out")
+    spec = NS(output_dir=out, cached_model_dir="/cache/models/synthetic")
+    first = first_ok(chosen_loss=1.0, core_s=1.0, tail_s=0.1, finish_reserve_s=1.0)
+    armed = {"on": False, "n": 0, "where": None}
+    model = tiny_llama()
+
+    def run_fn(spec_, deadline, rows_, loaded, tokenizer, *, geometry_select, result, **kw):
+        geometry_select.on_chosen(0.9)
+        try:
+            if not commit:
+                raise OSError(5, "injected before the commit point")
+            common.save_adapter(model, Tok(), spec_.output_dir, artifact_truth=common.ARTIFACT_COMPLETE_BEST, optimizer_step=7,
+                                truth_reason=geometry_select.truth_reason)
+            result.update(saved=True, chosen_loss=0.9)
+        finally:
+            armed["on"] = True
+
+    target = gs.__file__
+
+    def local(frame, event, arg):
+        if event == "line" and armed["on"]:
+            armed["n"] += 1
+            if armed["n"] == k:
+                armed["where"] = f"{frame.f_code.co_name}:{frame.f_lineno}"
+                raise exc_type(f"injected at {armed['where']}")
+        return local
+
+    def tracer(frame, event, arg):
+        return local if frame.f_code.co_filename == target else None
+
+    tele = Tele()
+    rec, raised = None, None
+    sys.settrace(tracer)
+    try:
+        rec = gs.maybe_second_run(spec, Deadline.from_hours(1.0, started_monotonic=time.monotonic(), export_reserve_s=180.0), [],
+                                  first=first, run_kwargs={}, run_fn=run_fn, load_base=lambda *a, **kw: NS(model=None, tokenizer=Tok()),
+                                  free=lambda: None, artifact_present=lambda s_: True, load_s=1.0, log=lambda n, **d: None,
+                                  telemetry=tele)
+    except BaseException as exc:  # noqa: BLE001
+        raised = exc
+    finally:
+        sys.settrace(None)
+    reason = str(gs.read_export(out, hash_weights=False).get("reason"))
+    disk = "S" if reason.startswith(gs.GENERATION_PREFIX) else "A"
+    shutil.rmtree(root, ignore_errors=True)
+    return rec, raised, armed["where"], disk, tele, armed["n"]
+
+
+@pytest.mark.parametrize("commit", [True, False])
+@pytest.mark.parametrize("exc_type", [KeyboardInterrupt, SystemExit, MemoryError])
+def test_property_no_statement_boundary_after_the_save_yields_a_wrong_pick(tmp_path, commit, exc_type):
+    """Inject a BaseException at every executed line of the selector module after run S's save (committed, or failed before
+    its commit point). A returned record must name the run that is on disk, or UNKNOWN. An escape is allowed only from the
+    few statements that no handler can cover, and then no final record with another pick exists."""
+    import os
+
+    from forge.tasks import common
+
+    template = tmp_path / "template"
+    os.makedirs(template)
+    common.save_adapter(tiny_llama(), Tok(), str(template / "out"), artifact_truth=common.ARTIFACT_COMPLETE_BEST,
+                        optimizer_step=3, truth_reason="sft_v2_final")
+    want = "S" if commit else "A"
+    outcomes = {"correct": 0, "unknown": 0, "escaped": []}
+    k = 0
+    while True:
+        k += 1
+        rec, raised, where, disk, tele, lines = _property_run(tmp_path, template, k, commit=commit, exc_type=exc_type)
+        assert disk == want, (k, where)                                # the injection never changes what is on disk
+        if lines < k:                                                  # no line left to inject at: an uninterrupted run
+            assert raised is None and rec["pick"] == want
+            break
+        final = tele.meta.get(gs.META_KEY) or {}
+        if final.get("state") == "final":                              # a final record in the flight recorder never lies
+            assert final["pick"] in (want, "UNKNOWN"), (k, where, final["pick"])
+        else:
+            assert "pick" not in final, (k, where)
+        if raised is not None:
+            assert where.split(":")[0] in ("maybe_second_run", "_finalize"), (k, where)
+            outcomes["escaped"].append(where)
+            continue
+        assert rec["state"] == "final" and rec["pick"] in (want, "UNKNOWN"), (k, where, rec["pick"], rec.get("reason"))
+        assert rec["exported_generation"] == rec["pick"]
+        outcomes["correct" if rec["pick"] == want else "unknown"] += 1
+        assert k < 2000
+    assert k > 60 and outcomes["correct"] >= 0.9 * (k - 1), outcomes   # almost every boundary still ends with the right pick
+    # the statements no handler can cover: the return of maybe_second_run and the loop head / fallback of _finalize
+    assert len(outcomes["escaped"]) <= 6, outcomes["escaped"]
+
+
+def test_cli_export_manifest_is_taken_only_when_a_second_run_may_have_started(tmp_path):
+    import hashlib
+
+    from forge import cli, telemetry
+
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "model.safetensors").write_bytes(b"weights")
+    (out / "forge_artifact_truth.json").write_text("{}")
+    (out / "forge_run.json").write_text("{}")
+    (out / "model.safetensors.tmp").write_text("x")
+    saved = dict(telemetry._data["meta"])
+    try:
+        telemetry._data["meta"] = {}
+        cli._record_export_manifest(str(out))
+        assert "export_manifest" not in telemetry._data["meta"]                       # no selector record: nothing is hashed
+        telemetry._data["meta"] = {"geometry_select": {"state": "final", "second_started": False, "pick": "A"}}
+        cli._record_export_manifest(str(out))
+        assert "export_manifest" not in telemetry._data["meta"]
+        for rec in ({"state": "final", "second_started": True, "pick": "S"}, {"state": "second_run_saving"}, {"state": "second_run_started"}):
+            telemetry._data["meta"] = {"geometry_select": rec}
+            cli._record_export_manifest(str(out))
+            files = telemetry._data["meta"]["export_manifest"]["files"]
+            assert sorted(files) == ["forge_artifact_truth.json", "model.safetensors"]
+            assert files["model.safetensors"] == {"bytes": 7, "sha256": hashlib.sha256(b"weights").hexdigest()}
+        telemetry._data["meta"] = {"geometry_select": {"second_started": True}}
+        cli._record_export_manifest(str(tmp_path / "missing"))                        # never raises
+        assert "export_manifest" not in telemetry._data["meta"]
+    finally:
+        telemetry._data["meta"] = saved
+
+
+def test_the_selector_read_back_and_the_cli_manifest_agree_on_the_weights(monkeypatch, tmp_path):
+    from forge import cli, telemetry
+
+    h, first = committed(monkeypatch, tmp_path)
+    rec, _, _ = orchestrate(h, first)
+    saved = dict(telemetry._data["meta"])
+    try:
+        telemetry._data["meta"] = {"geometry_select": rec}
+        cli._record_export_manifest(h.spec.output_dir)
+        files = h.meta["export_manifest"]["files"]                    # the harness routes telemetry.set_meta into h.meta
+    finally:
+        telemetry._data["meta"] = saved
+    assert rec["pick"] == "S" and rec["final_export"]["weight_sha256"] == {n: files[n]["sha256"] for n in rec["final_export"]["weight_files"]}
+    assert rec["final_export"]["weight_bytes"] == sum(files[n]["bytes"] for n in rec["final_export"]["weight_files"])
 
 
 def test_real_telemetry_snapshot_and_restore():

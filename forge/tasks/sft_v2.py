@@ -2262,6 +2262,8 @@ def run(
         return loss
 
     def persist(m: Any, cpu_state: dict[str, Any] | None, step: int, truth: str, reason: str) -> bool:
+        if geometry_select is not None and geometry_select.defer_persist:
+            return False  # geometry selector, run S: nothing reaches the output path before run S has won (second guard)
         t0 = time.perf_counter()
         try:
             save_adapter(m, tokenizer, spec.output_dir, artifact_truth=truth, optimizer_step=step, truth_reason=reason,
@@ -2468,6 +2470,9 @@ def run(
         geometry_select.before_train(dev_fp=_dev_fp, rows_per_step=rows_per_step(), t_step_s=t_per_step,
                                      steps_per_epoch=steps_per_epoch, finish_reserve_s=finish_reserve,
                                      remaining_s=deadline.remaining_hard())
+    # geometry selector, run S: no telemetry is written into the output path while run A's export is there (write_into is a
+    # no-op on a missing directory); run S's telemetry reaches the output only staged inside its own export
+    _telemetry_dir = spec.output_dir if geometry_select is None else spec.output_dir.rstrip("/") + ".geometry-select-second-run"
     _event_and_print("sft_v2_train_start", elapsed_s=round(time.monotonic() - t_start, 1), lr=lr, prior_lr=prior_lr,
                      t_per_step=t_per_step, steps_per_epoch=steps_per_epoch, finish_reserve_s=round(finish_reserve, 1),
                      **_flat({"probe": diag}))
@@ -2612,7 +2617,7 @@ def run(
         trainer = TrainerCls(
             model=model, args=make_args(epochs, phase_lr, warmup, geo.micro_batch, geo.grad_accum,
                                         seed=_seed_base + (1000 if seed_b_active else phase)),
-            train_dataset=train_ds, data_collator=train_collator, callbacks=[cb, telemetry.make_trainer_callback(spec.output_dir)],
+            train_dataset=train_ds, data_collator=train_collator, callbacks=[cb, telemetry.make_trainer_callback(_telemetry_dir)],
         )
         t_phase0 = time.monotonic()
         eval0, pers0 = state["eval_secs"], state["persist_secs"]
@@ -2872,7 +2877,8 @@ def run(
                     remaining_s=round(deadline.remaining_hard(), 1), **{f"cgroup_{k}": v for k, v in selection.cgroup_memory_peak().items()})
     if result is not None:
         result.update(completed=True, saved=bool(ok), truth=truth, tail_s=round(time.monotonic() - _t_core_end, 2))
-    telemetry.write_into(spec.output_dir)
+    if geometry_select is None:   # run S: the selector writes the record after it has read the export back
+        telemetry.write_into(spec.output_dir)
 
 
 def trained_artifact_present(spec: TaskSpec) -> bool:

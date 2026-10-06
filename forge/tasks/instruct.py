@@ -1009,8 +1009,9 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             v2_fallback = not retry_cheap
         else:
             # The run returned normally: its trained artifact is exported and complete on disk. Only now may the
-            # selector train the alternate geometry; whatever happens there, this artifact stays unless the second
-            # run beats it on the internal DEV and its own save succeeds (geometry_select.maybe_second_run never raises).
+            # selector train the alternate geometry. Which run is exported afterwards is read back from disk by the
+            # selector (geometry_select._finalize), never inferred here. maybe_second_run handles every exception itself;
+            # should an interrupt still escape it, the CLI keeps whatever trained artifact is at the output path.
             if _gs_first is not None:
                 loaded = None  # this frame holds no model: the run took it (loaded.model = None) and its frame is gone
                 tokenizer = None
