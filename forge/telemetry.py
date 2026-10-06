@@ -139,6 +139,26 @@ def eval_point(step: int, eval_loss: float) -> None:
         pass
 
 
+def snapshot() -> dict[str, Any]:
+    """Meta and curve lengths now (geometry selector: taken after run A, before a second training starts)."""
+    try:
+        return {"meta": dict(_data["meta"]), "train_curve": list(_data["train_curve"]), "eval_curve": list(_data["eval_curve"])}
+    except Exception:
+        return {}
+
+
+def restore(snap: dict[str, Any]) -> None:
+    """Put the snapshot's meta and curves back (the second training was not kept). Events are never removed."""
+    try:
+        if not snap:
+            return
+        _data["meta"] = dict(snap["meta"])
+        _data["train_curve"] = list(snap["train_curve"])
+        _data["eval_curve"] = list(snap["eval_curve"])
+    except Exception:
+        pass
+
+
 def collect_env() -> None:
     """Versions + hardware; called from handlers once heavy imports exist."""
     try:

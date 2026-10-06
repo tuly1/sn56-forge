@@ -20,6 +20,7 @@ import random
 import re
 import shutil
 import stat
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -45,6 +46,7 @@ from forge.model import (
     model_param_billions,
     prepare_full_finetune,
 )
+from forge.tasks import geometry_select
 from forge.tasks.common import (
     ARTIFACT_COMPLETE_BEST,
     ARTIFACT_FLOOR,
@@ -717,7 +719,9 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     if not rows:
         raise RuntimeError("empty dataset")
 
+    _t_load0 = time.monotonic()
     loaded = load_base(spec.cached_model_dir, for_generation=False)
+    _base_load_s = time.monotonic() - _t_load0  # geometry selector: what loading the base again will cost
     tokenizer = loaded.tokenizer
     telemetry.collect_env()
 
@@ -963,28 +967,27 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
     while (adapter_exception is None and not pinned_route and not falcon_legacy_route and not short_rows
            and sft_v2.eligible(spec, is_kl=is_kl, params_b=params_b, n_gpus=n_gpus, model=loaded.model)):
         retry_cheap = False
+        # in-run geometry selector (release-candidate-v10b, forge.tasks.geometry_select): armed on the full-weight FIELD
+        # route's first rung only; None = this call is 9504136's
+        _gs_refusal = geometry_select.static_refusal(field_route=bool(field_route), strategy=v2_strategy_override, rung=rung)
+        _gs_first: dict[str, Any] | None = {} if _gs_refusal is None else None
+        _v2_kwargs = dict(
+            baseline_summary=baseline_summary,
+            params_b=params_b,
+            per_gpu_gb=per_gpu_gb,
+            strategy_override=v2_strategy_override,
+            route_lr=v2_route_lr,
+            field_route=field_route,
+            damaged_base_route=damaged_base_route,
+            clean_small_qwen_route=clean_small_qwen_route,
+            clean_small_lfm2_route=clean_small_lfm2_route,
+            recipe_key=fullft_recipe,
+            cheap_full=rung == "cheap_full",
+            base_damage=_base_damage,
+            base_clean_ref=_base_clean_ref,
+        )
         try:
-            sft_v2.run(
-                spec,
-                deadline,
-                rows,
-                loaded,
-                tokenizer,
-                baseline_summary=baseline_summary,
-                params_b=params_b,
-                per_gpu_gb=per_gpu_gb,
-                strategy_override=v2_strategy_override,
-                route_lr=v2_route_lr,
-                field_route=field_route,
-                damaged_base_route=damaged_base_route,
-                clean_small_qwen_route=clean_small_qwen_route,
-                clean_small_lfm2_route=clean_small_lfm2_route,
-                recipe_key=fullft_recipe,
-                cheap_full=rung == "cheap_full",
-                base_damage=_base_damage,
-                base_clean_ref=_base_clean_ref,
-            )
-            return
+            sft_v2.run(spec, deadline, rows, loaded, tokenizer, **_v2_kwargs, result=_gs_first)
         except BaseException as exc:  # noqa: BLE001
             telemetry.event(
                 "sft_v2_failed",
@@ -1004,6 +1007,21 @@ def run(spec: TaskSpec, deadline: Deadline) -> None:
             retry_cheap = (fullft_route and rung == "full" and isinstance(exc, Exception)
                            and deadline.remaining() >= sft_v2.CHEAP_FULL_MIN_REMAINING_S)
             v2_fallback = not retry_cheap
+        else:
+            # The run returned normally: its trained artifact is exported and complete on disk. Only now may the
+            # selector train the alternate geometry; whatever happens there, this artifact stays unless the second
+            # run beats it on the internal DEV and its own save succeeds (geometry_select.maybe_second_run never raises).
+            if _gs_first is not None:
+                loaded = None  # this frame holds no model: the run took it (loaded.model = None) and its frame is gone
+                tokenizer = None
+                geometry_select.maybe_second_run(
+                    spec, deadline, rows, first=_gs_first, run_kwargs=_v2_kwargs, run_fn=sft_v2.run, load_base=load_base,
+                    free=_free_cuda, artifact_present=sft_v2.trained_artifact_present, load_s=_base_load_s,
+                    log=geometry_select.make_log(telemetry), telemetry=telemetry)
+            elif field_route and v2_strategy_override == "full":
+                geometry_select.make_log(telemetry)("sft_v2_geometry_select", ran=False, skipped=True, pick="A",
+                                                    reason=_gs_refusal)
+            return
         if not retry_cheap:
             break
         # rung 2, outside the except suite so the failed attempt's frames (model, optimizer) can be freed

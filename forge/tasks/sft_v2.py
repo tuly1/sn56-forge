@@ -26,6 +26,7 @@ from forge import telemetry
 from forge.clock import Deadline
 from forge.data import hygiene, packing, prompts, tokenize
 from forge.data.schema import TaskSpec
+from forge.tasks import geometry_select as geometry_select_mod
 from forge.data.split import (
     adaptive_max_len,
     dev_size_for,
@@ -1558,8 +1559,15 @@ def run(
     cheap_full: bool = False,
     base_damage: str | None = None,
     base_clean_ref: str | None = None,
+    geometry_select: Any | None = None,
+    result: dict[str, Any] | None = None,
 ) -> None:
-    """``recipe_key`` (default_recipe_key, full-FT default route): which measured recipe the FIELD route trains with.
+    """``geometry_select`` (forge.tasks.geometry_select.SecondRun, release-candidate-v10b): this call is the SECOND training
+    of the in-run geometry selector. It trains at the alternate rows per step, keeps run A's DEV size, saves nothing until it
+    has beaten run A's internal DEV, and raises SecondRunAbort / SecondRunRejected when run A stays. ``result``: a dict the
+    caller reads after the call (measured seconds, internal DEV, DEV fingerprint, geometry). Both default to None: the run
+    is then 9504136's, byte for byte in what it trains and saves.
+    ``recipe_key`` (default_recipe_key, full-FT default route): which measured recipe the FIELD route trains with.
     ``cheap_full`` (fallback rung 2): bf16 weights + paged 8-bit AdamW at any size, half the micro-batch, checkpointing
     on, no Gemma2 champion geometry. ``base_damage`` / ``base_clean_ref``: the dispatcher's damage verdict and the
     reference a "clean" verdict names (hyperparameters only: clean_minicpm5_lr_rule). Raises ZeroTrainedStepsError when
@@ -1636,6 +1644,8 @@ def run(
     max_len = adaptive_max_len(lengths, ceiling=min(EVAL_CAP, max(256, model_cap)))
     hours_total = deadline.remaining_hard() / 3600.0
     dev_n = dev_size_for(len(tokenized), hours=hours_total)
+    if geometry_select is not None:
+        dev_n = geometry_select.dev_n  # run A's DEV size (dev_size_for reads the remaining hours, fewer now): same DEV rows
     if dup_groups is not None:
         train_ex, dev_ex = grouped_stratified_split(tokenized, dev_n, dup_groups, seed=7)
     else:
@@ -1646,6 +1656,11 @@ def run(
         "sft_v2_data", rows=len(rows), tokenized=n_raw, deduped=len(tokenized), train_n=len(train_ex), dev_n=len(dev_ex),
         max_len=max_len, p50=sorted(lengths)[len(lengths) // 2], p99=sorted(lengths)[min(len(lengths) - 1, int(0.99 * len(lengths)))],
     )
+    _dev_fp = None
+    if result is not None or geometry_select is not None:
+        # geometry selector: the two runs are compared on these rows; the fingerprint verifies they are the same rows
+        _dev_fp = geometry_select_mod.dev_fingerprint(dev_ex)
+        _event_and_print("sft_v2_dev_fingerprint", dev_n=len(dev_ex), sha256=_dev_fp, second_run=geometry_select is not None)
 
     # ---- model preparation (full weights) ----
     vocab = _vocab(model)
@@ -1688,6 +1703,20 @@ def run(
     # batch 16 beat 178 at batch 76); full weights follow the champion's batch 64, or
     # the champion's size bucket on the field route
     _eff_default = 16 if strategy == "lora" else (field_eff_batch(params_b) if field else EFF_BATCH_TARGET)
+    if geometry_select is not None:
+        # geometry selector, run S: the VALUE the research knob FORGE_V2_FIELD_EFF_BATCH would carry (about 32 rows per
+        # step); everything below is the unchanged knob path (packing's rows-to-blocks, choose_geometry, the recipe's bf16
+        # geometry, the memory probe, the window plan)
+        if not field or strategy != "full":
+            raise geometry_select_mod.SecondRunAbort("not_field_full_weights")
+        _eff_default = int(geometry_select.eff_value(
+            params_b=params_b, unit_len=unit_len, vocab=vocab, per_gpu_gb=per_gpu_gb, bnb_ok=_bnb_available(), layers=layers,
+            hidden=hidden, liger=use_liger, pack=pack,
+            recipe_bf16=bool(run_field_recipe(
+                str(getattr(getattr(model, "config", None), "model_type", "") or ""), params_b, field=field,
+                recipe_key=recipe_key, damaged_base_route=damaged_base_route, clean_small_qwen_route=clean_small_qwen_route,
+                clean_small_lfm2_route=clean_small_lfm2_route, base_damage=base_damage,
+                base_clean_ref=base_clean_ref)["bf16"]))["value"])
     if field:
         _event_and_print("sft_v2_field_route", params_b=round(params_b, 3), eff_batch=_eff_default)
     if pack:
@@ -2075,9 +2104,9 @@ def run(
     # default tasks >= 3.0 B only. Below 3.0 B this block is not entered, so the run is 854bf7a's. Grows the effective
     # batch (same micro-batch, more accumulation) toward the champion's tokens per step and scales the fixed FIELD LR by
     # min(LR_FACTOR_MAX 2.0, (B_new / B_old) ** LR_ALPHA 0.5) (phase-ba arm C; c1f7501 used 0.75). ----
-    if (large_model_rule_eligible(field=field, recipe_key=recipe_key, cheap_full=cheap_full, g2c=_g2c, strategy=strategy,
-                                  params_b=params_b)
-            and t_per_step and _lr_override > 0 and not field_calibration):
+    _lm_eligible = large_model_rule_eligible(field=field, recipe_key=recipe_key, cheap_full=cheap_full, g2c=_g2c,
+                                             strategy=strategy, params_b=params_b)
+    if _lm_eligible and t_per_step and _lr_override > 0 and not field_calibration:
         _lm_sorted = sorted(lengths)
         _lm_len = large_model_rule.champion_len(_lm_sorted[len(_lm_sorted) // 2],
                                                 _lm_sorted[min(len(_lm_sorted) - 1, int(0.99 * len(_lm_sorted)))])
@@ -2413,7 +2442,8 @@ def run(
                 state["overfit"] = 0
             admitted = pool.consider(m, loss, step)
             since_persist = time.monotonic() - state["last_persist_at"]
-            if improved and (since_persist > 120.0 or loss < state["persisted_best"] * 0.995 or state["persisted_best"] == float("inf")):
+            _deferred = geometry_select is not None and geometry_select.defer_persist  # run S saves nothing until it has won
+            if improved and not _deferred and (since_persist > 120.0 or loss < state["persisted_best"] * 0.995 or state["persisted_best"] == float("inf")):
                 snap = pool.best()["state"] if (admitted and pool.best() and pool.best()["step"] == step) else selection.snapshot_trainable(m)
                 if persist(m, snap, step, ARTIFACT_PARTIAL_TRAINED_BEST, "dev_minimum"):
                     state["persisted_best"], state["persisted_step"] = loss, step
@@ -2433,6 +2463,11 @@ def run(
                     self.eval_every = widened
             return control
 
+    if geometry_select is not None:
+        # geometry selector, stage-2 time gate: run S's own measured step time, before its first optimizer step
+        geometry_select.before_train(dev_fp=_dev_fp, rows_per_step=rows_per_step(), t_step_s=t_per_step,
+                                     steps_per_epoch=steps_per_epoch, finish_reserve_s=finish_reserve,
+                                     remaining_s=deadline.remaining_hard())
     _event_and_print("sft_v2_train_start", elapsed_s=round(time.monotonic() - t_start, 1), lr=lr, prior_lr=prior_lr,
                      t_per_step=t_per_step, steps_per_epoch=steps_per_epoch, finish_reserve_s=round(finish_reserve, 1),
                      **_flat({"probe": diag}))
@@ -2712,6 +2747,7 @@ def run(
             _free_cuda()
 
     # ---- greedy soup ----
+    _t_soup0 = time.monotonic()
     chosen_state: dict[str, Any] | None = None
     chosen_loss = state["best"]
     chosen_step = state["best_step"]
@@ -2739,6 +2775,29 @@ def run(
     elif pool.best() is not None:
         chosen_state = pool.best()["state"]
         selection.load_state(model, chosen_state)
+
+    # ---- geometry selector (release-candidate-v10b): what this run measured, before its dev pass ----
+    _t_core_end = time.monotonic()
+    if result is not None:
+        result.update(
+            completed=False, saved=False, chosen_loss=chosen_loss, chosen_step=chosen_step, dev_n=len(dev_ex),
+            dev_fingerprint=_dev_fp, field=bool(field), strategy=strategy, cheap_full=bool(cheap_full),
+            gemma2_champion=bool(_g2c), large_model_rule=bool(_lm_eligible), field_hygiene=bool(field_hygiene),
+            lr_search=bool(field_calibration or (field and _field_sweep())), oom_retries=int(oom_retries),
+            window_bound=bool(not state["last_phase_complete"] and not state["stopped_overfit"]),
+            rows_per_step=int(rows_per_step()), micro=geo.micro_batch, grad_accum=geo.grad_accum,
+            steps_per_epoch=int(steps_per_epoch), steps=int(final_step), epochs_done=round(float(state["epochs_done"]), 4),
+            t_step_s=t_step, eval_s=round(float(state["eval_secs"]), 2), eval_count=int(state["eval_count"]),
+            soup_s=round(_t_core_end - _t_soup0, 2), core_s=round(_t_core_end - t_start, 2),
+            finish_reserve_s=round(float(finish_reserve), 2), stopped_overfit=bool(state["stopped_overfit"]),
+            last_phase_complete=bool(state["last_phase_complete"]))
+    if geometry_select is not None:
+        # run S: keep it only when its internal DEV beats run A's by the margin; otherwise SecondRunRejected leaves run A's
+        # exported artifact untouched (nothing of run S has been written to the output path)
+        _event_and_print("sft_v2_geometry_select_compare", first_dev=geometry_select.first.get("chosen_loss"),
+                         second_dev=chosen_loss, margin=geometry_select_mod.MARGIN, second_steps=int(final_step),
+                         second_epochs=round(float(state["epochs_done"]), 3), second_core_s=round(_t_core_end - t_start, 1))
+        geometry_select.on_chosen(chosen_loss)
 
     # ---- dev pass: one low-LR epoch over the held-out slice from the chosen weights ----
     # Harness knobs: FORGE_DEV_PASS_EPOCHS (passes, default 1), FORGE_DEV_PASS_LR_MULT
@@ -2809,6 +2868,8 @@ def run(
         raise PersistFailedError("sft_v2 trained but could not save any trained artifact")
     _event_and_print("sft_v2_final", saved=ok, chosen_loss=chosen_loss, chosen_step=chosen_step, truth=truth,
                     remaining_s=round(deadline.remaining_hard(), 1), **{f"cgroup_{k}": v for k, v in selection.cgroup_memory_peak().items()})
+    if result is not None:
+        result.update(completed=True, saved=bool(ok), truth=truth, tail_s=round(time.monotonic() - _t_core_end, 2))
     telemetry.write_into(spec.output_dir)
 
 
