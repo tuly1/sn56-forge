@@ -1,0 +1,210 @@
+{
+ "source": "research/20261001-job-runner/sessions/jr-20261006t010449z/results/bv-minicpm5-2b-base-v9-s7/items/bv-minicpm5-2b-base-v9-s7/train/forge_run.json",
+ "release": "d44a582",
+ "gpu": "NVIDIA H100 PCIe",
+ "note": "timing events of a real run (events filtered to the names the tail-reserve tests read; values unchanged)",
+ "meta": {
+  "task_id": "c9262336-94d2-5f87-9bdb-40f29fd1814c",
+  "hours_to_complete": 0.4,
+  "model_arg": "2fe290d4e75b65c7"
+ },
+ "events": [
+  {
+   "t": 12.7,
+   "name": "sft_v2_selected",
+   "params_b": 2.517,
+   "hours_remaining": 0.396
+  },
+  {
+   "t": 18.3,
+   "name": "sft_v2_data",
+   "rows": 3000,
+   "tokenized": 3000,
+   "deduped": 3000,
+   "train_n": 2600,
+   "dev_n": 400,
+   "max_len": 768,
+   "p50": 181,
+   "p99": 684
+  },
+  {
+   "t": 19.6,
+   "name": "sft_v2_field_recipe",
+   "damaged_base": false,
+   "clean_small_qwen": false,
+   "recipe_key": "llama",
+   "cheap_full": false,
+   "bf16": false,
+   "bf16_min_b": 2.0,
+   "lr_mult": 1.0,
+   "eff_batch": 48,
+   "strategy": "full"
+  },
+  {
+   "t": 23.7,
+   "name": "sft_v2_memory_probe",
+   "micro": 32,
+   "gradient_checkpointing": true,
+   "fits": true
+  },
+  {
+   "t": 23.8,
+   "name": "sft_v2_field_lr",
+   "prior_lr": 4.549217420743054e-05,
+   "raw": 4.549217420743054e-05,
+   "mult": 1.0,
+   "eff_batch": 64,
+   "rows_per_step": 64
+  },
+  {
+   "t": 37.2,
+   "name": "sft_v2_timing",
+   "t_per_step": 1.2497,
+   "eff_batch": 64,
+   "losses": [
+    1.4904,
+    1.7473,
+    1.412
+   ]
+  },
+  {
+   "t": 37.9,
+   "name": "sft_v2_sweep_gate",
+   "batches": 82,
+   "t_per_step": 1.2497,
+   "lr_override": 4.549217420743054e-05,
+   "remaining_s": 1402.1
+  },
+  {
+   "t": 38.5,
+   "name": "sft_v2_snapshot_pool",
+   "k": 8,
+   "params_b": 2.517,
+   "available_ram": 114739945472,
+   "peak_bytes": 12057739264,
+   "limit_bytes": 118111600640
+  },
+  {
+   "t": 38.5,
+   "name": "sft_v2_train_start",
+   "elapsed_s": 25.8,
+   "lr": 4.549217420743054e-05,
+   "prior_lr": 4.549217420743054e-05,
+   "t_per_step": 1.2496644469999865,
+   "steps_per_epoch": 40,
+   "finish_reserve_s": 193.1
+  },
+  {
+   "t": 38.5,
+   "name": "sft_v2_plan",
+   "phase": 0,
+   "lr": 4.549217420743054e-05,
+   "t_per_step": 1.2496644469999865,
+   "epochs": 4.0,
+   "total_steps": 160,
+   "warmup": 4,
+   "eval_every": 10,
+   "window_s": 1208.4,
+   "epochs_done": 0.0
+  },
+  {
+   "t": 65.7,
+   "name": "sft_v2_eval",
+   "step": 10,
+   "dev_loss": 2.077631,
+   "best": 2.077631,
+   "eval_s": 4.3,
+   "pool": 1,
+   "improved": true
+  },
+  {
+   "t": 65.7,
+   "name": "sft_v2_eval_governor",
+   "eval_every": 89,
+   "eval_s": 4.3
+  },
+  {
+   "t": 198.3,
+   "name": "sft_v2_eval",
+   "step": 89,
+   "dev_loss": 1.737336,
+   "best": 1.737336,
+   "eval_s": 4.0,
+   "pool": 2,
+   "improved": true
+  },
+  {
+   "t": 315.9,
+   "name": "sft_v2_eval",
+   "step": 164,
+   "dev_loss": 1.887411,
+   "best": 1.737336,
+   "eval_s": 4.0,
+   "pool": 3,
+   "improved": false
+  },
+  {
+   "t": 315.9,
+   "name": "train_end",
+   "steps": 164,
+   "epochs": 4.0,
+   "planned_epochs": 4.0
+  },
+  {
+   "t": 316.5,
+   "name": "sft_v2_phase_end",
+   "phase": 0,
+   "steps": 164,
+   "planned": 164,
+   "epochs_done": 4.1,
+   "t_per_step_measured": 1.559,
+   "best": 1.737336112856865,
+   "best_step": 89,
+   "remaining_s": 1123.5
+  },
+  {
+   "t": 316.5,
+   "name": "sft_v2_train_end",
+   "step": 164,
+   "best": 1.737336112856865,
+   "best_step": 89,
+   "phases": 1,
+   "remaining_s": 1123.5
+  },
+  {
+   "t": 354.9,
+   "name": "soup_result",
+   "seed_loss": 1.73723088350147,
+   "soup_loss": 1.551651632990688,
+   "members": 3,
+   "pool": 3,
+   "steps": [
+    89,
+    164,
+    10
+   ]
+  },
+  {
+   "t": 374.3,
+   "name": "sft_v2_dev_pass_done",
+   "rows": 400,
+   "lr": 1.1373043551857636e-05,
+   "pass_index": 1
+  },
+  {
+   "t": 382.8,
+   "name": "sft_v2_final",
+   "saved": true,
+   "chosen_loss": 1.551651632990688,
+   "chosen_step": 164,
+   "truth": "COMPLETE_BEST",
+   "remaining_s": 1057.3,
+   "cgroup_peak_bytes": 39215288320,
+   "cgroup_limit_bytes": 118111600640
+  },
+  {
+   "t": 383.4,
+   "name": "run_complete"
+  }
+ ]
+}

@@ -1528,17 +1528,26 @@ def _liger_ok(model: Any) -> bool:
 
 
 class _StopAt:
-    """Stops training when the remaining wall clock drops below the finish reserve, plus the tail reserve (v9.4:
-    ``extra_s``, the measured time the final eval, the greedy soup and the dev pass still need; 0.0 = 9504136)."""
+    """Stops training when the remaining wall clock drops below the finish reserve (9504136), or below the finish
+    reserve plus the tail reserve ``extra_s`` (v9.4: the time the greedy soup and the dev pass still need; 0.0 =
+    9504136). ``tail_fired`` is set only when the guard stops a step that 9504136 would have let run; the v9.4 finish
+    rules act only then."""
 
     def __init__(self, deadline: Deadline, finish_reserve_s: float) -> None:
         self.deadline = deadline
         self.finish_reserve_s = finish_reserve_s
         self.extra_s = 0.0
+        self.tail_fired = False
         self.fired = False
 
     def should_stop(self) -> bool:
-        return self.deadline.remaining_hard() <= self.finish_reserve_s + self.extra_s
+        left = self.deadline.remaining_hard()
+        if left <= self.finish_reserve_s:
+            return True  # the 9504136 stop
+        if left <= self.finish_reserve_s + self.extra_s:
+            self.tail_fired = True
+            return True
+        return False
 
 
 def run(
@@ -2482,7 +2491,8 @@ def run(
                     if (_tp["level"], _tp["soup_members"]) != state.get("tail_level"):
                         state["tail_level"] = (_tp["level"], _tp["soup_members"])
                         _event_and_print("sft_v2_tail_reserve", step=step, **_tp)
-                except Exception as exc:  # the reserve must never fail a run: keep the last value (0.0 = 9504136)
+                except Exception as exc:  # the reserve must never fail a run: back to 0.0 = the 9504136 stop
+                    stop_at.extra_s = 0.0
                     _event_and_print("sft_v2_tail_reserve_failed", stage="plan", error=f"{type(exc).__name__}: {exc}"[:200])
             if not self.governed and t_step:
                 # keep evaluation (incl. persistence) under ~6% of training time
@@ -2524,8 +2534,12 @@ def run(
     seed_b_active = False
     seed_a: dict[str, Any] = {}
     while phase < 4:
+        if _tail_on and stop_at.tail_fired:
+            break  # v9.4: the tail reserve ended training; what is left belongs to the finish stages
         remaining = deadline.remaining_hard()
         window = remaining - finish_reserve
+        if _tail_on:  # a later phase keeps the reserve only up to the cap of its own window (phase 0: 0.0)
+            stop_at.extra_s = min(stop_at.extra_s, TAIL_MAX_WINDOW_FRAC * max(0.0, window))
         min_window = max(240.0, 25.0 * t_step) if t_step else 240.0
         if state["stopped_overfit"]:
             # One warm restart from the best snapshot at a lower learning rate
@@ -2771,8 +2785,27 @@ def run(
         # the chosen candidate (single seed or the exact two-seed soup) is loaded in the model
         state["best"], state["best_step"], state["last_eval_step"] = two_seed_result[0], two_seed_result[1], final_step
         pool.items = []
+    # ---- v9.4 finish mode ----
+    # export_floor: the 9504136 export reserve, raised only by a slow save measured in this run. The v9.4 finish rules
+    # apply when the tail reserve ended training (tail_active) or the floor is raised (floor only: strictly less work
+    # than 9504136). In every other run each expression below evaluates exactly as in 9504136.
+    _eval_before = state["eval_secs"] / max(1, state["eval_count"]) if state["eval_count"] else dev_eval_est
+    export_floor, tail_active, _final_eval_need = export_reserve, False, dev_eval_est
+    if _tail_on:
+        try:
+            export_floor = tail_export_floor(export_reserve, state["persist_max"])
+            tail_active = bool(stop_at.tail_fired)
+            if tail_active or export_floor > export_reserve:
+                _final_eval_need = max(dev_eval_est, _tail_slow() * _eval_before)
+                _event_and_print("sft_v2_tail_finish", tail_active=tail_active, export_floor_s=round(export_floor, 1),
+                                 export_reserve_s=export_reserve, persist_max_s=round(state["persist_max"], 1),
+                                 remaining_s=round(deadline.remaining_hard(), 1))
+        except Exception as exc:  # the reserve must never fail a run: 9504136 finish
+            export_floor, tail_active, _final_eval_need = export_reserve, False, dev_eval_est
+            _event_and_print("sft_v2_tail_reserve_failed", stage="finish_mode", error=f"{type(exc).__name__}: {exc}"[:200])
+    _tail_mode = tail_active or export_floor > export_reserve
     # ---- final evaluation of the last weights (may be the best) ----
-    if dev_rows_for_selection and state["last_eval_step"] != final_step and deadline.remaining_hard() > export_reserve + dev_eval_est:
+    if dev_rows_for_selection and state["last_eval_step"] != final_step and deadline.remaining_hard() > export_floor + _final_eval_need:
         try:  # D5: a failed final eval (e.g. OOM) must not discard the trained weights; the pool/best keep selection
             last_loss = eval_dev(model)
             telemetry.eval_point(final_step, last_loss)
@@ -2790,23 +2823,19 @@ def run(
     chosen_step = state["best_step"]
     soup_budget = max(0.0, 0.5 * (deadline.remaining_hard() - export_reserve - _dev_pass_estimate(len(dev_ex), t_per_step, geo)))
     measured_eval = state["eval_secs"] / max(1, state["eval_count"]) if state["eval_count"] else dev_eval_est
-    # v9.4: the export floor of the tail stages. Never below the 9504136 export reserve; raised only when a save measured
-    # in this run, times the slow-node factor, exceeds it.
-    export_floor = export_reserve
-    if _tail_on:
+    if _tail_mode and pool.items and dev_rows_for_selection and len(pool.items) >= 2:
+        # v9.4: every soup trial must leave the export floor and the dev-pass gate margin (tail_soup_budget). After a
+        # tail-reserve stop that is the budget; with only a raised floor it can only shrink the 9504136 budget.
         try:
-            export_floor = tail_export_floor(export_reserve, state["persist_max"])
-            if pool.items and dev_rows_for_selection and len(pool.items) >= 2:
-                # v9.4: the soup may use everything above the export floor and the dev-pass gate margin; the dev pass then
-                # takes what is left. Never less than the 9504136 budget, so a soup that fitted before is tried identically.
-                _tb = tail_soup_budget(remaining_s=deadline.remaining_hard(), export_floor_s=export_floor, pool_n=len(pool.items),
-                                       eval_s=measured_eval, trainable_params=_tail_trainable(model))
-                if _tb["budget_s"] > soup_budget:
-                    _event_and_print("sft_v2_tail_soup_budget", old_s=round(soup_budget, 1), remaining_s=round(deadline.remaining_hard(), 1),
-                                     export_floor_s=round(export_floor, 1), **_tb)
-                    soup_budget = _tb["budget_s"]
-        except Exception as exc:  # the reserve must never fail a run: the 9504136 budget stands
+            _tb = tail_soup_budget(remaining_s=deadline.remaining_hard(), export_floor_s=export_floor, pool_n=len(pool.items),
+                                   eval_s=measured_eval, trainable_params=_tail_trainable(model))
+            _new = _tb["budget_s"] if tail_active else min(soup_budget, _tb["budget_s"])
+        except Exception as exc:  # no budget can be computed: no soup (the best snapshot is exported)
+            _tb, _new = {}, 0.0
             _event_and_print("sft_v2_tail_reserve_failed", stage="soup_budget", error=f"{type(exc).__name__}: {exc}"[:200])
+        _event_and_print("sft_v2_tail_soup_budget", old_s=round(soup_budget, 1), new_s=round(_new, 1), tail_active=tail_active,
+                         remaining_s=round(deadline.remaining_hard(), 1), export_floor_s=round(export_floor, 1), **_tb)
+        soup_budget = _new
     if pool.items and dev_rows_for_selection and len(pool.items) >= 2 and soup_budget < 2.5 * measured_eval:
         _event_and_print("sft_v2_soup_skipped", budget_s=round(soup_budget, 1), eval_s=round(measured_eval, 1))
         pool.items = pool.items[:1]  # keep the best only: the soup would not fit a single trial
@@ -2879,17 +2908,20 @@ def run(
     _dp_factory = dev_pass_optimizer_factory(geo, optimizer_factory, strategy=strategy, betas=(_beta1, _beta2))
     if _dp_factory is None and dev_ex and len(dev_ex) >= 100:
         _event_and_print("sft_v2_dev_pass_skipped", reason="bf16_weights_without_8bit_adamw", optim=geo.optim)
-    if (_tail_on and _dp_factory is not None and dev_ex and len(dev_ex) >= 100 and os.environ.get("FORGE_DEV_PASS", "1") != "0"
+    if (_tail_mode and _dp_factory is not None and dev_ex and len(dev_ex) >= 100 and os.environ.get("FORGE_DEV_PASS", "1") != "0"
             and deadline.remaining_hard() <= export_floor + dev_pass_s + 30):
-        # v9.4: the full dev pass does not fit (9504136 skipped it here without a log line). Run it over the first rows
-        # that do fit, never fewer than the gate's own 100-row minimum; otherwise skip and say so.
+        # v9.4: the full dev pass does not fit above the export floor (9504136 skipped it here without a log line). After
+        # a tail-reserve stop, run it over the first rows that do fit, never fewer than the gate's own 100-row minimum;
+        # otherwise (and always when only the floor is raised) skip and say so.
         _left = deadline.remaining_hard()
-        try:
-            _n_short = tail_dev_pass_rows(remaining_s=_left, export_floor_s=export_floor, n_dev=len(dev_ex),
-                                          estimate=lambda n: _dev_pass_estimate(n, t_per_step, geo))
-        except Exception as exc:  # the reserve must never fail a run: no shortened pass (9504136 skips it here)
-            _event_and_print("sft_v2_tail_reserve_failed", stage="dev_pass_rows", error=f"{type(exc).__name__}: {exc}"[:200])
-            _n_short = 0
+        _n_short = 0
+        if tail_active:
+            try:
+                _n_short = tail_dev_pass_rows(remaining_s=_left, export_floor_s=export_floor, n_dev=len(dev_ex),
+                                              estimate=lambda n: _dev_pass_estimate(n, t_per_step, geo))
+            except Exception as exc:  # the reserve must never fail a run: no shortened pass
+                _event_and_print("sft_v2_tail_reserve_failed", stage="dev_pass_rows", error=f"{type(exc).__name__}: {exc}"[:200])
+                _n_short = 0
         if _n_short > 0:
             _event_and_print("sft_v2_tail_dev_pass_shortened", rows=_n_short, of=len(dev_ex), remaining_s=round(_left, 1),
                              dev_pass_s=round(_dev_pass_estimate(_n_short, t_per_step, geo), 1), export_floor_s=round(export_floor, 1))
@@ -2933,6 +2965,9 @@ def run(
     if final_step <= 0:
         return
     final_state = chosen_state if chosen_state is not None else selection.snapshot_trainable(model)
+    # log only: the export START milestone (sft_v2_final below is written after the save)
+    _event_and_print("sft_v2_export_start", remaining_s=round(deadline.remaining_hard(), 1), export_floor_s=round(export_floor, 1),
+                     tail_active=tail_active, persist_max_s=round(state["persist_max"], 1))
     # run S labels its one save with its generation marker: the selector reads it back to know which run is exported
     ok = persist(model, final_state, chosen_step or final_step, truth,
                  "sft_v2_final" if geometry_select is None else geometry_select.truth_reason)
@@ -3222,25 +3257,28 @@ def tail_export_floor(export_reserve_s: float, persist_max_s: float) -> float:
 def tail_reserve_plan(*, export_reserve_s: float, finish_reserve_s: float, eval_s: float, pool_n: int,
                       trainable_params: float, dev_pass_s: float, t_step: float, persist_max_s: float,
                       window_s: float) -> dict[str, Any]:
-    """How many seconds BEFORE the 9504136 finish reserve training must stop (``extra_s`` >= 0, so never later).
+    """How many seconds BEFORE the 9504136 finish reserve training must stop (``extra_s`` >= 0 for finite inputs, so the
+    stop guard never fires later at the same callback state).
 
-    extra(level) = slow x soup trials + dev pass + its gate margin + one optimizer step + any export-floor raise. It is
-    added ON TOP of the finish reserve (which keeps paying for the final eval and the export exactly as in 9504136), so
-    when the soup and the dev pass take no longer than reserved, the export starts no later than 9504136 would have
-    started it. Predeclared order when extra exceeds TAIL_MAX_WINDOW_FRAC of the window: (1) full pool + dev pass;
-    (2) full pool, no dev-pass reserve; (3) the best m < pool members, m down to 2; (4) nothing (9504136 behaviour).
-    The soup goes last because it carries the measured gain (soup -3.1 %, one dev pass -0.35 % on the same trajectory;
-    SCIENCE-LEDGER 2026-09-12 04:15)."""
+    extra(level) = soup + dev-pass estimate + its gate margin + one optimizer step + any export-floor raise, where
+    soup = the larger of slow x members trials and what tail_soup_budget needs to admit ``members`` trials at the
+    measured speed ((members + slow) trials + one averaging). It is added ON TOP of the finish reserve. If the trials
+    really run slow-factor slower, the last of them may not be admitted. Predeclared order when extra exceeds TAIL_MAX_WINDOW_FRAC of the window: (1) reserve for the
+    whole pool + dev pass; (2) whole pool, no dev-pass reserve; (3) m < pool trials, m down to 2; (4) nothing (the
+    9504136 stop). ``soup_members`` sizes the RESERVE only: the greedy soup itself tries the pool best-first until its
+    time budget ends. The averaging constant and the soup-before-dev-pass priority are empirical choices (H100 / A100
+    receipts; one stage-scored trajectory), not bounds."""
     slow = _tail_slow()
     floor_raise = tail_export_floor(export_reserve_s, persist_max_s) - float(export_reserve_s)
     trial = tail_trial_seconds(eval_s, trainable_params)
+    mix = tail_trial_seconds(0.0, trainable_params)
     cap = TAIL_MAX_WINDOW_FRAC * max(0.0, float(window_s))
     n = max(0, int(pool_n))
     dp = (float(dev_pass_s) + TAIL_GATE_MARGIN_S) if dev_pass_s > 0 else 0.0
 
     def extra(members: int, with_dp: bool) -> float:
-        soup = members * trial if members >= 2 else 0.0
-        return slow * soup + (dp if with_dp else 0.0) + max(0.0, float(t_step)) + floor_raise
+        soup = max(slow * members * trial, (members + slow) * trial + mix) if members >= 2 else 0.0
+        return soup + (dp if with_dp else 0.0) + max(0.0, float(t_step)) + floor_raise
 
     levels: list[tuple[str, int, bool]] = []
     if n >= 2:
@@ -3253,18 +3291,29 @@ def tail_reserve_plan(*, export_reserve_s: float, finish_reserve_s: float, eval_
     base = {"finish_reserve_s": round(float(finish_reserve_s), 1), "cap_s": round(cap, 1), "trial_s": round(trial, 1), "slow": slow}
     for name, members, with_dp in levels:
         x = extra(members, with_dp)
-        if x <= cap:
+        if math.isfinite(x) and 0.0 <= x <= cap:
             return {"level": name, "soup_members": members, "dev_pass": bool(with_dp), "extra_s": round(x, 1), **base}
     return {"level": "none", "soup_members": 0, "dev_pass": False, "extra_s": 0.0, **base}
 
 
 def tail_soup_budget(*, remaining_s: float, export_floor_s: float, pool_n: int, eval_s: float, trainable_params: float) -> dict[str, Any]:
-    """Greedy-soup time budget at the tail: everything above the export floor, the dev-pass gate margin and one trial's
-    averaging (the soup's own clock check counts the eval only). The soup takes only the trials it has; the dev pass
-    then runs on what is left (whole, shortened, or not at all): the soup has priority."""
+    """Greedy-soup time budget at the tail. The soup's own clock check starts a trial when elapsed + the first trial's
+    measured time fits the budget, so the budget is what is left above the export floor and the dev-pass gate margin,
+    less one slow-factor trial (the trial in flight) and one averaging (the final load). If every trial takes at most
+    slow x (measured eval + averaging), the soup ends with export floor + margin still left (tail_soup_predicted_end_s)."""
+    c = _tail_slow() * tail_trial_seconds(eval_s, trainable_params)
     mix = tail_trial_seconds(0.0, trainable_params)
-    budget = float(remaining_s) - float(export_floor_s) - TAIL_GATE_MARGIN_S - mix
-    return {"budget_s": round(max(0.0, budget), 1), "pool_s": round(max(0, int(pool_n)) * tail_trial_seconds(eval_s, trainable_params), 1)}
+    budget = float(remaining_s) - float(export_floor_s) - TAIL_GATE_MARGIN_S - c - mix
+    return {"budget_s": round(max(0.0, budget), 1), "pool_s": round(max(0, int(pool_n)) * tail_trial_seconds(eval_s, trainable_params), 1),
+            "trial_bound_s": round(c, 1)}
+
+
+def tail_soup_predicted_end_s(*, budget_s: float, eval_s: float, trainable_params: float) -> float:
+    """Upper bound on the soup's elapsed seconds under ``budget_s`` when no trial exceeds slow x (eval + averaging):
+    the last trial starts with elapsed + first-trial time <= budget and takes at most one bound; then one final load."""
+    if budget_s <= 0:
+        return 0.0
+    return float(budget_s) + _tail_slow() * tail_trial_seconds(eval_s, trainable_params) + tail_trial_seconds(0.0, trainable_params)
 
 
 def tail_dev_pass_rows(*, remaining_s: float, export_floor_s: float, n_dev: int, estimate: Callable[[int], float]) -> int:

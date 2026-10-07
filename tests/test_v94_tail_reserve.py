@@ -30,7 +30,9 @@ from forge.tuning import selection
 
 HERE = Path(__file__).resolve().parent
 RECEIPT = {s: json.loads((HERE / f"data/v94/receipt_ce_d0_01fdf13f_s{s}.json").read_text()) for s in (7, 11)}
-TAIL_EVENTS = ("sft_v2_tail_reserve", "sft_v2_tail_soup_budget", "sft_v2_tail_dev_pass_shortened", "sft_v2_tail_dev_pass_skipped")
+TAIL_EVENTS = ("sft_v2_tail_reserve", "sft_v2_tail_finish", "sft_v2_tail_soup_budget", "sft_v2_tail_dev_pass_shortened",
+               "sft_v2_tail_dev_pass_skipped")
+LOG_ONLY = ("sft_v2_tail_reserve",)   # the only v9.4 event a run may log when the guard never fires and no save was slow
 
 
 def _rev(seed, name):
@@ -57,7 +59,8 @@ def test_plan_on_the_seed7_receipt_numbers():
     p = _plan()
     # trial = 8.2 + 3.5 x 2.5168 = 17.0 s (measured on seed 11: 122.9 s / 8 = 15.4 s)
     assert p["trial_s"] == pytest.approx(17.0, abs=0.05)
-    extra = 1.3 * 8 * (8.2 + 3.5 * 2.5168) + 46.6 + 30 + 2.845
+    trial = 8.2 + 3.5 * 2.5168
+    extra = max(1.3 * 8 * trial, (8 + 1.3) * trial + 3.5 * 2.5168) + 46.6 + 30 + 2.845
     assert (p["level"], p["soup_members"], p["dev_pass"]) == ("soup_and_dev_pass", 8, True)
     assert p["extra_s"] == pytest.approx(extra, abs=0.1) == pytest.approx(256.3, abs=0.2)
     assert p["extra_s"] < 0.15 * 3329.6  # 7.7 % of the training window
@@ -101,14 +104,100 @@ def test_export_floor_only_rises():
     assert sft_v2.tail_export_floor(60.0, 1.0) == 60.0
 
 
-def test_soup_budget_is_everything_above_the_floor_the_gate_margin_and_one_averaging():
+def test_soup_budget_leaves_the_floor_the_gate_margin_one_trial_in_flight_and_one_averaging():
     kw = dict(export_floor_s=150.0, eval_s=8.2, pool_n=8, trainable_params=2.5168e9)
+    c, mix = 1.3 * (8.2 + 3.5 * 2.5168), 3.5 * 2.5168
     b = sft_v2.tail_soup_budget(remaining_s=420.0, **kw)
-    assert b["budget_s"] == pytest.approx(420 - 150 - 30 - 8.81, abs=0.1) and b["pool_s"] == pytest.approx(8 * 17.0, abs=0.2)
+    assert b["budget_s"] == pytest.approx(420 - 150 - 30 - c - mix, abs=0.1) and b["pool_s"] == pytest.approx(8 * 17.0, abs=0.2)
     assert sft_v2.tail_soup_budget(remaining_s=100.0, **kw)["budget_s"] == 0.0
-    for rem in range(0, 2000, 37):
-        x = sft_v2.tail_soup_budget(remaining_s=float(rem), export_floor_s=150.0, eval_s=11.2, pool_n=3, trainable_params=3.8e9)
-        assert x["budget_s"] <= max(0.0, rem - 150.0 - sft_v2.TAIL_GATE_MARGIN_S)
+    # the reserve of the plan is enough for the budget to admit the planned trials at the measured speed
+    for n, params, ev in ((8, 2.5168e9, 8.2), (3, 3.8e9, 11.2), (2, 0.3e9, 2.0), (3, 4.2e9, 60.0)):
+        p = sft_v2.tail_reserve_plan(export_reserve_s=150.0, finish_reserve_s=150.0, eval_s=ev, pool_n=n, trainable_params=params,
+                                     dev_pass_s=0.0, t_step=0.0, persist_max_s=0.0, window_s=1e9)
+        trial = ev + 3.5 * params / 1e9
+        bud = sft_v2.tail_soup_budget(remaining_s=150.0 + 30.0 + p["extra_s"], export_floor_s=150.0, eval_s=ev, pool_n=n,
+                                      trainable_params=params)["budget_s"]
+        assert bud >= n * trial - 0.2, (n, bud, n * trial)      # greedy_soup starts trial i while elapsed + one trial <= budget
+
+
+def test_codex_146_b1_a_slow_measured_save_outranks_every_soup_trial():
+    """RESP-146-1 146-B1: remaining 400 s, export reserve 150 s, dev-pass estimate 20 s, measured save 300 s. 6b1f603 kept
+    max(legacy 115 s, new 0 s) = 115 s of soup inside the time the save needs. Now the raised floor (390 s) decides."""
+    floor = sft_v2.tail_export_floor(150.0, 300.0)
+    assert floor == pytest.approx(390.0)
+    legacy = max(0.0, 0.5 * (400.0 - 150.0 - 20.0))
+    assert legacy == 115.0
+    new = sft_v2.tail_soup_budget(remaining_s=400.0, export_floor_s=floor, pool_n=8, eval_s=8.0, trainable_params=2.5e9)["budget_s"]
+    assert new == 0.0 and min(legacy, new) == 0.0
+    src = inspect.getsource(sft_v2.run)
+    assert '_new = _tb["budget_s"] if tail_active else min(soup_budget, _tb["budget_s"])' in src and "soup_budget = _new" in src
+    assert "max(soup_budget" not in src and 'if _tb["budget_s"] > soup_budget' not in src
+
+
+def _simulate_tail(rng, *, remaining, export_reserve, persist_max, eval_s, params, pool_n, n_dev, t_probe, eff, tail_active, dev_pass_ok=True):
+    """The finish stages' admission rules as run() applies them, with every admitted stage charged its PREDICTED worst
+    case (a soup trial: slow x (eval + averaging), first-trial time drawn at or below that; the dev pass: its estimate).
+    Returns (remaining at the predicted export start, floor, admitted)."""
+    slow = sft_v2.TAIL_SLOW_FACTOR
+    geo = sft_v2.Geometry(max(1, eff // 4), 4, 1024, True, True, "adamw_torch_fused")
+    floor = sft_v2.tail_export_floor(export_reserve, persist_max)
+    mode = tail_active or floor > export_reserve
+    dp_est = sft_v2._dev_pass_estimate(n_dev, t_probe, geo) if dev_pass_ok else 0.0
+    left, admitted = remaining, {"soup_trials": 0, "dev_pass_rows": 0}
+    legacy = max(0.0, 0.5 * (left - export_reserve - dp_est))
+    budget = legacy
+    if mode and pool_n >= 2:
+        tb = sft_v2.tail_soup_budget(remaining_s=left, export_floor_s=floor, pool_n=pool_n, eval_s=eval_s, trainable_params=params)["budget_s"]
+        budget = tb if tail_active else min(legacy, tb)
+    if not mode:
+        return None, floor, admitted            # 9504136 finish: not this property's subject
+    c = slow * sft_v2.tail_trial_seconds(eval_s, params)
+    if pool_n >= 2 and budget >= 2.5 * eval_s:
+        first = rng.uniform(0.3, 1.0) * c        # greedy_soup: per_eval = the first trial's measured time
+        elapsed, admitted["soup_trials"] = first, 1
+        for _ in range(1, pool_n):
+            if elapsed + first > budget:
+                break
+            elapsed += rng.uniform(0.3, 1.0) * c
+            admitted["soup_trials"] += 1
+        left -= elapsed + sft_v2.tail_trial_seconds(0.0, params)   # the final load of the soup
+    if dev_pass_ok and n_dev >= 100:
+        rows = n_dev if left > floor + dp_est + 30 else (
+            sft_v2.tail_dev_pass_rows(remaining_s=left, export_floor_s=floor, n_dev=n_dev,
+                                      estimate=lambda n: sft_v2._dev_pass_estimate(n, t_probe, geo)) if tail_active else 0)
+        if rows:
+            left -= sft_v2._dev_pass_estimate(rows, t_probe, geo)
+            admitted["dev_pass_rows"] = rows
+    return left, floor, admitted
+
+
+def test_property_no_admitted_tail_work_predicts_an_export_start_past_the_floor():
+    """For random inputs: if any soup trial or dev-pass row is admitted under the v9.4 finish rules, the predicted export
+    start still leaves max(export reserve, measured save x slow factor) on the clock (and the 30 s gate margin after a
+    dev pass). Prediction = each stage at its bound; an overrun of a stage in flight is outside the property."""
+    import random
+
+    rng = random.Random(20261007)
+    seen = {"soup": 0, "dp": 0, "short": 0, "nothing": 0, "raised": 0}
+    for _ in range(20000):
+        kw = dict(remaining=rng.uniform(0, 2500), export_reserve=rng.choice([60.0, 150.0]), persist_max=rng.choice([0.0, 1.0, 9.0, 60.0, 161.0, 300.0, 700.0]),
+                  eval_s=rng.uniform(0.5, 300.0), params=rng.uniform(0.05e9, 4.3e9), pool_n=rng.randint(0, 8), n_dev=rng.choice([60, 100, 400, 1000]),
+                  t_probe=rng.uniform(0.05, 30.0), eff=rng.choice([8, 16, 56, 140]), tail_active=rng.random() < 0.6, dev_pass_ok=rng.random() < 0.8)
+        left, floor, adm = _simulate_tail(rng, **kw)
+        if left is None:
+            continue
+        assert floor >= kw["export_reserve"] and floor >= sft_v2.TAIL_SLOW_FACTOR * kw["persist_max"]
+        seen["raised"] += floor > kw["export_reserve"]
+        if adm["soup_trials"] or adm["dev_pass_rows"]:
+            assert left >= floor - 1e-6, (kw, left, floor, adm)
+            if adm["dev_pass_rows"]:
+                assert left >= floor + 30.0 - 1e-6, (kw, left, floor, adm)
+        else:
+            seen["nothing"] += 1
+        seen["soup"] += adm["soup_trials"] >= 2
+        seen["dp"] += adm["dev_pass_rows"] > 0
+        seen["short"] += 0 < adm["dev_pass_rows"] < kw["n_dev"]
+    assert min(seen.values()) > 50, seen
 
 
 def test_shortened_dev_pass_rows():
@@ -144,13 +233,31 @@ def test_no_model_name_or_size_threshold_in_the_rule():
 def test_run_wiring():
     src = inspect.getsource(sft_v2.run)
     assert "stop_at.extra_s = _tp[\"extra_s\"]" in src and "_tail_on = tail_reserve_enabled()" in src
-    assert "export_floor = export_reserve\n" in src and "export_floor = tail_export_floor(export_reserve, state[\"persist_max\"])" in src
-    assert "if _tb[\"budget_s\"] > soup_budget:" in src          # the soup budget only ever grows
+    assert "tail_active = bool(stop_at.tail_fired)" in src and "_tail_mode = tail_active or export_floor > export_reserve" in src
     # the 9504136 expressions are still there, unchanged
     assert "soup_budget = max(0.0, 0.5 * (deadline.remaining_hard() - export_reserve - _dev_pass_estimate(len(dev_ex), t_per_step, geo)))" in src
     assert "len(pool.items) >= 2 and soup_budget < 2.5 * measured_eval" in src
     assert "finish_reserve = export_reserve + (1.5 + _soup_reserve_evals) * dev_eval_est + _dev_pass_estimate(len(dev_ex), t_per_step, geo)" in src
     assert "window = remaining - finish_reserve" in src          # the planner's window does not see the tail reserve
+    # every v9.4 finish rule sits behind _tail_mode / tail_active
+    assert "if _tail_mode and pool.items and dev_rows_for_selection and len(pool.items) >= 2:" in src
+    assert "if (_tail_mode and _dp_factory is not None" in src and "        if tail_active:\n            try:\n                _n_short = tail_dev_pass_rows(" in src
+    # a failing plan resets the reserve to the 9504136 stop
+    i = src.index('stage="plan"')
+    assert "stop_at.extra_s = 0.0" in src[i - 200:i]
+
+
+def test_stop_guard_marks_only_stops_9504136_would_not_have_made():
+    d = NS(remaining_hard=lambda: 400.0)
+    s = sft_v2._StopAt(d, 212.9)
+    s.extra_s = 250.0
+    assert s.should_stop() is True and s.tail_fired is True          # 400 <= 462.9, above the 9504136 stop
+    s2 = sft_v2._StopAt(NS(remaining_hard=lambda: 200.0), 212.9)
+    s2.extra_s = 250.0
+    assert s2.should_stop() is True and s2.tail_fired is False       # 9504136 stops here too: its finish applies
+    s3 = sft_v2._StopAt(NS(remaining_hard=lambda: 500.0), 212.9)
+    s3.extra_s = 250.0
+    assert s3.should_stop() is False and s3.tail_fired is False
 
 
 # ---- 2. the real sft_v2.run on a fake clock ---------------------------------------------------------------------------
@@ -213,7 +320,7 @@ class Timeline:
         return self.loss_at[lo] * (1 - w) + self.loss_at[hi] * w
 
 
-def _run(monkeypatch, tmp_path, tl: Timeline, *, tail: bool, rows=N_ROWS, n_dev=N_DEV, max_len=1728):
+def _run(monkeypatch, tmp_path, tl: Timeline, *, tail: bool, rows=N_ROWS, n_dev=N_DEV, max_len=1728, p_b=P_B, persist_fn=None):
     """The real sft_v2.run with a fake clock. Returns NS(events, trainers, clock, dev_pass_rows, t_export_start, saved)."""
     import torch
     import transformers
@@ -249,15 +356,20 @@ def _run(monkeypatch, tmp_path, tl: Timeline, *, tail: bool, rows=N_ROWS, n_dev=
     monkeypatch.setattr(selection, "available_ram", lambda: 10 ** 12)
     # the snapshot pool believes the model has the receipt's trainable size (it only uses this for RAM gating and, in
     # v9.4, for the per-trial averaging time); the tensors themselves are the tiny model's
-    monkeypatch.setattr(selection.SnapshotPool, "_bytes", lambda self, model: int(P_B * 1e9 * 2))
-    monkeypatch.setattr(sft_v2.lr_probe, "measure_step_time", lambda model, batches, **kw: (tl.t_probe, [1.2254, 1.3209, 1.1684]))
+    monkeypatch.setattr(selection.SnapshotPool, "_bytes", lambda self, model: int(p_b * 1e9 * 2))
+    def probe(model, batches, **kw):
+        if hasattr(tl, "probe_row_s"):   # per-row timelines: the probe sees the geometry it is timing
+            return tl.probe_row_s * len(batches[0]["input_ids"]) * int(kw.get("grad_accum") or 1), [1.2254, 1.3209, 1.1684]
+        return tl.t_probe, [1.2254, 1.3209, 1.1684]
+
+    monkeypatch.setattr(sft_v2.lr_probe, "measure_step_time", probe)
 
     def save(*a, **k):
         if phase["trained"] and out.t_export_start is None and k.get("truth_reason") == "sft_v2_final":
             out.t_export_start = clock[0]
             clock[0] += tl.final_persist_s
         else:
-            clock[0] += tl.persist_s
+            clock[0] += persist_fn(out.saved) if persist_fn else tl.persist_s
         out.saved += 1
 
     monkeypatch.setattr(sft_v2, "save_adapter", save)
@@ -306,21 +418,26 @@ def _run(monkeypatch, tmp_path, tl: Timeline, *, tail: bool, rows=N_ROWS, n_dev=
             self.callbacks = callbacks
             micro_batches = math.ceil(len(train_dataset) / args.per_device_train_batch_size)
             per_epoch = max(1, micro_batches // args.gradient_accumulation_steps + int(micro_batches % args.gradient_accumulation_steps > 0))
+            self.steps_per_epoch = per_epoch
             self.state = NS(global_step=0, max_steps=math.ceil(args.num_train_epochs * per_epoch))  # as transformers computes it
             self.optimizer = object()
             self.lr_scheduler = object()
             out.trainers.append(self)
 
         def get_train_dataloader(self):
-            return torch.utils.data.DataLoader(self.train_dataset, batch_size=2, collate_fn=self.data_collator)
+            bs = self.args.per_device_train_batch_size if hasattr(tl, "probe_row_s") else 2
+            return torch.utils.data.DataLoader(self.train_dataset, batch_size=bs, collate_fn=self.data_collator)
 
         def train(self):
             phase["training"] = True
             try:
                 for step in range(1, self.state.max_steps + 1):
-                    clock[0] += tl.t_step
+                    clock[0] += (tl.row_s * self.args.per_device_train_batch_size * self.args.gradient_accumulation_steps
+                                 if hasattr(tl, "row_s") else tl.t_step)
+                    out.steps_per_epoch = self.steps_per_epoch
                     self.state.global_step = step
                     phase["step"] = step
+                    tl.spe_h = self.steps_per_epoch
                     control = NS(should_training_stop=False)
                     self.callbacks[0].on_step_end(self.args, self.state, control, model=self.model)
                     if control.should_training_stop:
@@ -332,7 +449,7 @@ def _run(monkeypatch, tmp_path, tl: Timeline, *, tail: bool, rows=N_ROWS, n_dev=
     spec = NS(output_dir=str(tmp_path / "out"), task_id="synthetic", instruct=InstructColumns("instruction", "output"))
     deadline = NS(remaining_hard=lambda: max(0.0, tl.hard_t - clock[0]), export_reserve_s=180.0)
     sft_v2.run(spec, deadline, source, NS(model=tiny), NS(pad_token_id=1), baseline_summary=None,
-               params_b=P_B, per_gpu_gb=80.0, strategy_override="full", field_route=True, damaged_base_route=False,
+               params_b=p_b, per_gpu_gb=80.0, strategy_override="full", field_route=True, damaged_base_route=False,
                recipe_key="llama")
     return out
 
@@ -405,6 +522,20 @@ def test_seed7_timeline_with_the_tail_reserve_soups_and_dev_passes(monkeypatch, 
     assert _final_remaining(on) >= _final_remaining(off) and _final_remaining(on) > 180.0
 
 
+def _strict(o):
+    """Every event (payload and fake-clock time) except the reserve's own log line."""
+    return [(n, d) for n, d in o.events if n not in LOG_ONLY]
+
+
+def _assert_identical(on, off):
+    """v9.4 == 9504136: every event, every trainer argument, every save, every eval, the dev-pass rows, the clock."""
+    assert _strict(on) == _strict(off)
+    assert not any(n in TAIL_EVENTS and n not in LOG_ONLY for n, _ in on.events)
+    assert _args(on) == _args(off)
+    assert (on.saved, on.evals, on.dev_pass_rows, on.t_export_start, on.clock[0]) == (off.saved, off.evals, off.dev_pass_rows,
+                                                                                    off.t_export_start, off.clock[0])
+
+
 def test_seed11_timeline_is_unchanged(monkeypatch, tmp_path):
     tl = Timeline(11)
     off = _run(monkeypatch, tmp_path / "off", tl, tail=False)
@@ -415,13 +546,94 @@ def test_seed11_timeline_is_unchanged(monkeypatch, tmp_path):
     assert _ev(off, "sft_v2_train_end")[0]["remaining_s"] == pytest.approx(464.6, abs=10.0)
     assert _ev(off, "soup_result")[0]["pool"] == 8 and off.dev_pass_rows == [400]
     assert _final_remaining(off) == pytest.approx(288.9, abs=15.0)
-    # v9.4 = 9504136 on every event (payload and fake-clock time), every trainer argument, every save
-    drop = lambda o: [(n, d) for n, d in o.events if n not in TAIL_EVENTS]  # noqa: E731
-    assert drop(on) == drop(off)
-    assert _args(on) == _args(off)
-    assert (on.saved, on.evals, on.dev_pass_rows, on.t_export_start, on.clock[0]) == (off.saved, off.evals, off.dev_pass_rows,
-                                                                                    off.t_export_start, off.clock[0])
-    assert _ev(on, "sft_v2_tail_reserve")  # the reserve was armed; the overfit stop came first
+    _assert_identical(on, off)
+    assert _ev(on, "sft_v2_tail_reserve")  # the reserve was armed; the overfit stop came first, so nothing else changed
+
+
+# ---- 2b. more real receipts: runs whose guard never fires are 9504136's, event for event --------------------------------
+
+def _fx(name):
+    return json.loads((HERE / f"data/v94/receipt_{name}.json").read_text())
+
+
+class ReceiptTimeline:
+    """A fake-clock timeline from any receipt fixture. The harness trains a tiny llama on its own geometry, so the
+    receipt's time per ROW (probe and realised) and its dev curve by epoch fraction are what is replayed."""
+
+    def __init__(self, name):
+        fx = _fx(name)
+        g = lambda n: [e for e in fx["events"] if e["name"] == n]  # noqa: E731
+        ts, ph, plan, data = g("sft_v2_train_start")[0], g("sft_v2_phase_end"), g("sft_v2_plan")[0], g("sft_v2_data")[0]
+        self.p_b = g("sft_v2_selected")[0]["params_b"]
+        self.rows, self.n_dev = data["tokenized"], data["dev_n"]
+        self.spe_r = ts["steps_per_epoch"]
+        self.row_s = ph[0]["t_per_step_measured"] * self.spe_r / data["train_n"]
+        self.probe_row_s = self.row_s * plan["t_per_step"] / ph[0]["t_per_step_measured"]
+        self.t_probe = self.probe_row_s * 56                                # only read by assertions on the 56-row geometry
+        evs = g("sft_v2_eval")
+        self.eval_s = [e["eval_s"] for e in evs]
+        self.curve = sorted((e["step"] / self.spe_r, e["dev_loss"]) for e in evs)
+        med = sorted(self.eval_s)[len(self.eval_s) // 2]
+        self.persist_s, self.final_persist_s = 1.0 + 1.4 * self.p_b, 3.0 * self.p_b          # audit medians by size
+        self.tail_eval_s, self.mix_s = med, 3.0 * self.p_b
+        self.dev_pass_s = 20.0 + 10.0 * self.p_b
+        self.hard_t, self.start_t = fx["meta"]["hours_to_complete"] * 3600.0, ts["t"]
+        self.ended = "overfit_stop" if g("sft_v2_early_stop") else ("plan_complete" if ph[-1]["steps"] >= ph[-1]["planned"] else "clock")
+        self.final_remaining = g("sft_v2_final")[0]["remaining_s"]
+        self.spe_h = None
+
+    def loss(self, step):
+        f = step / self.spe_h
+        if f <= self.curve[0][0]:
+            return self.curve[0][1]
+        if f >= self.curve[-1][0]:
+            return self.curve[-1][1]
+        hi = next(i for i, (e, _) in enumerate(self.curve) if e > f)
+        (e0, l0), (e1, l1) = self.curve[hi - 1], self.curve[hi]
+        w = (f - e0) / (e1 - e0)
+        return l0 * (1 - w) + l1 * w
+
+
+def _receipt_pair(monkeypatch, tmp_path, name):
+    tl = ReceiptTimeline(name)
+    kw = dict(rows=tl.rows, n_dev=tl.n_dev, p_b=tl.p_b)
+    off = _run(monkeypatch, tmp_path / "off", tl, tail=False, **kw)
+    monkeypatch.undo()
+    on = _run(monkeypatch, tmp_path / "on", tl, tail=True, **kw)
+    monkeypatch.undo()
+    return tl, off, on
+
+
+def _ended(out):
+    pe = _ev(out, "sft_v2_phase_end")[-1]
+    return "overfit_stop" if _ev(out, "sft_v2_early_stop") else ("plan_complete" if pe["steps"] >= pe["planned"] else "clock")
+
+
+@pytest.mark.parametrize("name", ["bj_nx15_880b38e9_s7", "bv_minicpm5_2b_s7", "bt_q25_05bi_indic_s7", "cb_lfm25_350m_s7",
+                                  "by_m2bb_01fdf13f_public_s7"])
+def test_receipts_whose_guard_never_fires_are_identical(monkeypatch, tmp_path, name):
+    """Timings of four plan-complete receipts (3.8 B, 2.5 B, 0.5 B, 0.35 B with a second phase) and one overfit-stopped
+    receipt (01fdf13f on the public base), replayed on the fake clock: the v9.4 run is the 9504136 run, event for event."""
+    tl, off, on = _receipt_pair(monkeypatch, tmp_path, name)
+    # the replay ends as the receipt did. One exception: the 3.8 B receipt's real run grew its batch (large-model rule)
+    # and completed its plan; the harness keeps its own geometry, evaluates at other steps and meets the overfit stop on
+    # the interpolated dev curve. Either way the guard never fires, which is what this test is about.
+    assert _ended(off) == {"bj_nx15_880b38e9_s7": "overfit_stop"}.get(name, tl.ended)
+    assert _ev(off, "soup_result") and _ev(off, "sft_v2_soup_skipped") == []
+    _assert_identical(on, off)
+    assert _ev(on, "sft_v2_tail_reserve")                            # armed all along; never fired
+
+
+def test_a_plan_that_completes_inside_the_reserve_is_changed_and_says_so(monkeypatch, tmp_path):
+    """bk-lfm12-turkish-v9-s7 completed its plan with 212 s left: 9504136 souped on a short budget and dropped the dev
+    pass without a log line. Under v9.4 the guard fires before the plan ends, so this run is NOT identical; the change is
+    announced by sft_v2_tail_finish."""
+    tl, off, on = _receipt_pair(monkeypatch, tmp_path, "bk_lfm12_turkish_s7")
+    assert tl.ended == "plan_complete" and tl.final_remaining < 200.0
+    assert _steps(on) < _steps(off)
+    fin = _ev(on, "sft_v2_tail_finish")
+    assert len(fin) == 1 and fin[0]["tail_active"] is True
+    assert _ev(on, "soup_result") and on.dev_pass_rows and _export_start_remaining(on, tl) >= 180.0 - 1.0
 
 
 # ---- 3. grid on the same harness --------------------------------------------------------------------------------------
@@ -439,32 +651,29 @@ def test_grid_never_later_and_never_below_the_9504136_floor(monkeypatch, tmp_pat
     monkeypatch.undo()
     on = _run(monkeypatch, tmp_path / "on", tl, tail=True)
     # (a) the plan is the same and training never stops later
-    assert _ev(on, "sft_v2_plan") == _ev(off, "sft_v2_plan") or len(_ev(on, "sft_v2_plan")) <= len(_ev(off, "sft_v2_plan"))
     assert _ev(on, "sft_v2_plan")[0] == _ev(off, "sft_v2_plan")[0]
     assert _steps(on) <= _steps(off)
-    # (b) the export starts with at least the 9504136 gate floor left (export reserve + 30 s), less only what 9504136 is
-    #     exposed to as well: a final eval or a dev pass that overran its own estimate
     geo = sft_v2.Geometry(14, 4, 1728, True, True, "adamw_torch_fused")
     dp_est = sft_v2._dev_pass_estimate(N_DEV, tl.t_probe, geo)
-    eval_est = sft_v2._estimate_eval_seconds(N_DEV, tl.t_probe, geo)
-    for o in (off, on):
-        overrun = max(0.0, tl.dev_pass_s * (o.dev_pass_rows[0] / N_DEV) - dp_est) if o.dev_pass_rows else 0.0
-        overrun += max(0.0, tl.tail_eval_s - eval_est)
-        assert _export_start_remaining(o, tl) >= 150.0 + 30.0 - overrun - 1.0
-    last = (_ev(on, "sft_v2_tail_reserve") or [{"level": "none", "soup_members": 0}])[-1]
-    # (c) full reserve armed and the finish stages cost no more than slow-factor x what the run measured: the export
-    #     starts no later than under 9504136 (to one optimizer step of stop granularity)
-    if last["level"] == "soup_and_dev_pass" and kw["tail_slow"] <= sft_v2.TAIL_SLOW_FACTOR:
+    fired = bool(_ev(on, "sft_v2_tail_finish"))
+    if not fired:
+        # (b) the guard never fired: the run is 9504136's
+        _assert_identical(on, off)
+        return
+    # (c) the guard fired: every stage that was admitted left the export floor on its own prediction; the export starts
+    #     with at least 150 s + 30 s left, less only what a stage in flight overran its bound by
+    c = sft_v2.TAIL_SLOW_FACTOR * sft_v2.tail_trial_seconds(_ev(on, "sft_v2_tail_soup_budget")[0]["trial_bound_s"] / sft_v2.TAIL_SLOW_FACTOR, 0.0)
+    overrun = max(0.0, tl.dev_pass_s * (on.dev_pass_rows[0] / N_DEV) - dp_est) if on.dev_pass_rows else 0.0
+    overrun += max(0.0, (tl.tail_eval_s + tl.mix_s) - c) * 8 + max(0.0, tl.tail_eval_s - sft_v2.TAIL_SLOW_FACTOR * tl.eval_s[0])
+    assert _export_start_remaining(on, tl) >= 180.0 - overrun - 1.0
+    # (d) finish stages no slower than the slow factor allows: the export starts no later than under 9504136 (one step)
+    last = _ev(on, "sft_v2_tail_reserve")[-1]
+    if last["level"] == "soup_and_dev_pass" and kw["tail_slow"] <= 1.0:
         assert on.t_export_start <= off.t_export_start + tl.t_step
-    # (c') nothing armed: the run is 9504136's
-    if last["level"] == "none":
-        drop = lambda o: [(n, d) for n, d in o.events if n not in TAIL_EVENTS]  # noqa: E731
-        assert _steps(on) == _steps(off) and on.t_export_start >= off.t_export_start - 1e-6
-    # (d) never a bare checkpoint where a soup was affordable: if the reserve was armed for a soup, a soup was tried
-    if last["soup_members"] >= 2 and _ev(off, "sft_v2_early_stop") == []:
-        assert _ev(on, "soup_result") and _ev(on, "sft_v2_soup_skipped") == []
-        assert _ev(on, "soup_result")[0]["members"] >= 2
-    # (e) the reserve never exceeds its cap
+    # (e) never the bare checkpoint where the reserve was armed for a soup
+    if last["soup_members"] >= 2:
+        assert _ev(on, "soup_result") and _ev(on, "sft_v2_soup_skipped") == [] and _ev(on, "soup_result")[0]["members"] >= 2
+    # (f) the reserve never exceeds its cap
     for e in _ev(on, "sft_v2_tail_reserve"):
         assert 0.0 <= e["extra_s"] <= e["cap_s"] + 0.05
 
@@ -476,29 +685,29 @@ def test_grid_runs_with_margin_are_identical(monkeypatch, tmp_path, slow):
     monkeypatch.undo()
     on = _run(monkeypatch, tmp_path / "on", tl, tail=True)
     assert _ev(off, "soup_result") and _ev(off, "soup_time_exhausted") == [] and off.dev_pass_rows == [400]  # 9504136 finished properly
-    drop = lambda o: [(n, d) for n, d in o.events if n not in TAIL_EVENTS]  # noqa: E731
-    assert drop(on) == drop(off) and on.clock[0] == off.clock[0]
-    assert _args(on) == _args(off)
+    _assert_identical(on, off)
 
 
 def test_finish_stages_slower_than_reserved_degrade_in_the_declared_order(monkeypatch, tmp_path):
-    """Seed 7's timeline with the soup trials and the dev pass 1.6 - 2.6 x slower than the run measured (beyond the 1.3
-    factor). The soup keeps priority (its own clock check ends it), the dev pass is shortened to the rows that still fit
-    or skipped, every degradation is logged, and the export starts above the 9504136 gate floor less what a stage in
-    flight overran its estimate by (9504136 has the same exposure: neither interrupts a dev pass or a soup trial)."""
-    seen = {"shortened": 0, "skipped_logged": 0, "soup": 0}
+    """Seed 7's timeline with the soup trials and the dev pass 1.6 - 3.0 x slower than the run measured (beyond the 1.3
+    factor). The soup keeps priority and is ended by its own budget; the dev pass is shortened to the rows that still fit
+    or skipped; every degradation is logged. Neither release interrupts a stage in flight, so the export floor holds less
+    the overrun of the stages beyond their bounds."""
+    seen = {"shortened": 0, "skipped_logged": 0, "soup": 0, "exhausted": 0}
     geo = sft_v2.Geometry(14, 4, 1728, True, True, "adamw_torch_fused")
-    for i, ts in enumerate((1.6, 1.9, 2.0, 2.2, 2.6)):
+    for i, ts in enumerate((1.6, 1.9, 2.2, 2.6, 3.0)):
         tl = Timeline(7, tail_slow=ts)
         on = _run(monkeypatch, tmp_path / f"on{i}", tl, tail=True)
         monkeypatch.undo()
         soup = _ev(on, "soup_result")
         assert soup and soup[0]["members"] >= 2 and _ev(on, "sft_v2_soup_skipped") == []   # never the bare checkpoint
         seen["soup"] += 1
+        seen["exhausted"] += bool(_ev(on, "soup_time_exhausted"))
         rows = on.dev_pass_rows[0] if on.dev_pass_rows else 0
+        bound = sft_v2.TAIL_SLOW_FACTOR * (8.2 + 3.5 * P_B)
         overrun = max(0.0, tl.dev_pass_s * rows / N_DEV - sft_v2._dev_pass_estimate(rows, tl.t_probe, geo)) if rows else 0.0
-        overrun += tl.tail_eval_s + tl.mix_s  # at most the one soup trial in flight when its budget ran out
-        assert _export_start_remaining(on, tl) >= 180.0 - overrun
+        overrun += max(0.0, tl.tail_eval_s + tl.mix_s - bound) * soup[0]["members"] + max(0.0, tl.tail_eval_s - 1.3 * 8.2)
+        assert _export_start_remaining(on, tl) >= 180.0 - overrun - 1.0
         short = _ev(on, "sft_v2_tail_dev_pass_shortened")
         if short:
             seen["shortened"] += 1
@@ -507,24 +716,53 @@ def test_finish_stages_slower_than_reserved_degrade_in_the_declared_order(monkey
         if not on.dev_pass_rows:
             assert _ev(on, "sft_v2_tail_dev_pass_skipped")  # never silent
             seen["skipped_logged"] += 1
-    assert seen["soup"] == 5 and seen["shortened"] >= 1 and seen["skipped_logged"] >= 1, seen
+    assert seen["soup"] == 5 and (seen["shortened"] + seen["skipped_logged"]) >= 1, seen
 
 
-def test_overfit_stop_near_the_clock_is_preempted_by_the_reserve(monkeypatch, tmp_path):
-    """Seed 11's curve with the deadline pulled in by 150 - 390 s: under 9504136 the overfit stop lands with too little
-    left and the soup is cut short or skipped; under v9.4 at least as many members are souped and the floor holds."""
-    more = 0
-    for i, cut in enumerate(range(150, 420, 60)):
+def test_overfit_stop_before_the_guard_is_9504136_even_near_the_clock(monkeypatch, tmp_path):
+    """Seed 11's curve with the deadline pulled in. While the overfit stop still comes before the guard the run is
+    9504136's (short soup budget and all: inherited). Once the guard comes first, the v9.4 finish applies and says so."""
+    kinds = set()
+    for i, cut in enumerate((0, 150, 300, 420)):
         tl = Timeline(11, hard_t=HARD_T - cut)
         off = _run(monkeypatch, tmp_path / f"off{i}", tl, tail=False)
         monkeypatch.undo()
         on = _run(monkeypatch, tmp_path / f"on{i}", tl, tail=True)
         monkeypatch.undo()
-        members = lambda o: (_ev(o, "soup_result") or [{"members": 1}])[0]["members"]  # noqa: E731
-        assert _steps(on) <= _steps(off) and members(on) >= members(off)
-        assert _export_start_remaining(on, tl) >= 180.0 - 1.0 and on.dev_pass_rows == [400]
-        more += members(on) > members(off)
-    assert more >= 1
+        if _ev(on, "sft_v2_tail_finish"):
+            kinds.add("fired")
+            assert _steps(on) < _steps(off) and _export_start_remaining(on, tl) >= 180.0 - 1.0
+            assert _ev(on, "soup_result") and _ev(on, "soup_result")[0]["members"] >= (_ev(off, "soup_result") or [{"members": 1}])[0]["members"]
+        else:
+            kinds.add("identical")
+            _assert_identical(on, off)
+    assert kinds == {"fired", "identical"}
+
+
+def test_codex_146_b1_on_the_real_run_a_slow_save_shrinks_the_soup_never_grows_it(monkeypatch, tmp_path):
+    """Seed 11's timeline (overfit stop, guard never fires) with one 300 s save during training: the export floor is
+    390 s. 9504136 soups on its 150 s reserve; v9.4 must not admit a soup trial or a dev pass that leaves less than 390 s."""
+    tl = Timeline(11)
+    slow_save = lambda i: 300.0 if i == 2 else tl.persist_s  # noqa: E731
+    off = _run(monkeypatch, tmp_path / "off", tl, tail=False, persist_fn=slow_save)
+    monkeypatch.undo()
+    on = _run(monkeypatch, tmp_path / "on", tl, tail=True, persist_fn=slow_save)
+    fin = _ev(on, "sft_v2_tail_finish")
+    assert len(fin) == 1 and fin[0]["export_floor_s"] == pytest.approx(390.0)
+    bud = _ev(on, "sft_v2_tail_soup_budget")
+    if bud:
+        assert bud[0]["new_s"] <= bud[0]["old_s"] or bud[0]["tail_active"]
+    start = _ev(on, "sft_v2_export_start")[0]
+    work = bool(_ev(on, "soup_result") and _ev(on, "soup_result")[0]["pool"] >= 2) or bool(on.dev_pass_rows)
+    if work:
+        assert start["remaining_s"] >= 390.0 - 1.0
+    assert on.t_export_start <= off.t_export_start + 1e-6             # never later than 9504136 on the same timeline
+    # and with the floor out of reach, nothing is admitted at all
+    monkeypatch.undo()
+    tight = Timeline(11, hard_t=HARD_T - 150.0)
+    on2 = _run(monkeypatch, tmp_path / "on2", tight, tail=True, persist_fn=slow_save)
+    if _export_start_remaining(on2, tight) < 390.0:
+        assert not on2.dev_pass_rows and (not _ev(on2, "soup_result") or _ev(on2, "soup_result")[0]["pool"] < 2 or _ev(on2, "soup_result")[0]["members"] == 1)
 
 
 def test_off_switch_never_touches_the_stop_guard(monkeypatch, tmp_path):
@@ -533,7 +771,7 @@ def test_off_switch_never_touches_the_stop_guard(monkeypatch, tmp_path):
 
 
 def test_a_failing_reserve_never_fails_the_run(monkeypatch, tmp_path):
-    """Any exception inside the new code leaves the 9504136 behaviour and is logged."""
+    """An exception in the plan resets the reserve to 0.0: the run is 9504136's, plus the failure log lines."""
     def boom(**kw):
         raise RuntimeError("synthetic")
 
@@ -541,10 +779,14 @@ def test_a_failing_reserve_never_fails_the_run(monkeypatch, tmp_path):
     off = _run(monkeypatch, tmp_path / "off", tl, tail=False)
     monkeypatch.undo()
     monkeypatch.setattr(sft_v2, "tail_reserve_plan", boom)
+    on = _run(monkeypatch, tmp_path / "on", tl, tail=True)
+    assert {e["stage"] for e in _ev(on, "sft_v2_tail_reserve_failed")} == {"plan"}
+    drop = lambda o: [(n, d) for n, d in o.events if n != "sft_v2_tail_reserve_failed"]  # noqa: E731
+    assert drop(on) == drop(off) and on.t_export_start == off.t_export_start
+    # an exception at the tail (after a real tail stop): no soup budget can be computed -> no soup, the run still exports
+    monkeypatch.undo()
     monkeypatch.setattr(sft_v2, "tail_soup_budget", boom)
     monkeypatch.setattr(sft_v2, "tail_dev_pass_rows", boom)
-    on = _run(monkeypatch, tmp_path / "on", tl, tail=True)
-    failed = _ev(on, "sft_v2_tail_reserve_failed")
-    assert {e["stage"] for e in failed} >= {"plan", "soup_budget"}
-    drop = lambda o: [(n, d) for n, d in o.events if n not in TAIL_EVENTS + ("sft_v2_tail_reserve_failed",)]  # noqa: E731
-    assert drop(on) == drop(off) and on.t_export_start == off.t_export_start
+    on2 = _run(monkeypatch, tmp_path / "on2", Timeline(7), tail=True)
+    assert "soup_budget" in {e["stage"] for e in _ev(on2, "sft_v2_tail_reserve_failed")}
+    assert _ev(on2, "sft_v2_final")[0]["saved"] is True and _export_start_remaining(on2, Timeline(7)) >= 180.0
