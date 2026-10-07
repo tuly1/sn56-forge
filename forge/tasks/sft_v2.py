@@ -318,6 +318,60 @@ def governed_eval_every(eval_every: int, per_eval_s: float, t_step: float, total
     return widened, info
 
 
+# ---- deterministic eval cadence (candidate behind v9.4; FORGE_V2_STEP_CADENCE=0 restores the base commit) ------------------
+# Base rule (governed_eval_every above, called from SelectCallback after the FIRST dev eval): the interval is widened to
+# ceil((first eval seconds + half the first save seconds) / (6 % of the step time)). Two runs of the same seed measured
+# 74 and 70 steps (01fdf13f) and 83 and 82 (880b38e9); from then on they evaluate at different steps, and the overfit stop
+# (three evals in a row 5 % above the best) samples a different part of the dev curve.
+# Cadence rule: the interval is fixed at plan time as planned x 2^k, with k the smallest power that meets the same 6 %
+# target on the ESTIMATED eval cost (a function of the one timing probe and the plan: _estimate_eval_seconds). The measured
+# eval time is used only by an explicit hard cap on total eval + save seconds, which can only double the interval.
+STEP_CADENCE_DEFAULT = "1"
+CADENCE_EVAL_CAP_FRAC = 0.10    # hard cap: dev evals + in-training saves may take at most this share of the first training window
+OVERFIT_PATIENCE_INTERVALS = 3  # the overfit stop's patience, in PLANNED eval intervals (= the base rule's 3 evals when k = 0)
+
+
+def step_cadence_enabled() -> bool:
+    return os.environ.get("FORGE_V2_STEP_CADENCE", STEP_CADENCE_DEFAULT).strip() != "0"
+
+
+def step_cadence(planned_every: int, est_eval_s: float, t_probe: float | None, total_steps: int,
+                 window_s: float | None = None) -> tuple[int, dict]:
+    """Eval interval of a phase, fixed before its first step: planned_every x 2^k. k = 0 without a timing probe."""
+    planned = max(1, int(planned_every))
+    if not t_probe or t_probe <= 0 or not math.isfinite(float(est_eval_s)):
+        return planned, {"planned": planned, "k": 0, "target": planned, "est_eval_s": None}
+    target, _ = governed_eval_every(planned, max(0.0, float(est_eval_s)), float(t_probe), int(total_steps), window_s)
+    k = 0
+    while planned * (2 ** k) < target and k < 16:
+        k += 1
+    return planned * (2 ** k), {"planned": planned, "k": k, "target": int(target), "est_eval_s": round(float(est_eval_s), 2)}
+
+
+def cadence_cap_interval(interval: int, *, spent_s: float, evals_done: int, steps_left: int, cap_s: float) -> int:
+    """Hard cap on eval time. Projection = seconds spent on evals and saves so far + the evals still due in this phase at
+    the mean cost so far. While the projection exceeds the cap the interval doubles (never shrinks). Uses measured time on
+    purpose: it is the slow-node protection, and it changes the cadence only when it binds."""
+    interval = max(1, int(interval))
+    if evals_done <= 0 or cap_s <= 0:
+        return interval
+    mean = float(spent_s) / evals_done
+    for _ in range(16):
+        if float(spent_s) + (max(0, int(steps_left)) // interval) * mean <= cap_s:
+            break
+        interval *= 2
+    return interval
+
+
+def overfit_patience_reached(count: int, span_steps: int, planned_every: int, stepwise: bool) -> bool:
+    """The overfit stop's patience. Base rule: three bad evals in a row. Step-wise (cadence on): also when at least two
+    bad evals in a row span OVERFIT_PATIENCE_INTERVALS planned intervals, so the patience in optimizer steps does not
+    grow with the cadence. At the planned cadence (k = 0) the two rules are the same rule."""
+    if count >= 3:
+        return True
+    return bool(stepwise and count >= 2 and span_steps >= OVERFIT_PATIENCE_INTERVALS * max(1, int(planned_every)))
+
+
 def seed_b_window(deadline: Any, finish_reserve: float, min_window: float) -> tuple[float, bool]:
     """Window for the seed-B plan, re-read after the seed-A greedy soup and adapter re-init (which spend wall clock:
     Codex review of 6912643). Returns (window_s, fits)."""
@@ -2395,6 +2449,7 @@ def run(
         _ema_frac = 0.0  # a full-weight fp32 average would not fit next to the optimizer state
     ema: dict[str, Any] = {}
     _tail_on = tail_reserve_enabled()
+    _cad_on = step_cadence_enabled()
 
     def _tail_trainable(m: Any) -> float:
         try:
@@ -2412,7 +2467,8 @@ def run(
             self.eval_every = eval_every
             self.total_steps = total_steps
             self.window_s = window_s
-            self.governed = False
+            self.governed = bool(_cad_on)   # step cadence: the interval was fixed at plan time; no wall-clock governor
+            self.planned_every = eval_every
             self.ema_start = int(total_steps * (1.0 - _ema_frac)) if _ema_frac > 0 else None
             self.ema_n = 0
 
@@ -2457,16 +2513,18 @@ def run(
             if improved:
                 state["best"], state["best_step"] = loss, step
                 state["overfit"] = 0
+                state["overfit_from"] = step
             elif loss > state["best"] * 1.05 and state["phase_evals"] > 1:
                 state["overfit"] += 1
                 # PLACEHOLDER (release-candidate-v9; NOT IMPLEMENTED): phase-bg exposure arm slot (2 of 2): arms C/D
                 # suppress this DEV overfit stop (FORGE_V2_NO_OVERFIT_STOP on 32984fb). Nothing here runs; see slot 1.
-                if state["overfit"] >= 3:
+                if overfit_patience_reached(state["overfit"], step - state.get("overfit_from", step), self.planned_every, _cad_on):
                     _event_and_print("sft_v2_early_stop", step=step, best=state["best"], best_step=state["best_step"])
                     state["stopped_overfit"] = True
                     control.should_training_stop = True
             else:
                 state["overfit"] = 0
+                state["overfit_from"] = step
             admitted = pool.consider(m, loss, step)
             since_persist = time.monotonic() - state["last_persist_at"]
             _deferred = geometry_select is not None and geometry_select.defer_persist  # run S saves nothing until it has won
@@ -2494,6 +2552,19 @@ def run(
                 except Exception as exc:  # the reserve must never fail a run: back to 0.0 = the 9504136 stop
                     stop_at.extra_s = 0.0
                     _event_and_print("sft_v2_tail_reserve_failed", stage="plan", error=f"{type(exc).__name__}: {exc}"[:200])
+            if _cad_on:
+                # hard cap on eval + save seconds (the slow-node protection the wall-clock governor used to give)
+                try:
+                    _spent = state["eval_secs"] + state["persist_secs"]
+                    _cap = CADENCE_EVAL_CAP_FRAC * max(0.0, float(state.get("cadence_window_s") or 0.0))
+                    _capped = cadence_cap_interval(self.eval_every, spent_s=_spent, evals_done=state["eval_count"],
+                                                   steps_left=max(0, end_step - local_step), cap_s=_cap)
+                    if _capped > self.eval_every:
+                        _event_and_print("sft_v2_eval_cadence_cap", step=step, eval_every=_capped, was=self.eval_every,
+                                         spent_s=round(_spent, 1), cap_s=round(_cap, 1), evals=state["eval_count"])
+                        self.eval_every = _capped
+                except Exception as exc:
+                    _event_and_print("sft_v2_eval_cadence_failed", stage="cap", error=f"{type(exc).__name__}: {exc}"[:200])
             if not self.governed and t_step:
                 # keep evaluation (incl. persistence) under ~6% of training time
                 self.governed = True
@@ -2657,9 +2728,24 @@ def run(
         phase_lr = lr if (phase == 0 or state["restarts"] or seed_b_active) else lr * max(0.1, _restart_factor ** phase)
         state["overfit"] = 0
         state["phase_evals"] = 0
+        state["overfit_from"] = state["step_offset"]
         _event_and_print("sft_v2_plan", phase=phase, lr=phase_lr, t_per_step=t_step, epochs=epochs, total_steps=total_steps,
                          warmup=warmup, eval_every=eval_every, window_s=round(window, 1), epochs_done=round(state["epochs_done"], 3))
+        _cadence_every = eval_every
+        if _cad_on:
+            # the interval of this phase, fixed now: from the plan, the timing probe and the eval estimate only
+            state.setdefault("cadence_window_s", window)
+            try:
+                _cadence_every, _ci = step_cadence(eval_every, dev_eval_est, t_per_step, total_steps,
+                                                   window if _eval_slack(_csq_field) else None)
+                _event_and_print("sft_v2_eval_cadence", phase=phase, eval_every=_cadence_every,
+                                 cap_s=round(CADENCE_EVAL_CAP_FRAC * max(0.0, float(state["cadence_window_s"])), 1), **_ci)
+            except Exception as exc:
+                _cadence_every = eval_every
+                _event_and_print("sft_v2_eval_cadence_failed", stage="plan", error=f"{type(exc).__name__}: {exc}"[:200])
         cb = SelectCallback(eval_every, total_steps, window_s=window)
+        if _cad_on:
+            cb.eval_every = _cadence_every   # cb.planned_every stays the planned interval
         trainer = TrainerCls(
             model=model, args=make_args(epochs, phase_lr, warmup, geo.micro_batch, geo.grad_accum,
                                         seed=_seed_base + (1000 if seed_b_active else phase)),

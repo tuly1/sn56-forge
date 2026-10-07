@@ -331,6 +331,9 @@ def _run(monkeypatch, tmp_path, tl: Timeline, *, tail: bool, rows=N_ROWS, n_dev=
     torch.set_num_threads(2)
     tiny = _tiny_llama()  # before the transformers doubles below: importing a model class re-binds the lazy module's names
     monkeypatch.setenv("FORGE_V2_TAIL_RESERVE", "1" if tail else "0")
+    import os as _os
+    if "FORGE_V2_STEP_CADENCE" not in _os.environ:   # these tests are about the tail reserve at the base cadence
+        monkeypatch.setenv("FORGE_V2_STEP_CADENCE", "0")
     monkeypatch.setenv("FORGE_DEV_PASS", "1")
     clock = [tl.start_t]
     phase = {"training": False, "soup": False, "trained": False, "step": 0}
