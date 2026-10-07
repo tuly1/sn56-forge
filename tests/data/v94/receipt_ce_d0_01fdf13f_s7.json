@@ -1,0 +1,325 @@
+{
+ "source": "research/20261001-job-runner/sessions/jr-20261007t025853z/results/ce-d0-m2bb-01fdf13f-delivered-s7/items/ce-d0-m2bb-01fdf13f-delivered-s7/train/forge_run.json",
+ "note": "timing events of a real 9504136 run (H100 PCIe, MiniCPM5-2B-Base as delivered, task 01fdf13f, 1.0 h); events filtered to the names the tail-reserve tests read; values unchanged",
+ "meta": {
+  "task_id": "01fdf13f-f708-4200-9cbc-715df3c182f1",
+  "hours_to_complete": 1.0,
+  "model_arg": "2fe290d4e75b65c7"
+ },
+ "gpu": "NVIDIA H100 PCIe",
+ "events": [
+  {
+   "t": 13.8,
+   "name": "sft_v2_selected",
+   "params_b": 2.517,
+   "hours_remaining": 0.996
+  },
+  {
+   "t": 27.9,
+   "name": "sft_v2_data",
+   "rows": 22926,
+   "tokenized": 22925,
+   "deduped": 22925,
+   "train_n": 22525,
+   "dev_n": 400,
+   "max_len": 1728,
+   "p50": 298,
+   "p99": 1544
+  },
+  {
+   "t": 31.5,
+   "name": "sft_v2_field_recipe",
+   "damaged_base": false,
+   "clean_small_qwen": false,
+   "recipe_key": "llama",
+   "cheap_full": false,
+   "bf16": false,
+   "bf16_min_b": 2.0,
+   "lr_mult": 1.0,
+   "eff_batch": 48,
+   "strategy": "full"
+  },
+  {
+   "t": 35.6,
+   "name": "sft_v2_memory_probe",
+   "micro": 14,
+   "gradient_checkpointing": true,
+   "fits": true
+  },
+  {
+   "t": 35.7,
+   "name": "sft_v2_field_lr",
+   "prior_lr": 5.008265509006297e-05,
+   "raw": 5.008265509006297e-05,
+   "mult": 1.0,
+   "eff_batch": 56,
+   "rows_per_step": 56
+  },
+  {
+   "t": 55.7,
+   "name": "sft_v2_timing",
+   "t_per_step": 2.4806,
+   "eff_batch": 56,
+   "losses": [
+    1.2254,
+    1.3209,
+    1.1684
+   ]
+  },
+  {
+   "t": 56.7,
+   "name": "sft_v2_sweep_gate",
+   "batches": 400,
+   "t_per_step": 2.4806,
+   "lr_override": 5.008265509006297e-05,
+   "remaining_s": 3543.3
+  },
+  {
+   "t": 57.5,
+   "name": "sft_v2_snapshot_pool",
+   "k": 8,
+   "params_b": 2.517,
+   "available_ram": 114235297792,
+   "peak_bytes": 12523208704,
+   "limit_bytes": 118111600640
+  },
+  {
+   "t": 57.5,
+   "name": "sft_v2_train_start",
+   "elapsed_s": 43.7,
+   "lr": 5.008265509006297e-05,
+   "prior_lr": 5.008265509006297e-05,
+   "t_per_step": 2.4805675690004136,
+   "steps_per_epoch": 402,
+   "finish_reserve_s": 212.9
+  },
+  {
+   "t": 57.5,
+   "name": "sft_v2_plan",
+   "phase": 0,
+   "lr": 5.008265509006297e-05,
+   "t_per_step": 2.4805675690004136,
+   "epochs": 3.0,
+   "total_steps": 1206,
+   "warmup": 36,
+   "eval_every": 50,
+   "window_s": 3329.6,
+   "epochs_done": 0.0
+  },
+  {
+   "t": 213.7,
+   "name": "sft_v2_eval",
+   "step": 50,
+   "dev_loss": 1.310579,
+   "best": 1.310579,
+   "eval_s": 8.5,
+   "pool": 1,
+   "improved": true
+  },
+  {
+   "t": 213.7,
+   "name": "sft_v2_eval_governor",
+   "eval_every": 74,
+   "eval_s": 8.5
+  },
+  {
+   "t": 313.8,
+   "name": "sft_v2_eval",
+   "step": 74,
+   "dev_loss": 1.044234,
+   "best": 1.044234,
+   "eval_s": 8.1,
+   "pool": 2,
+   "improved": true
+  },
+  {
+   "t": 513.0,
+   "name": "sft_v2_eval",
+   "step": 148,
+   "dev_loss": 1.061226,
+   "best": 1.044234,
+   "eval_s": 8.2,
+   "pool": 3,
+   "improved": false
+  },
+  {
+   "t": 760.0,
+   "name": "sft_v2_eval",
+   "step": 222,
+   "dev_loss": 0.931852,
+   "best": 0.931852,
+   "eval_s": 8.1,
+   "pool": 4,
+   "improved": true
+  },
+  {
+   "t": 958.0,
+   "name": "sft_v2_eval",
+   "step": 296,
+   "dev_loss": 0.965431,
+   "best": 0.931852,
+   "eval_s": 8.2,
+   "pool": 5,
+   "improved": false
+  },
+  {
+   "t": 1198.5,
+   "name": "sft_v2_eval",
+   "step": 370,
+   "dev_loss": 0.899519,
+   "best": 0.899519,
+   "eval_s": 8.1,
+   "pool": 6,
+   "improved": true
+  },
+  {
+   "t": 1402.6,
+   "name": "sft_v2_eval",
+   "step": 444,
+   "dev_loss": 0.910272,
+   "best": 0.899519,
+   "eval_s": 8.2,
+   "pool": 7,
+   "improved": false
+  },
+  {
+   "t": 1639.7,
+   "name": "sft_v2_eval",
+   "step": 518,
+   "dev_loss": 0.878086,
+   "best": 0.878086,
+   "eval_s": 8.2,
+   "pool": 8,
+   "improved": true
+  },
+  {
+   "t": 1844.6,
+   "name": "sft_v2_eval",
+   "step": 592,
+   "dev_loss": 0.883403,
+   "best": 0.878086,
+   "eval_s": 8.2,
+   "pool": 8,
+   "improved": false
+  },
+  {
+   "t": 2079.3,
+   "name": "sft_v2_eval",
+   "step": 666,
+   "dev_loss": 0.867966,
+   "best": 0.867966,
+   "eval_s": 8.1,
+   "pool": 8,
+   "improved": true
+  },
+  {
+   "t": 2291.1,
+   "name": "sft_v2_eval",
+   "step": 740,
+   "dev_loss": 0.859297,
+   "best": 0.859297,
+   "eval_s": 8.2,
+   "pool": 8,
+   "improved": true
+  },
+  {
+   "t": 2516.9,
+   "name": "sft_v2_eval",
+   "step": 814,
+   "dev_loss": 0.864534,
+   "best": 0.859297,
+   "eval_s": 8.1,
+   "pool": 8,
+   "improved": false
+  },
+  {
+   "t": 2728.9,
+   "name": "sft_v2_eval",
+   "step": 888,
+   "dev_loss": 1.002571,
+   "best": 0.859297,
+   "eval_s": 8.1,
+   "pool": 8,
+   "improved": false
+  },
+  {
+   "t": 2949.3,
+   "name": "sft_v2_eval",
+   "step": 962,
+   "dev_loss": 0.895577,
+   "best": 0.859297,
+   "eval_s": 8.1,
+   "pool": 8,
+   "improved": false
+  },
+  {
+   "t": 3163.9,
+   "name": "sft_v2_eval",
+   "step": 1036,
+   "dev_loss": 0.991134,
+   "best": 0.859297,
+   "eval_s": 8.1,
+   "pool": 8,
+   "improved": false
+  },
+  {
+   "t": 3375.6,
+   "name": "sft_v2_eval",
+   "step": 1110,
+   "dev_loss": 0.947444,
+   "best": 0.859297,
+   "eval_s": 8.0,
+   "pool": 8,
+   "improved": false
+  },
+  {
+   "t": 3389.8,
+   "name": "train_end",
+   "steps": 1113,
+   "epochs": 2.763,
+   "planned_epochs": 3.0
+  },
+  {
+   "t": 3390.5,
+   "name": "sft_v2_phase_end",
+   "phase": 0,
+   "steps": 1113,
+   "planned": 1209,
+   "epochs_done": 2.769,
+   "t_per_step_measured": 2.845,
+   "best": 0.8592971161566675,
+   "best_step": 740,
+   "remaining_s": 209.5
+  },
+  {
+   "t": 3390.5,
+   "name": "sft_v2_train_end",
+   "step": 1113,
+   "best": 0.8592971161566675,
+   "best_step": 740,
+   "phases": 1,
+   "remaining_s": 209.5
+  },
+  {
+   "t": 3401.7,
+   "name": "sft_v2_soup_skipped",
+   "budget_s": 0.9,
+   "eval_s": 8.7
+  },
+  {
+   "t": 3409.9,
+   "name": "sft_v2_final",
+   "saved": true,
+   "chosen_loss": 0.8592971161566675,
+   "chosen_step": 740,
+   "truth": "PARTIAL_TRAINED_BEST",
+   "remaining_s": 190.1,
+   "cgroup_peak_bytes": 69152669696,
+   "cgroup_limit_bytes": 118111600640
+  },
+  {
+   "t": 3410.2,
+   "name": "run_complete"
+  }
+ ]
+}
