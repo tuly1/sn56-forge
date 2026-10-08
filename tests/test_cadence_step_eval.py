@@ -53,6 +53,8 @@ def _eval_steps(out):
 
 def test_switch(monkeypatch):
     monkeypatch.delenv("FORGE_V2_STEP_CADENCE", raising=False)
+    assert sft_v2.step_cadence_enabled() is False     # merged candidate: default off (d09fdc1 was default on)
+    monkeypatch.setenv("FORGE_V2_STEP_CADENCE", "1")
     assert sft_v2.step_cadence_enabled() is True
     monkeypatch.setenv("FORGE_V2_STEP_CADENCE", "0")
     assert sft_v2.step_cadence_enabled() is False

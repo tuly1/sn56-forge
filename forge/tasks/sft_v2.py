@@ -326,7 +326,11 @@ def governed_eval_every(eval_every: int, per_eval_s: float, t_step: float, total
 # Cadence rule: the interval is fixed at plan time as planned x 2^k, with k the smallest power that meets the same 6 %
 # target on the ESTIMATED eval cost (a function of the one timing probe and the plan: _estimate_eval_seconds). The measured
 # eval time is used only by an explicit hard cap on total eval + save seconds, which can only double the interval.
-STEP_CADENCE_DEFAULT = "1"
+# Merged candidate (v10b + tail reserve + cadence, 2026-10-08): default OFF. The cadence has no GPU result (phase-cg has
+# not run), Codex RESP-148-1 reads it as a two-factor bundle (cadence + step-wise patience) whose cap is a projection and
+# not a bound, and it has never run together with the geometry selector, whose two runs would plan different intervals.
+# FORGE_V2_STEP_CADENCE=1 arms it for research arms.
+STEP_CADENCE_DEFAULT = "0"
 CADENCE_EVAL_CAP_FRAC = 0.10    # hard cap: dev evals + in-training saves may take at most this share of the first training window
 OVERFIT_PATIENCE_INTERVALS = 3  # the overfit stop's patience, in PLANNED eval intervals (= the base rule's 3 evals when k = 0)
 
@@ -2317,6 +2321,12 @@ def run(
     state = {"best": float("inf"), "best_step": 0, "overfit": 0, "persisted_best": float("inf"), "persisted_step": 0,
              "eval_count": 0, "last_persist_at": 0.0, "step_offset": 0, "epochs_done": 0.0, "eval_secs": 0.0,
              "persist_secs": 0.0, "persist_max": 0.0, "stopped_overfit": False, "last_phase_complete": False, "restarts": 0, "last_eval_step": -1}
+    _tail_on = tail_reserve_enabled()
+    if geometry_select is not None and _tail_on:
+        # merged candidate: run S starts from run A's slowest measured save, so its export floor is not blind (the tail
+        # reserve raises the floor only from saves measured in the run; run S makes none before its one export)
+        state["persist_max"] = second_run_persist_seed(getattr(geometry_select, "first", None))
+        _event_and_print("sft_v2_tail_second_run_seed", persist_max_s=round(state["persist_max"], 1))
     eval_bs = selection.eval_batch_for(max_len=max_len, vocab=vocab)
     dev_rows_for_selection = dev_ex
 
@@ -2448,7 +2458,6 @@ def run(
     if strategy != "lora":
         _ema_frac = 0.0  # a full-weight fp32 average would not fit next to the optimizer state
     ema: dict[str, Any] = {}
-    _tail_on = tail_reserve_enabled()
     _cad_on = step_cadence_enabled()
 
     def _tail_trainable(m: Any) -> float:
@@ -3051,9 +3060,12 @@ def run(
     if final_step <= 0:
         return
     final_state = chosen_state if chosen_state is not None else selection.snapshot_trainable(model)
-    # log only: the export START milestone (sft_v2_final below is written after the save)
-    _event_and_print("sft_v2_export_start", remaining_s=round(deadline.remaining_hard(), 1), export_floor_s=round(export_floor, 1),
-                     tail_active=tail_active, persist_max_s=round(state["persist_max"], 1))
+    # log only: the export START milestone (sft_v2_final below is written after the save). Merged candidate: written only
+    # with the tail reserve switched on, so FORGE_V2_TAIL_RESERVE=0 logs exactly what 2d6eaec logs (Codex RESP-147-1 B2)
+    if _tail_on:
+        _event_and_print("sft_v2_export_start", remaining_s=round(deadline.remaining_hard(), 1),
+                         export_floor_s=round(export_floor, 1), tail_active=tail_active,
+                         persist_max_s=round(state["persist_max"], 1))
     # run S labels its one save with its generation marker: the selector reads it back to know which run is exported
     ok = persist(model, final_state, chosen_step or final_step, truth,
                  "sft_v2_final" if geometry_select is None else geometry_select.truth_reason)
@@ -3066,6 +3078,10 @@ def run(
                     remaining_s=round(deadline.remaining_hard(), 1), **{f"cgroup_{k}": v for k, v in selection.cgroup_memory_peak().items()})
     if result is not None:
         result.update(completed=True, saved=bool(ok), truth=truth, tail_s=round(time.monotonic() - _t_core_end, 2))
+        if _tail_on and geometry_select is None:
+            # merged candidate: run A's slowest measured save (its final export included) is handed to a second run,
+            # which defers every save until it has won and so measures none before its one export
+            result["persist_max_s"] = round(float(state["persist_max"]), 2)
     if geometry_select is None:   # run S: the selector writes the record after it has read the export back
         telemetry.write_into(spec.output_dir)
 
@@ -3332,6 +3348,16 @@ def _tail_slow() -> float:
 def tail_trial_seconds(eval_s: float, trainable_params: float) -> float:
     """One greedy-soup trial: one measured dev eval plus averaging and loading the weights (scaled by trainable size)."""
     return max(0.0, float(eval_s)) + TAIL_MIX_S_PER_BPARAM * max(0.0, float(trainable_params)) / 1e9
+
+
+def second_run_persist_seed(first: Any) -> float:
+    """Run A's slowest measured save in seconds, as the starting value of run S's save measure. 0.0 (= no raise, the
+    2d6eaec floor) when run A recorded none or the value is not a finite non-negative number."""
+    try:
+        v = float((first or {}).get("persist_max_s") or 0.0)
+    except (TypeError, ValueError, AttributeError):
+        return 0.0
+    return v if math.isfinite(v) and v > 0.0 else 0.0
 
 
 def tail_export_floor(export_reserve_s: float, persist_max_s: float) -> float:

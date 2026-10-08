@@ -32,7 +32,8 @@ HERE = Path(__file__).resolve().parent
 RECEIPT = {s: json.loads((HERE / f"data/v94/receipt_ce_d0_01fdf13f_s{s}.json").read_text()) for s in (7, 11)}
 TAIL_EVENTS = ("sft_v2_tail_reserve", "sft_v2_tail_finish", "sft_v2_tail_soup_budget", "sft_v2_tail_dev_pass_shortened",
                "sft_v2_tail_dev_pass_skipped")
-LOG_ONLY = ("sft_v2_tail_reserve",)   # the only v9.4 event a run may log when the guard never fires and no save was slow
+LOG_ONLY = ("sft_v2_tail_reserve", "sft_v2_export_start")  # merged candidate: the export-start line is written only with the switch on
+_LOG_ONLY_V94 = ("sft_v2_tail_reserve",)   # the only v9.4 event a run may log when the guard never fires and no save was slow
 
 
 def _rev(seed, name):
@@ -784,7 +785,7 @@ def test_a_failing_reserve_never_fails_the_run(monkeypatch, tmp_path):
     monkeypatch.setattr(sft_v2, "tail_reserve_plan", boom)
     on = _run(monkeypatch, tmp_path / "on", tl, tail=True)
     assert {e["stage"] for e in _ev(on, "sft_v2_tail_reserve_failed")} == {"plan"}
-    drop = lambda o: [(n, d) for n, d in o.events if n != "sft_v2_tail_reserve_failed"]  # noqa: E731
+    drop = lambda o: [(n, d) for n, d in o.events if n not in ("sft_v2_tail_reserve_failed", "sft_v2_export_start")]  # noqa: E731
     assert drop(on) == drop(off) and on.t_export_start == off.t_export_start
     # an exception at the tail (after a real tail stop): no soup budget can be computed -> no soup, the run still exports
     monkeypatch.undo()
