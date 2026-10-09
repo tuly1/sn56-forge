@@ -61,9 +61,12 @@ def test_plan_on_the_seed7_receipt_numbers():
     # trial = 8.2 + 3.5 x 2.5168 = 17.0 s (measured on seed 11: 122.9 s / 8 = 15.4 s)
     assert p["trial_s"] == pytest.approx(17.0, abs=0.05)
     trial = 8.2 + 3.5 * 2.5168
-    extra = max(1.3 * 8 * trial, (8 + 1.3) * trial + 3.5 * 2.5168) + 46.6 + 30 + 2.845
+    # v10d: the 46.6 s dev-pass estimate is inside finish_reserve_s (212.9) and is no longer added a second time; only its
+    # 30 s gate margin is. b6f61a5 pinned "+ 46.6 + 30" and 256.3 here.
+    extra = max(1.3 * 8 * trial, (8 + 1.3) * trial + 3.5 * 2.5168) + 30 + 2.845
     assert (p["level"], p["soup_members"], p["dev_pass"]) == ("soup_and_dev_pass", 8, True)
-    assert p["extra_s"] == pytest.approx(extra, abs=0.1) == pytest.approx(256.3, abs=0.2)
+    assert p["extra_s"] == pytest.approx(extra, abs=0.1) == pytest.approx(209.7, abs=0.2)
+    assert p["extra_s"] + 46.6 == pytest.approx(256.3, abs=0.2)  # the b6f61a5 number, reconstructed
     assert p["extra_s"] < 0.15 * 3329.6  # 7.7 % of the training window
 
 
@@ -76,7 +79,9 @@ def test_extra_is_never_negative_and_never_above_the_cap(kw):
 
 def test_degrade_order_is_dev_pass_then_pool_then_nothing():
     seen = []
-    for window in (4000, 1400, 1000, 500, 300, 100, 0):
+    # v10d: the full level is 209.7 s (b6f61a5: 256.3 s), so it now fits 15 % of a 1,400 s window; "soup_only" (179.7 s)
+    # is the plan between 1,198 s and 1,398 s. The second window is 1,300 s here (b6f61a5: 1,400 s).
+    for window in (4000, 1300, 1000, 500, 300, 100, 0):
         p = _plan(window_s=float(window))
         seen.append((p["level"], p["soup_members"]))
         if p["level"] == "none":
@@ -88,7 +93,8 @@ def test_degrade_order_is_dev_pass_then_pool_then_nothing():
     members = [m for lv, m in seen if lv == "soup_reduced"]
     assert members == sorted(members, reverse=True) and min(members) >= 2  # a smaller pool before no soup, never one member
     # one snapshot: nothing to soup, the dev pass alone is reserved; no dev pass either: nothing
-    assert (_plan(pool_n=1)["level"], _plan(pool_n=1)["extra_s"]) == ("dev_pass_only", pytest.approx(46.6 + 30 + 2.845, abs=0.1))
+    # (v10d: the dev pass itself is held by the finish reserve; the extra is its 30 s gate margin + one step)
+    assert (_plan(pool_n=1)["level"], _plan(pool_n=1)["extra_s"]) == ("dev_pass_only", pytest.approx(30 + 2.845, abs=0.1))
     assert _plan(pool_n=1, dev_pass_s=0.0)["level"] == "none"
 
 
@@ -514,7 +520,7 @@ def test_seed7_timeline_with_the_tail_reserve_soups_and_dev_passes(monkeypatch, 
     lost = _steps(off) - _steps(on)
     assert 0 < lost <= 0.10 * _steps(off)
     tr = _ev(on, "sft_v2_tail_reserve")[-1]
-    assert tr["level"] == "soup_and_dev_pass" and tr["soup_members"] == 8 and tr["extra_s"] == pytest.approx(256.2, abs=1.0)
+    assert tr["level"] == "soup_and_dev_pass" and tr["soup_members"] == 8 and tr["extra_s"] == pytest.approx(256.2 - 46.6, abs=1.0)  # v10d: b6f61a5's 256.2 less the dev-pass estimate
     # the whole pool is tried, the dev pass runs on all 400 rows
     soup = _ev(on, "soup_result")
     assert len(soup) == 1 and soup[0]["pool"] == 8 and soup[0]["members"] >= 2
@@ -670,10 +676,15 @@ def test_grid_never_later_and_never_below_the_9504136_floor(monkeypatch, tmp_pat
     overrun = max(0.0, tl.dev_pass_s * (on.dev_pass_rows[0] / N_DEV) - dp_est) if on.dev_pass_rows else 0.0
     overrun += max(0.0, (tl.tail_eval_s + tl.mix_s) - c) * 8 + max(0.0, tl.tail_eval_s - sft_v2.TAIL_SLOW_FACTOR * tl.eval_s[0])
     assert _export_start_remaining(on, tl) >= 180.0 - overrun - 1.0
-    # (d) finish stages no slower than the slow factor allows: the export starts no later than under 9504136 (one step)
+    # (d) v10d restatement. b6f61a5 asserted here "the export starts no later than under 9504136 (one step)". That held
+    #     only because the dev-pass estimate was held twice. 9504136 keeps the estimate in its finish reserve and, when it
+    #     trains to the clock, never spends it (no dev pass); v10d spends that slot on the dev pass, so its export may start
+    #     later than 9504136's by at most the estimate less the 30 s gate margin (plus one step), and it still starts with
+    #     the export floor + the gate margin left (finish stages no slower than the slow factor allows).
     last = _ev(on, "sft_v2_tail_reserve")[-1]
     if last["level"] == "soup_and_dev_pass" and kw["tail_slow"] <= 1.0:
-        assert on.t_export_start <= off.t_export_start + tl.t_step
+        assert on.t_export_start <= off.t_export_start + max(0.0, dp_est - sft_v2.TAIL_GATE_MARGIN_S) + tl.t_step
+        assert _export_start_remaining(on, tl) >= 150.0 + sft_v2.TAIL_GATE_MARGIN_S - 1.0
     # (e) never the bare checkpoint where the reserve was armed for a soup
     if last["soup_members"] >= 2:
         assert _ev(on, "soup_result") and _ev(on, "sft_v2_soup_skipped") == [] and _ev(on, "soup_result")[0]["members"] >= 2
@@ -699,7 +710,9 @@ def test_finish_stages_slower_than_reserved_degrade_in_the_declared_order(monkey
     the overrun of the stages beyond their bounds."""
     seen = {"shortened": 0, "skipped_logged": 0, "soup": 0, "exhausted": 0}
     geo = sft_v2.Geometry(14, 4, 1728, True, True, "adamw_torch_fused")
-    for i, ts in enumerate((1.6, 1.9, 2.2, 2.6, 3.0)):
+    # v10d: tail_slow values (b6f61a5: 1.6, 1.9, 2.2, 2.6, 3.0). Without the second dev-pass hold the soup's budget is
+    # about 45 s smaller, so the budget ends the soup from 1.6 x on and the dev pass is shortened at 1.75, 2.05 and 2.4 x.
+    for i, ts in enumerate((1.6, 1.75, 2.05, 2.4, 3.0)):
         tl = Timeline(7, tail_slow=ts)
         on = _run(monkeypatch, tmp_path / f"on{i}", tl, tail=True)
         monkeypatch.undo()
@@ -721,6 +734,144 @@ def test_finish_stages_slower_than_reserved_degrade_in_the_declared_order(monkey
             assert _ev(on, "sft_v2_tail_dev_pass_skipped")  # never silent
             seen["skipped_logged"] += 1
     assert seen["soup"] == 5 and (seen["shortened"] + seen["skipped_logged"]) >= 1, seen
+
+
+# ---- 4. v10d: the dev-pass estimate is held once (in the finish reserve), not twice ----------------------------------------
+
+def _extra_b6f61a5(*, eval_s, pool_n, trainable_params, dev_pass_s, t_step, floor_raise=0.0):
+    """b6f61a5's full-level extra, reconstructed arithmetically (the old rule is not selectable in the release code)."""
+    trial = eval_s + 3.5 * trainable_params / 1e9
+    soup = max(1.3 * pool_n * trial, (pool_n + 1.3) * trial + 3.5 * trainable_params / 1e9) if pool_n >= 2 else 0.0
+    return soup + ((dev_pass_s + 30.0) if dev_pass_s > 0 else 0.0) + t_step + floor_raise
+
+
+_V10D_GRID = [dict(eval_s=ev, pool_n=n, trainable_params=pb * 1e9, dev_pass_s=dp, t_step=ts)
+              for ev in (0.5, 8.2, 60.0) for n in (0, 1, 2, 5, 8) for pb in (0.1, 2.5168, 4.25) for dp in (0.0, 20.0, 46.6, 400.0)
+              for ts in (0.0, 2.845, 20.0)]
+
+
+def test_v10d_extra_does_not_contain_the_dev_pass_estimate():
+    # (a) with a dev pass planned, the size of its estimate does not move the extra
+    for kw in _V10D_GRID:
+        if kw["dev_pass_s"] <= 0:
+            continue
+        got = [_plan(window_s=1e9, **{**kw, "dev_pass_s": d})["extra_s"] for d in (kw["dev_pass_s"], 1.0, 5000.0)]
+        assert got[0] == got[1] == got[2], (kw, got)
+    src = inspect.getsource(sft_v2.tail_reserve_plan)
+    assert "dp = TAIL_GATE_MARGIN_S if dev_pass_s > 0 else 0.0" in src and "float(dev_pass_s) + TAIL_GATE_MARGIN_S" not in src
+    assert src.count("dev_pass_s") == 3  # the signature, the docstring and the planned-or-not test: never a summand
+
+
+def test_v10d_extra_holds_the_gate_margin_iff_a_dev_pass_is_planned():
+    # (b) 30 s when planned, nothing when not
+    assert sft_v2.TAIL_GATE_MARGIN_S == 30.0
+    for kw in _V10D_GRID:
+        with_dp = _plan(window_s=1e9, **{**kw, "dev_pass_s": 46.6})
+        without = _plan(window_s=1e9, **{**kw, "dev_pass_s": 0.0})
+        if kw["pool_n"] >= 2:
+            assert with_dp["dev_pass"] is True and without["dev_pass"] is False
+            assert with_dp["extra_s"] - without["extra_s"] == pytest.approx(30.0, abs=0.11), kw
+        else:
+            assert (with_dp["level"], with_dp["extra_s"]) == ("dev_pass_only", pytest.approx(30.0 + kw["t_step"], abs=0.06))
+            assert (without["level"], without["extra_s"]) == ("none", 0.0)
+
+
+def test_v10d_extra_is_b6f61a5s_less_the_dev_pass_estimate_when_the_cap_does_not_bind():
+    # (c) same level, same soup members, extra smaller by exactly the estimate
+    n = 0
+    for kw in _V10D_GRID:
+        for persist in (0.0, 5.2, 161.1):
+            p = _plan(window_s=1e9, persist_max_s=persist, **kw)
+            raise_s = sft_v2.tail_export_floor(150.0, persist) - 150.0
+            old = _extra_b6f61a5(floor_raise=raise_s, **kw)
+            if kw["pool_n"] < 2 and kw["dev_pass_s"] <= 0:
+                assert (p["level"], p["extra_s"]) == ("none", 0.0)
+                continue
+            assert p["extra_s"] == pytest.approx(old - kw["dev_pass_s"], abs=0.06), (kw, persist, p, old)
+            assert p["soup_members"] == (kw["pool_n"] if kw["pool_n"] >= 2 else 0)
+            n += 1
+    assert n > 400
+
+
+def _plan_b6f61a5(*, window_s, **kw):
+    """b6f61a5's whole plan (levels and cap) as (extra_s, holds the dev pass), reconstructed arithmetically."""
+    cap = 0.15 * max(0.0, window_s)
+    n, dp, ts = kw["pool_n"], kw["dev_pass_s"], kw["t_step"]
+    one = lambda m, with_dp: _extra_b6f61a5(**{**kw, "pool_n": m, "dev_pass_s": dp if with_dp else 0.0})  # noqa: E731
+    levels = []
+    if n >= 2:
+        levels.append((n, dp > 0))
+        if dp > 0:
+            levels.append((n, False))
+        levels.extend((m, False) for m in range(n - 1, 1, -1))
+    elif dp > 0:
+        levels.append((0, True))
+    for m, with_dp in levels:
+        if one(m, with_dp) <= cap:
+            return one(m, with_dp), with_dp
+    return 0.0, False
+
+
+def test_v10d_stop_guard_never_later_than_9504136_and_not_earlier_than_b6f61a5_where_b6f61a5_held_the_dev_pass():
+    """(d) The guard stops when the time left is at or below finish reserve + extra. extra >= 0, so never later than the
+    9504136 stop. Against b6f61a5: wherever b6f61a5's plan held the dev pass (or none is planned) the v10d extra is not
+    larger, so v10d never stops earlier. ONE declared exception, found while writing this test: in the band where
+    b6f61a5's full level exceeded the 15 % cap and it fell back to a level WITHOUT any dev-pass hold, the v10d full level
+    (30 s instead of estimate + 30 s) can fit the cap; v10d then stops earlier than b6f61a5 did, by exactly the 30 s
+    margin (pool >= 2) or by margin + one step (one snapshot). It is still inside the cap."""
+    seen = {"le": 0, "band_30": 0, "band_single": 0, "stops": 0}
+    fr = 212.9
+    for kw in _V10D_GRID:
+        for window in (0.0, 300.0, 700.0, 1000.0, 1250.0, 1400.0, 1600.0, 3329.6, 1e9):
+            new = _plan(window_s=window, finish_reserve_s=fr, persist_max_s=0.0, **kw)
+            old_extra, old_dp = _plan_b6f61a5(window_s=window, **kw)
+            assert 0.0 <= new["extra_s"] <= 0.15 * window + 0.05
+            if old_dp or kw["dev_pass_s"] <= 0 or not new["dev_pass"]:
+                assert new["extra_s"] <= old_extra + 0.06, (kw, window, new, old_extra)
+                seen["le"] += 1
+            elif kw["pool_n"] >= 2:
+                assert new["extra_s"] - old_extra == pytest.approx(30.0, abs=0.11), (kw, window, new, old_extra)
+                seen["band_30"] += 1
+            else:
+                assert old_extra == 0.0 and new["extra_s"] == pytest.approx(30.0 + kw["t_step"], abs=0.06)
+                seen["band_single"] += 1
+            for left in (0.0, fr, fr + 0.5 * new["extra_s"], fr + new["extra_s"], fr + new["extra_s"] + 0.2, fr + old_extra, 5000.0):
+                d = NS(remaining_hard=lambda left=left: left)
+                g_new, g_old, g_9504136 = sft_v2._StopAt(d, fr), sft_v2._StopAt(d, fr), sft_v2._StopAt(d, fr)
+                g_new.extra_s, g_old.extra_s = new["extra_s"], old_extra
+                stop_new, stop_old, stop_base = g_new.should_stop(), g_old.should_stop(), g_9504136.should_stop()
+                assert stop_new or not stop_base                       # never later than 9504136
+                if old_dp or kw["dev_pass_s"] <= 0 or not new["dev_pass"]:
+                    assert stop_old or not stop_new or left <= fr + old_extra + 0.06   # never earlier than b6f61a5
+                seen["stops"] += stop_new
+    assert min(seen.values()) > 20, seen
+
+
+def test_v10d_a_starved_finish_reserve_never_had_the_dev_pass_hold_in_b6f61a5_either():
+    """starved_finish_reserve plans the finish reserve WITHOUT the dev-pass estimate when keeping it would leave less than
+    max(25 % of the time left, 3 steps) to train. There the b6f61a5 extra was the only hold of the estimate, and v10d does
+    not add it. This shows b6f61a5 never selected a dev-pass level in that case (estimate + 30 s never fits 15 % of the
+    starved window), so no run loses a hold it had. Grid: step time up to 60 s, 100-1,000 dev rows, 8-140 rows per step."""
+    import random
+
+    rng = random.Random(20261009)
+    starved = 0
+    for _ in range(20000):
+        left = rng.uniform(300.0, 7200.0)
+        t = rng.choice([None, rng.uniform(0.05, 60.0)])
+        n_dev, eff = rng.choice([100, 200, 400, 1000]), rng.choice([8, 16, 56, 140])
+        geo = sft_v2.Geometry(max(1, eff // 4), 4, 1024, True, True, "adamw_torch_fused")
+        assert geo.eff_batch == max(1, eff // 4) * 4
+        dp = sft_v2._dev_pass_estimate(n_dev, t, geo)
+        export = rng.choice([60.0, 150.0])
+        fr = export + 1.5 * sft_v2._estimate_eval_seconds(n_dev, t, geo) + dp
+        fr2 = sft_v2.starved_finish_reserve(remaining=left, finish_reserve=fr, dev_pass_s=dp, t_step=t)
+        if fr2 == fr:
+            continue
+        starved += 1
+        cap = sft_v2.TAIL_MAX_WINDOW_FRAC * max(0.0, left - fr2)   # the planner window is at most this
+        assert dp + sft_v2.TAIL_GATE_MARGIN_S > cap, (left, t, n_dev, eff, dp, cap)
+    assert starved > 500, starved
 
 
 def test_overfit_stop_before_the_guard_is_9504136_even_near_the_clock(monkeypatch, tmp_path):

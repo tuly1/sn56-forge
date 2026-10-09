@@ -4,7 +4,9 @@
 1. pure rules: step_cadence, cadence_cap_interval, overfit_patience_reached;
 2. off switch == base commit a9de4f9: the real sft_v2.run on the fake clock (harness of tests/test_v94_tail_reserve.py), eight
    receipt timelines, compared event for event with tests/data/cadence/golden_a9de4f9.json, which was written by running this
-   file's --write-golden on a checkout of a9de4f9 (it refuses to run where the cadence code exists);
+   file's --write-golden on a checkout of a9de4f9 (it refuses to run where the cadence code exists).
+   release-candidate-v10d-20261009 changes the SIZE of the tail reserve (the dev-pass estimate is held once, not twice), so
+   the golden is no longer matched byte for byte: see the note above section 2 for the two declared differences;
 3. cadence on: the two real seed-7 runs of 01fdf13f (live 9504136: ran to the clock; v9.4 6b1f603: overfit stop at 980) replayed
    on a 1.0 x and a 1.3 x node; the hard cap on eval time.
 """
@@ -124,20 +126,93 @@ def test_wiring():
 
 # ---- 2. off switch == base commit a9de4f9 ------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("name", ["ce_d0_s7", "ce_d0_s11"] + RECEIPTS)
-def test_off_switch_is_the_base_commit_event_for_event(monkeypatch, tmp_path, name):
+# release-candidate-v10d-20261009: the golden below is NOT regenerated. It was written on a9de4f9, whose tail reserve
+# added the dev-pass estimate to the extra a second time; v10d adds only the 30 s gate margin. Against that golden a v10d
+# run with the tail reserve on can differ in exactly two ways, and the assertions are split accordingly:
+#   (1) every run: the ``extra_s`` field of the log line sft_v2_tail_reserve is smaller by the run's dev-pass estimate
+#       wherever that line plans a dev pass (level and soup members unchanged);
+#   (2) the two runs whose reserve FIRED on a9de4f9 (ce_d0_s7, bk_lfm12_turkish_s7): training stops later, so every
+#       event from the stop onward moves. They are compared up to a9de4f9's stop and then checked on what v10d must keep.
+# The six runs whose reserve never fired are still a9de4f9's, event for event, apart from (1).
+V10D_FIRED_ON_A9DE4F9 = ("ce_d0_s7", "bk_lfm12_turkish_s7")
+
+
+def _golden_run(monkeypatch, tmp_path, name):
     golden = json.loads(GOLDEN.read_text())
     assert golden["commit"] == "a9de4f9a025e1ad7225063c766e61a2f1678cc03"
     tl, kw = _timelines()[name]
     monkeypatch.setenv("FORGE_V2_STEP_CADENCE", "0")
+    seen, real = [], sft_v2._dev_pass_estimate
+
+    def spy(n_dev, t_per_step, geo):   # the run's own dev-pass estimate (what a9de4f9 held a second time)
+        v = real(n_dev, t_per_step, geo)
+        seen.append((n_dev, v))
+        return v
+
+    monkeypatch.setattr(sft_v2, "_dev_pass_estimate", spy)
     out = t94._run(monkeypatch, tmp_path, tl, tail=True, **kw)
-    got = _trace(out)
     assert not any(n in CAD_EVENTS for n, _ in out.events)
-    want = golden["runs"][name]
+    n_dev = kw.get("n_dev", t94.N_DEV)
+    full = {round(v, 6) for n, v in seen if n == n_dev}
+    assert len(full) == 1
+    return tl, out, _trace(out), golden["runs"][name], full.pop()
+
+
+def _same_but_for_the_second_dev_pass_hold(g, w, dp_est):
+    """One event of a v10d run against the a9de4f9 golden: equal, except sft_v2_tail_reserve.extra_s, which is a9de4f9's
+    less the dev-pass estimate when the line plans a dev pass (both values are rounded to 0.1 s in the log)."""
+    if g == w:
+        return True
+    if g[0] != "sft_v2_tail_reserve" or w[0] != "sft_v2_tail_reserve":
+        return False
+    rest = lambda d: {k: v for k, v in d.items() if k != "extra_s"}  # noqa: E731
+    return rest(g[1]) == rest(w[1]) and g[1]["dev_pass"] is True and abs((w[1]["extra_s"] - g[1]["extra_s"]) - dp_est) <= 0.11
+
+
+@pytest.mark.parametrize("name", [n for n in ["ce_d0_s7", "ce_d0_s11"] + RECEIPTS if n not in V10D_FIRED_ON_A9DE4F9])
+def test_off_switch_is_the_base_commit_event_for_event(monkeypatch, tmp_path, name):
+    """Runs whose reserve never fires: a9de4f9 event for event, every payload and fake-clock time, except the logged size
+    of the reserve (see the v10d note above)."""
+    tl, out, got, want, dp_est = _golden_run(monkeypatch, tmp_path, name)
+    assert not [d for n, d in want["events"] if n == "sft_v2_tail_finish"]          # the golden run's reserve never fired
     assert len(got["events"]) == len(want["events"])
     for i, (g, w) in enumerate(zip(got["events"], want["events"])):
-        assert g == w, (i, g, w)
+        assert _same_but_for_the_second_dev_pass_hold(g, w, dp_est), (i, g, w)
     assert {k: got[k] for k in got if k != "events"} == {k: want[k] for k in want if k != "events"}
+
+
+@pytest.mark.parametrize("name", V10D_FIRED_ON_A9DE4F9)
+def test_v10d_runs_whose_reserve_fired_on_the_base_commit_stop_later_and_keep_the_finish(monkeypatch, tmp_path, name):
+    """The two golden runs the a9de4f9 reserve ended. v10d (release-candidate-v10d-20261009) holds the dev-pass estimate
+    once, so the same timeline stops LATER; the golden is kept as a9de4f9's record and is not rewritten."""
+    tl, out, got, want, dp_est = _golden_run(monkeypatch, tmp_path, name)
+    wev = lambda n: [d for m, d in want["events"] if m == n]  # noqa: E731
+    assert wev("sft_v2_tail_finish")[0]["tail_active"] is True and t94._ev(out, "sft_v2_tail_finish")[0]["tail_active"] is True
+    # identical up to a9de4f9's stop: its first event after the stop is sft_v2_phase_end
+    k = next(i for i, (n, _) in enumerate(want["events"]) if n == "sft_v2_phase_end")
+    for i in range(k):
+        assert _same_but_for_the_second_dev_pass_hold(got["events"][i], want["events"][i], dp_est), (i, got["events"][i], want["events"][i])
+    assert got["args"] == want["args"]
+    # the stop: later than a9de4f9's, at v10d's own reserve, which is a9de4f9's less the dev-pass estimate
+    g_end, w_end = t94._ev(out, "sft_v2_train_end")[0], wev("sft_v2_train_end")[0]
+    assert g_end["step"] > w_end["step"] and g_end["remaining_s"] < w_end["remaining_s"]
+    g_tr, w_tr = t94._ev(out, "sft_v2_tail_reserve")[-1], wev("sft_v2_tail_reserve")[-1]
+    assert (g_tr["level"], g_tr["soup_members"], g_tr["dev_pass"]) == (w_tr["level"], w_tr["soup_members"], w_tr["dev_pass"])
+    assert w_tr["extra_s"] - g_tr["extra_s"] == pytest.approx(dp_est, abs=0.11)
+    fr = t94._ev(out, "sft_v2_train_start")[0]["finish_reserve_s"]
+    assert g_end["remaining_s"] <= fr + g_tr["extra_s"] + 0.1                       # the guard fired at its line
+    assert w_end["remaining_s"] - g_end["remaining_s"] == pytest.approx(dp_est, abs=15.0)   # to one step and one eval
+    # the finish v10d must keep: the same pool souped, the dev pass on the same rows, one export, the floor + margin left
+    g_soup, w_soup = t94._ev(out, "soup_result")[0], wev("soup_result")[0]
+    assert g_soup["pool"] == w_soup["pool"] and g_soup["members"] >= 2 and t94._ev(out, "sft_v2_soup_skipped") == []
+    assert got["dev_pass_rows"] == want["dev_pass_rows"] and got["dev_pass_rows"]
+    assert got["saved"] == want["saved"] and t94._ev(out, "sft_v2_final")[0]["saved"] is True
+    start = t94._ev(out, "sft_v2_export_start")[0]
+    assert start["remaining_s"] >= start["export_floor_s"] + sft_v2.TAIL_GATE_MARGIN_S - 1.0
+    # no event kind appears or disappears, apart from in-run evals of the extra steps trained
+    names = lambda evs: sorted(n for n, _ in evs if n not in ("sft_v2_eval", "sft_v2_tail_reserve"))  # noqa: E731
+    assert names(got["events"]) == names(want["events"])
+    assert got["t_export_start"] > want["t_export_start"]                            # the export starts later than a9de4f9's
 
 
 # ---- 3. cadence on ----------------------------------------------------------------------------------------------------

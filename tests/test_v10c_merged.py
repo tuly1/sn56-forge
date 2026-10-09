@@ -10,7 +10,9 @@ Three switches, one per part:
    extracted archive of 2d6eaec (it refuses to run where the tail-reserve code exists). This is the FIRST run of a task
    (geometry_select=None); the selector's own orchestration is covered by tests/test_v10b_geometry_select.py, unchanged.
 2. Tail reserve on, cadence off: the a9de4f9 golden (tests/test_cadence_step_eval.py) still holds, with one declared
-   difference - none on these runs, since they all have the tail reserve on.
+   difference - none on these runs, since they all have the tail reserve on. (release-candidate-v10d-20261009: no longer
+   byte for byte. The reserve is smaller by the dev-pass estimate; tests/test_cadence_step_eval.py section 2 states the
+   two declared differences. Item 1, switches off == 2d6eaec, is unchanged.)
 3. The export-start line is written only with the tail reserve on (RESP-147-1 B2).
 4. Run S (the selector's second run) starts its save measure from run A's slowest save.
 5. Route snapshot: every cell is 2d6eaec's under every switch combination.

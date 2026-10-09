@@ -3372,10 +3372,17 @@ def tail_reserve_plan(*, export_reserve_s: float, finish_reserve_s: float, eval_
     """How many seconds BEFORE the 9504136 finish reserve training must stop (``extra_s`` >= 0 for finite inputs, so the
     stop guard never fires later at the same callback state).
 
-    extra(level) = soup + dev-pass estimate + its gate margin + one optimizer step + any export-floor raise, where
-    soup = the larger of slow x members trials and what tail_soup_budget needs to admit ``members`` trials at the
-    measured speed ((members + slow) trials + one averaging). It is added ON TOP of the finish reserve. If the trials
-    really run slow-factor slower, the last of them may not be admitted. Predeclared order when extra exceeds TAIL_MAX_WINDOW_FRAC of the window: (1) reserve for the
+    extra(level) = soup + the dev-pass gate margin (TAIL_GATE_MARGIN_S, only when a dev pass is planned) + one optimizer
+    step + any export-floor raise, where soup = the larger of slow x members trials and what tail_soup_budget needs to
+    admit ``members`` trials at the measured speed ((members + slow) trials + one averaging). It is added ON TOP of the
+    finish reserve. The finish reserve ALREADY holds the dev-pass estimate (export reserve + 1.5 x estimated eval +
+    dev-pass estimate), so the estimate is NOT held here a second time (v10d; b6f61a5 added it again, an undeclared
+    second hold of one whole dev pass). ``dev_pass_s`` only says whether a dev pass is planned (> 0): the gate at the
+    finish needs remaining > export floor + estimate + margin, and the margin is the part the finish reserve lacks.
+    When the finish reserve was planned WITHOUT the estimate (starved_finish_reserve) the extra does not restore it; the
+    finish gate then shortens or skips the pass and logs it. If the trials really run slow-factor slower, the last of
+    them may not be admitted, and the soup's budget does not subtract the dev pass (the soup keeps priority).
+    Predeclared order when extra exceeds TAIL_MAX_WINDOW_FRAC of the window: (1) reserve for the
     whole pool + dev pass; (2) whole pool, no dev-pass reserve; (3) m < pool trials, m down to 2; (4) nothing (the
     9504136 stop). ``soup_members`` sizes the RESERVE only: the greedy soup itself tries the pool best-first until its
     time budget ends. The averaging constant and the soup-before-dev-pass priority are empirical choices (H100 / A100
@@ -3386,7 +3393,7 @@ def tail_reserve_plan(*, export_reserve_s: float, finish_reserve_s: float, eval_
     mix = tail_trial_seconds(0.0, trainable_params)
     cap = TAIL_MAX_WINDOW_FRAC * max(0.0, float(window_s))
     n = max(0, int(pool_n))
-    dp = (float(dev_pass_s) + TAIL_GATE_MARGIN_S) if dev_pass_s > 0 else 0.0
+    dp = TAIL_GATE_MARGIN_S if dev_pass_s > 0 else 0.0  # the estimate itself is inside finish_reserve_s (see docstring)
 
     def extra(members: int, with_dp: bool) -> float:
         soup = max(slow * members * trial, (members + slow) * trial + mix) if members >= 2 else 0.0
