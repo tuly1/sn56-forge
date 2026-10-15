@@ -307,9 +307,13 @@ def test_clean_small_qwen_is_on_by_default(monkeypatch, tmp_path):
 
 
 def test_eval_slack_on_only_for_the_clean_small_qwen_route(monkeypatch):
+    # v10e: the slack is on by default on every route; the clean small-Qwen route default stays on
     monkeypatch.delenv("FORGE_V2_EVAL_SLACK", raising=False)
-    assert sft_v2.EVAL_SLACK_DEFAULT == "0"
+    assert sft_v2.EVAL_SLACK_DEFAULT == "1"
+    assert sft_v2._eval_slack() is True and sft_v2._eval_slack(True) is True
+    monkeypatch.setattr(sft_v2, "EVAL_SLACK_DEFAULT", "0")      # the fa3e6ac default: route-only
     assert sft_v2._eval_slack() is False and sft_v2._eval_slack(True) is True
+    monkeypatch.setattr(sft_v2, "EVAL_SLACK_DEFAULT", "1")
     monkeypatch.setenv("FORGE_V2_EVAL_SLACK", "0")
     assert sft_v2._eval_slack(True) is False
     monkeypatch.setenv("FORGE_V2_EVAL_SLACK", "1")
@@ -317,7 +321,7 @@ def test_eval_slack_on_only_for_the_clean_small_qwen_route(monkeypatch):
     import inspect
     src = inspect.getsource(sft_v2.run)
     assert "_csq_field = bool(field and clean_small_qwen_route)" in src
-    assert "self.window_s if _eval_slack(_csq_field) else None" in src
+    assert "_slack_on = _eval_slack(_csq_field)" in src and "self.window_s if _slack_on else None" in src
     # the two-seed (LoRA-only) refresh keeps the switch-only gate
     assert src.count("if _eval_slack():") == 1
 

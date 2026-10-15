@@ -591,7 +591,7 @@ def test_a_failing_final_save_of_the_second_run_keeps_the_first(monkeypatch, tmp
 
 
 @pytest.mark.parametrize("over,reason", [(dict(window_bound=True), "first_run_window_bound"),
-                                         (dict(large_model_rule=True), "large_model_batch_rule"),
+                                         (dict(large_model_rule=True, large_model_grew=True), "large_model_batch_rule"),
                                          (dict(saved=False), "first_artifact_not_saved")])
 def test_a_refused_first_run_never_reloads_the_base(monkeypatch, tmp_path, over, reason):
     h = Harness(monkeypatch, tmp_path)

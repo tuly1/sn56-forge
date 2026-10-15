@@ -193,8 +193,10 @@ def first_run_refusal(first: dict[str, Any]) -> str | None:
         return "cheap_full_rung"
     if first.get("gemma2_champion"):
         return "gemma2_champion_geometry"        # that recipe fixes its own blocks per step
-    if first.get("large_model_rule"):
-        return "large_model_batch_rule"          # >= 3.0 B: the rule would grow run S's batch back
+    if first.get("large_model_rule") and (first.get("large_model_grew", True) or first.get("window_bound")):
+        # >= 3.0 B (v10e): refused only when the rule grew run A's batch or run A was window-bound (a record without
+        # the large_model_grew key is read as grown). Run S never applies the rule (sft_v2.run skips it for run S).
+        return "large_model_batch_rule"
     if first.get("field_hygiene"):
         return "field_hygiene_experiment"        # its subsample depends on the remaining hours
     if first.get("lr_search"):

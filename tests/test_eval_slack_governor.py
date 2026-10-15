@@ -1,4 +1,4 @@
-"""Window-aware dev-eval governor (FORGE_V2_EVAL_SLACK, research, default off)."""
+"""Window-aware dev-eval governor (FORGE_V2_EVAL_SLACK; default on from v10e, research before)."""
 import importlib
 
 import pytest
@@ -6,10 +6,13 @@ import pytest
 from forge.tasks import sft_v2
 
 
-def test_default_off_keeps_flat_rule(monkeypatch):
+def test_switch_off_keeps_flat_rule(monkeypatch):
+    # v10e: default on; FORGE_V2_EVAL_SLACK=0 is the flat rule (the callback then passes no window)
     monkeypatch.delenv("FORGE_V2_EVAL_SLACK", raising=False)
     importlib.reload(sft_v2)
-    assert sft_v2.EVAL_SLACK_DEFAULT == "0" and not sft_v2._eval_slack()
+    assert sft_v2.EVAL_SLACK_DEFAULT == "1" and sft_v2._eval_slack()
+    monkeypatch.setenv("FORGE_V2_EVAL_SLACK", "0")
+    assert not sft_v2._eval_slack() and not sft_v2._eval_slack(True)
     # flat rule only when no window is passed (the callback passes None while the switch is off)
     assert sft_v2.governed_eval_every(10, 5.7, 0.73, 264, None) == (131, None)
 
@@ -87,7 +90,7 @@ def test_refresh_is_gated_and_placed_after_seed_a_soup():
     cb = src.index("cb = SelectCallback(eval_every, total_steps, window_s=window)")
     assert flag < soup < reinit < refresh < handler < restore < plan < cb
     gate = src.rindex("if _eval_slack():", 0, refresh)
-    assert refresh - gate < 400                           # the refresh only runs with FORGE_V2_EVAL_SLACK=1
+    assert refresh - gate < 400                           # the refresh only runs with the eval slack on (v10e: default)
     # the restore runs outside the broad stage-A handler (Codex re-review of 01a6b57): nothing in the try body restores
     body = src[soup:handler]
     assert "load_state(model, seed_a" not in body and "restore_seed_a_or_fail" not in body

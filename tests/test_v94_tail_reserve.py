@@ -341,6 +341,8 @@ def _run(monkeypatch, tmp_path, tl: Timeline, *, tail: bool, rows=N_ROWS, n_dev=
     import os as _os
     if "FORGE_V2_STEP_CADENCE" not in _os.environ:   # these tests are about the tail reserve at the base cadence
         monkeypatch.setenv("FORGE_V2_STEP_CADENCE", "0")
+    if "FORGE_V2_EVAL_SLACK" not in _os.environ:     # v10e: the goldens are fa3e6ac-and-earlier traces (flat governor); slack is tested in test_v10e
+        monkeypatch.setenv("FORGE_V2_EVAL_SLACK", "0")
     monkeypatch.setenv("FORGE_DEV_PASS", "1")
     clock = [tl.start_t]
     phase = {"training": False, "soup": False, "trained": False, "step": 0}

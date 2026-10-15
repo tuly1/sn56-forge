@@ -288,9 +288,14 @@ def damaged_base_family_enabled(model_type: str | None) -> bool:
     return _field_full() and _damaged_base_route() and str(model_type or "").lower() in damaged_base_types()
 
 
-# Window-aware eval governor: OFF by default, ON for the clean small-Qwen FIELD route (the only route with replay
-# evidence: research/20260923-replay-bench phase-f/phase-g). FORGE_V2_EVAL_SLACK=0/1 overrides both.
-EVAL_SLACK_DEFAULT = "0"
+# Window-aware eval governor: ON by default on every route (v10e; was ON only for the clean small-Qwen FIELD route,
+# research/20261013-eval-slack-default-scope). FORGE_V2_EVAL_SLACK=0 = the flat rule on every route (fa3e6ac with the
+# same env; fa3e6ac's clean small-Qwen FIELD default, slack without the three fixes below, is not selectable).
+# v10e fixes the three risks of that report: the slack uses the step time MEASURED in the phase (not the probe), the
+# tail reserve the pool will need is subtracted from the slack, and a phase whose evals the slack made denser cannot
+# end on the overfit stop before it has trained SLACK_OVERFIT_MIN_EPOCHS epochs.
+EVAL_SLACK_DEFAULT = "1"
+SLACK_OVERFIT_MIN_EPOCHS = 1.0  # epochs trained before an overfit stop may end a slack-densified phase (final on field)
 
 
 def _eval_slack(route_default: bool = False) -> bool:
@@ -301,21 +306,41 @@ def _eval_slack(route_default: bool = False) -> bool:
 
 
 def governed_eval_every(eval_every: int, per_eval_s: float, t_step: float, total_steps: int,
-                        window_s: float | None) -> tuple[int, dict | None]:
-    """Dev-eval interval after the first eval. Flat rule: keep evaluation under ~6% of training time. Window-aware
-    rule (window_s given, i.e. FORGE_V2_EVAL_SLACK=1): when the planned phase leaves wall-clock slack, spend up to half
-    of it on denser evals; short full-weight runs (Qwen2-0.5B trdpo: 4 epochs in ~5 of 45 min) otherwise select from
-    ~3 dev points. Never denser than the planned interval, never sparser than the flat rule. Returns (interval, info)."""
+                        window_s: float | None, *, t_step_measured: float | None = None,
+                        reserve_s: float = 0.0) -> tuple[int, dict | None]:
+    """Dev-eval interval after the first eval. Flat rule: keep evaluation under ~6% of training time (``t_step``, as in
+    fa3e6ac). Window-aware rule (window_s given, i.e. the eval slack is on): when the planned phase leaves wall-clock
+    slack, spend up to half of it on denser evals; short full-weight runs (Qwen2-0.5B trdpo: 4 epochs in ~5 of 45 min)
+    otherwise select from ~3 dev points. Never denser than the planned interval, never sparser than the flat rule.
+    v10e: slack = window - total_steps x step time - reserve_s, with the step time MEASURED in this phase
+    (``t_step_measured``; the probe ``t_step`` only when nothing was measured) and ``reserve_s`` the tail reserve the
+    snapshot pool will need (it is taken out of the training window, so denser evals may not spend it). Returns
+    (interval, info)."""
     widened = int(math.ceil(per_eval_s / (0.06 * max(t_step, 1e-3))))
     info = None
     if window_s:
-        slack = window_s - total_steps * t_step
+        t_slack = float(t_step_measured) if t_step_measured and t_step_measured > 0 else float(t_step)
+        reserve = max(0.0, float(reserve_s or 0.0))
+        slack = window_s - total_steps * t_slack - reserve
         if slack > 0:
             slack_every = max(eval_every, int(math.ceil(total_steps * per_eval_s / (0.5 * slack))))
             if slack_every < widened:
-                info = {"flat_rule": widened, "slack_s": round(slack, 1), "per_eval_s": round(per_eval_s, 1)}
+                info = {"flat_rule": widened, "slack_s": round(slack, 1), "per_eval_s": round(per_eval_s, 1),
+                        "t_step_slack": round(t_slack, 4), "measured": bool(t_step_measured and t_step_measured > 0),
+                        "reserve_s": round(reserve, 1)}
                 widened = slack_every
     return widened, info
+
+
+def slack_overfit_guard(*, densified: bool, epochs_done: float, local_step: int, steps_per_epoch: int) -> bool:
+    """True = the overfit stop must wait (v10e). Only a phase whose interval the eval slack made denser than the flat
+    rule is guarded: there three bad evals in a row span fewer steps, and on the field route the stop is final (no
+    restart, no epoch-cap extension). Such a phase may stop on overfit only after SLACK_OVERFIT_MIN_EPOCHS epochs of
+    the run (earlier phases included). Every other phase keeps the fa3e6ac stop."""
+    if not densified:
+        return False
+    trained = float(epochs_done) + int(local_step) / max(1, int(steps_per_epoch))
+    return trained < SLACK_OVERFIT_MIN_EPOCHS
 
 
 # ---- deterministic eval cadence (candidate behind v9.4; FORGE_V2_STEP_CADENCE=0 restores the base commit) ------------------
@@ -2175,7 +2200,9 @@ def run(
     # min(LR_FACTOR_MAX 2.0, (B_new / B_old) ** LR_ALPHA 0.5) (phase-ba arm C; c1f7501 used 0.75). ----
     _lm_eligible = large_model_rule_eligible(field=field, recipe_key=recipe_key, cheap_full=cheap_full, g2c=_g2c,
                                              strategy=strategy, params_b=params_b)
-    if _lm_eligible and t_per_step and _lr_override > 0 and not field_calibration:
+    _lm_grew = False  # v10e: the rule grew THIS run's batch (the geometry selector refuses run S only then, or when bound)
+    # v10e: run S (geometry selector) never applies the rule: it would grow run S's ~32-row batch back to run A's
+    if _lm_eligible and t_per_step and _lr_override > 0 and not field_calibration and geometry_select is None:
         _lm_sorted = sorted(lengths)
         _lm_len = large_model_rule.champion_len(_lm_sorted[len(_lm_sorted) // 2],
                                                 _lm_sorted[min(len(_lm_sorted) - 1, int(0.99 * len(_lm_sorted)))])
@@ -2196,6 +2223,7 @@ def run(
                            geo.fp32_master, geo.optim)
             lr = prior_lr * _lm_f
             _lr_override = lr
+            _lm_grew = True
             _event_and_print("sft_v2_large_model_batch", params_b=round(params_b, 3), lr_old=prior_lr, lr_new=lr,
                              champ_len=_lm_len, **_lm_info)
         else:
@@ -2480,6 +2508,16 @@ def run(
             self.planned_every = eval_every
             self.ema_start = int(total_steps * (1.0 - _ema_frac)) if _ema_frac > 0 else None
             self.ema_n = 0
+            self.t0: float | None = None    # v10e: wall clock and eval + save seconds at the phase's first step
+            self.ov0 = 0.0
+            self.t_meas: float | None = None  # v10e: step time measured in this phase up to the first eval
+            self.densified = False          # v10e: the eval slack made this phase's interval denser than the flat rule
+            self.guard_logged = False
+
+        def on_train_begin(self, args, st, control, **kw):  # noqa: ANN001
+            self.t0 = time.monotonic()
+            self.ov0 = state["eval_secs"] + state["persist_secs"]
+            return control
 
         def _ema_update(self, m: Any, local_step: int) -> None:
             # Uniform (LAWA-style) running mean of the trainable weights over the
@@ -2511,6 +2549,10 @@ def run(
             due = local_step > 0 and (local_step % self.eval_every == 0 or local_step >= end_step)
             if not due or m is None or not dev_rows_for_selection:
                 return control
+            if not self.governed and self.t0 is not None and local_step > 0:
+                # v10e: seconds per optimizer step measured so far in this phase (evals and saves excluded)
+                _wall = time.monotonic() - self.t0 - (state["eval_secs"] + state["persist_secs"] - self.ov0)
+                self.t_meas = _wall / local_step if _wall > 0 else None
             t0 = time.perf_counter()
             loss = eval_dev(m)
             state["last_eval_step"] = step
@@ -2528,9 +2570,16 @@ def run(
                 # PLACEHOLDER (release-candidate-v9; NOT IMPLEMENTED): phase-bg exposure arm slot (2 of 2): arms C/D
                 # suppress this DEV overfit stop (FORGE_V2_NO_OVERFIT_STOP on 32984fb). Nothing here runs; see slot 1.
                 if overfit_patience_reached(state["overfit"], step - state.get("overfit_from", step), self.planned_every, _cad_on):
-                    _event_and_print("sft_v2_early_stop", step=step, best=state["best"], best_step=state["best_step"])
-                    state["stopped_overfit"] = True
-                    control.should_training_stop = True
+                    if slack_overfit_guard(densified=self.densified, epochs_done=state["epochs_done"],
+                                           local_step=local_step, steps_per_epoch=steps_per_epoch):
+                        if not self.guard_logged:  # v10e: a slack-densified phase trains its first epoch(s) out
+                            self.guard_logged = True
+                            _event_and_print("sft_v2_early_stop_deferred", step=step, best=state["best"],
+                                             best_step=state["best_step"], min_epochs=SLACK_OVERFIT_MIN_EPOCHS)
+                    else:
+                        _event_and_print("sft_v2_early_stop", step=step, best=state["best"], best_step=state["best_step"])
+                        state["stopped_overfit"] = True
+                        control.should_training_stop = True
             else:
                 state["overfit"] = 0
                 state["overfit_from"] = step
@@ -2578,9 +2627,25 @@ def run(
                 # keep evaluation (incl. persistence) under ~6% of training time
                 self.governed = True
                 per_eval = dt + 0.5 * (state["persist_secs"] / max(1, state["eval_count"]))
+                _slack_on = _eval_slack(_csq_field)
+                _slack_reserve = 0.0
+                if _slack_on and _tail_on:
+                    try:  # v10e: the tail reserve once the pool is full (it grows with the pool, denser evals fill it)
+                        _slack_reserve = float(tail_reserve_plan(
+                            export_reserve_s=export_reserve, finish_reserve_s=finish_reserve,
+                            eval_s=state["eval_secs"] / max(1, state["eval_count"]), pool_n=pool.k,
+                            trainable_params=_tail_trainable(m),
+                            dev_pass_s=_dev_pass_estimate(len(dev_ex), t_per_step, geo) if _tail_dev_pass_eligible() else 0.0,
+                            t_step=self.t_meas or t_step or 0.0, persist_max_s=state["persist_max"],
+                            window_s=self.window_s or 0.0)["extra_s"])
+                    except Exception as exc:
+                        _slack_reserve = TAIL_MAX_WINDOW_FRAC * max(0.0, float(self.window_s or 0.0))  # the reserve's cap
+                        _event_and_print("sft_v2_tail_reserve_failed", stage="slack", error=f"{type(exc).__name__}: {exc}"[:200])
                 widened, slack_info = governed_eval_every(self.eval_every, per_eval, t_step, self.total_steps,
-                                                          self.window_s if _eval_slack(_csq_field) else None)
+                                                          self.window_s if _slack_on else None,
+                                                          t_step_measured=self.t_meas, reserve_s=_slack_reserve)
                 if slack_info:
+                    self.densified = True
                     _event_and_print("sft_v2_eval_governor_slack", eval_every=widened, **slack_info)
                 if widened > self.eval_every:
                     _event_and_print("sft_v2_eval_governor", eval_every=widened, eval_s=round(dt, 1))
@@ -2960,7 +3025,8 @@ def run(
         result.update(
             completed=False, saved=False, chosen_loss=chosen_loss, chosen_step=chosen_step, dev_n=len(dev_ex),
             dev_fingerprint=_dev_fp, field=bool(field), strategy=strategy, cheap_full=bool(cheap_full),
-            gemma2_champion=bool(_g2c), large_model_rule=bool(_lm_eligible), field_hygiene=bool(field_hygiene),
+            gemma2_champion=bool(_g2c), large_model_rule=bool(_lm_eligible), large_model_grew=bool(_lm_grew),
+            field_hygiene=bool(field_hygiene),
             lr_search=bool(field_calibration or (field and _field_sweep())), oom_retries=int(oom_retries),
             window_bound=bool(not state["last_phase_complete"] and not state["stopped_overfit"]),
             rows_per_step=int(rows_per_step()), micro=geo.micro_batch, grad_accum=geo.grad_accum,
