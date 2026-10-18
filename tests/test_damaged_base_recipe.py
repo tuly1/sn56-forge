@@ -187,7 +187,7 @@ def _dispatch(monkeypatch, tmp_path, mt, params_b, vocab, verdict, env=None):
     monkeypatch.setattr(idr, "identify", lambda d, **kw: {"status": "unknown", "reason": "no_matching_table"})
     calls = []
 
-    def assess(model_dir, *, identity, detectors, model_name=None):
+    def assess(model_dir, *, identity, detectors):
         calls.append(tuple(detectors))
         return {"verdict": verdict, "by": ["fingerprint"] if verdict != "unknown" else [], "detectors": {}, "seconds": 0}
 
@@ -357,7 +357,11 @@ def test_shipped_table_is_plain_json():
     assert max(b for b in raw) < 128 and max(len(line) for line in raw.split(b"\n")) < 4096
     damage._TABLE_CACHE.clear()
     t = damage.load_table()
-    assert t is not None and len(t["models"]) == 109  # 73 (2026-09-23) + 36 small public bases (2026-09-27 addendum)
+    # 73 (2026-09-23) + 36 small public bases (2026-09-27 addendum) - 7 past tournament-winner repos (2026-10-18)
+    assert t is not None and len(t["models"]) == 102
+    assert not [k for k in t["models"] if k.startswith("gradients-io-tournaments/tournament-tourn_")]
+    assert not [k for k in t.get("not_fingerprinted", {}) if k.startswith("gradients-io-tournaments/tournament-tourn_")]
+    assert b"name_hash" not in raw
 
 
 def test_lfm2_small_recipe_matches_the_phase_h_fp32_arm(monkeypatch):

@@ -38,7 +38,7 @@ t94 = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(t94)
 GOLDEN = HERE / "data/v10c/golden_2d6eaec.json"
 BASE_COMMIT = "2d6eaecbb7d644a222fc1c928b1afef0de2ffed7"
-ROUTE_SHA_2D6EAEC = "28da141c3a731d13410bc876457e0b7fdc4d656368e77a58c2d5d372c947f9f0"   # this harness on an extracted archive of 2d6eaec (4,068 cells, 1,540 armed); not the served route digest
+ROUTE_SHA_2D6EAEC = "a01da13c67ac19ca3326013e1accc7dfc8c1d89aca37a8881facc40c37764720"   # this harness on an extracted archive of 2d6eaec (4,068 cells, 1,540 armed; 3,816 after v10f dropped 7 past-winner models); not the served route digest
 RECEIPTS = ["bj_nx15_880b38e9_s7", "bv_minicpm5_2b_s7", "bt_q25_05bi_indic_s7", "cb_lfm25_350m_s7", "by_m2bb_01fdf13f_public_s7",
             "bk_lfm12_turkish_s7"]
 t94.RECEIPT["t7"] = json.loads((HERE / "data/cadence/receipt_cf_t_01fdf13f_s7.json").read_text())
@@ -199,7 +199,7 @@ def test_route_snapshot_is_2d6eaecs_under_every_switch(monkeypatch, tail, cad):
     for k, v in (("FORGE_V2_TAIL_RESERVE", tail), ("FORGE_V2_STEP_CADENCE", cad)):
         monkeypatch.delenv(k, raising=False) if v is None else monkeypatch.setenv(k, v)
     snap = rs.build_snapshot()
-    assert len(snap) == 4068 and rs.route_sha(snap) == ROUTE_SHA_2D6EAEC
+    assert len(snap) == 3816 and rs.route_sha(snap) == ROUTE_SHA_2D6EAEC
 
 
 def _write_golden():

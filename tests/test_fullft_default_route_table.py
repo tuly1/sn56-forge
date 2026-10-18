@@ -9,8 +9,8 @@ detection gating, field-route flags and strategy resolution are the deployed cod
 FAILS if any in-scope task (single GPU, non-KL InstructTextTask, params_b <= 4.25) lands on an adapter without a listed
 exception, or if an out-of-scope task's route differs from cab930c (FORGE_V2_FULLFT_DEFAULT=0).
 
-Pool = every model of the shipped fingerprint table (forge/routing/data/base_fingerprints.json, 109 validator-pool
-bases incl. the 2026-09-27 addendum) + the CURRENT-CAMPAIGN pool members missing from it (NuExtract-v1.5 / phi3,
+Pool = every model of the shipped fingerprint table (forge/routing/data/base_fingerprints.json, 102 validator-pool
+bases incl. the 2026-09-27 addendum; the 7 out-of-scope 8 B past-winner repos were removed 2026-10-18) + the CURRENT-CAMPAIGN pool members missing from it (NuExtract-v1.5 / phi3,
 Qwen1.5-0.5B-Chat, pythia-410m) + the loaded sizes of Qwen3.5 (text-only load 4.2058 B, receipt
 research/20260925-release-lfm-q35drift/CPU-PRECHECK.json).
 """
@@ -232,7 +232,7 @@ def test_pool_covers_the_named_families():
                  "Qwen/Qwen2.5-3B-Instruct", "Qwen/Qwen3-4B", "tiiuae/falcon-rw-1b", "unsloth/Phi-3-mini-4k-instruct",
                  "unsloth/codegemma-2b", "microsoft/phi-1_5", "bigscience/bloomz-560m", "EleutherAI/pythia-410m"):
         assert must in names, must
-    assert len(IN_SCOPE) >= 70 and len(POOL) >= 110
+    assert len(IN_SCOPE) >= 70 and len(POOL) >= 106  # 2026-10-18: -7 past-winner 8 B repos (all out of scope)
 
 
 @pytest.mark.parametrize("entry", IN_SCOPE, ids=[e["model"] for e in IN_SCOPE])

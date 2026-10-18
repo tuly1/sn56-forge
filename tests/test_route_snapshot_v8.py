@@ -32,7 +32,7 @@ from forge.tasks import sft_v2  # noqa: E402
 
 BASELINE = Path(__file__).resolve().parent / "data" / "route_snapshot_7024722.json"
 # canonical sha256 of the baseline (json.dumps(sort_keys=True, separators=(",", ":")) of the parsed file)
-ROUTE_SHA_7024722 = "ebdc33e82e7d6e2d6e510a8b625fa1186fa63a49037bbf6f01fb2b4bf3f6a4b6"
+ROUTE_SHA_7024722 = "81a206d7841b1440d1ce66c015feabf15a22c9ee7b38e85994ffc70a467abba0"  # v10f 2026-10-18: the earlier pin minus the 7 removed past-winner models' cells (research/20261018-f2f3-decision)
 VERDICTS = ("clean", "damaged", "unknown")
 SWITCHES = (None, "0")  # production default; FORGE_V2_FULLFT_DEFAULT=0 (cab930c research switch)
 KW_KEYS = ("params_b", "per_gpu_gb", "strategy_override", "route_lr", "field_route", "damaged_base_route",

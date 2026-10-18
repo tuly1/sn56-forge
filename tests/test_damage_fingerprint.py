@@ -103,7 +103,7 @@ def _table(entries: dict[str, Path], path: Path) -> Path:
     models = {}
     for name, d in entries.items():
         fp = damage.local_fingerprint(str(d))
-        models[name] = {"revision": "0" * 40, "name_hash": damage.name_hash(name), "tensors": fp["tensors"],
+        models[name] = {"revision": "0" * 40, "tensors": fp["tensors"],
                         "one_d": fp["one_d"], "config": {}, "files": ["model.safetensors"], "params": 1, "roles": []}
     t = {"schema": damage.FINGERPRINT_SCHEMA, "version": damage.FINGERPRINT_VERSION, "built_utc": "test",
          "models": models, "not_fingerprinted": {}}
@@ -133,10 +133,10 @@ def _save(world, name, tensors):
 # ---------------------------------------------------------------------------------------------------------------------
 # synthetic tests
 # ---------------------------------------------------------------------------------------------------------------------
-def test_clean_copy_reads_clean_with_and_without_name(world):
-    for name in (None, "org/Pub-1B", damage.name_hash("org/Pub-1B"), "0123456789abcdef"):
-        rep = damage.fingerprint(str(world["pub"]), None, model_name=name)
-        assert rep["verdict"] == "clean" and rep["reason"] == "prefix_identical" and rep["source"] == "org/Pub-1B", name
+def test_clean_copy_reads_clean_from_norms_alone(world):
+    rep = damage.fingerprint(str(world["pub"]), None)
+    assert rep["verdict"] == "clean" and rep["reason"] == "prefix_identical" and rep["source"] == "org/Pub-1B"
+    assert rep["identified_by"] == "norms"
 
 
 @pytest.mark.parametrize("aug,intensity", [("weight_scaling", 0.62), ("weight_scaling", 1.37), ("magnitude_pruning", 0.3),
@@ -144,7 +144,7 @@ def test_clean_copy_reads_clean_with_and_without_name(world):
 @pytest.mark.parametrize("seed", [3, 11])
 def test_validator_augmentation_reads_damaged(world, aug, intensity, seed):
     d = _save(world, f"aug-{aug}-{intensity}-{seed}", _augment(world["tensors"], aug, intensity, seed))
-    rep = damage.fingerprint(d, None, model_name="a1b2c3d4e5f60718")  # anonymous, salted-style argument: no name hit
+    rep = damage.fingerprint(d, None)
     assert rep["verdict"] == "damaged", rep
     assert rep["reason"] == "prefix_mismatch" and rep["source"] == "org/Pub-1B" and rep["identified_by"] == "norms"
     assert rep["compare"]["differ"] >= 1 and rep["compare"]["differ_protected"] == 0
@@ -206,7 +206,7 @@ def test_structurally_different_damaged_copy_is_unknown(world, case):
         dt, x = t["model.layers.1.mlp.down_proj.weight"]
         t["model.layers.1.mlp.down_proj.weight"] = (dt, x.reshape(256, 128))
     d = _save(world, f"struct-{case}", t)
-    rep = damage.fingerprint(d, None, model_name="a1b2c3d4e5f60718")
+    rep = damage.fingerprint(d, None)
     assert rep["source"] == "org/Pub-1B" and rep["identified_by"] == "norms"  # norms still name the public source
     assert rep["verdict"] == "unknown" and rep["reason"] == "structure_differs", rep
     assert "reference_free" not in rep  # an identified source is final: pruning statistics cannot override it
@@ -376,13 +376,16 @@ def test_exact_identity_is_authoritative_for_its_reference(world, case, expected
     assert damage.assess(d, identity=_exact(world, d), detectors=("fingerprint", "identity"))["verdict"] == expected[0]
 
 
-def test_name_with_different_norms_is_not_trusted(world):
-    rep = damage.fingerprint(str(world["tmp"] / "other"), None, model_name="org/Pub-1B")
-    # the argument names Pub but the norms are Other's: identification by norms wins
-    assert rep["verdict"] == "clean" and rep["source"] == "org/Other-1B"
-    d = _save(world, "stranger", _model(99))
-    rep = damage.fingerprint(d, None, model_name="org/Pub-1B")
-    assert rep["verdict"] == "unknown" and rep["identified_by"] == "name_norms_differ"
+def test_identification_never_reads_the_model_argument(world):
+    import inspect
+    # no model-name parameter anywhere on the detection path, and no name lookup in the shipped table
+    for fn in (damage.identify_source, damage.fingerprint_assess, damage.fingerprint, damage.assess):
+        assert "model_name" not in inspect.signature(fn).parameters, fn
+    assert not hasattr(damage, "name_hash")
+    rep = damage.fingerprint(str(world["tmp"] / "other"), None)
+    assert rep["verdict"] == "clean" and rep["source"] == "org/Other-1B" and rep["identified_by"] == "norms"
+    rep = damage.fingerprint(_save(world, "stranger", _model(99)), None)
+    assert rep["verdict"] == "unknown" and rep["identified_by"] == "none"
 
 
 def test_reference_free_fallback_when_source_not_in_table(world):
@@ -403,12 +406,12 @@ def test_no_table_and_no_files(world, monkeypatch, tmp_path):
     assert damage.fingerprint(str(tmp_path / "nothing"), None)["verdict"] == "unknown"
 
 
-def test_assess_passes_model_name_and_reads_prefixes_only(world):
+def test_assess_identifies_by_norms_and_reads_prefixes_only(world):
     t = _augment(world["tensors"], "weight_scaling", 0.8, 1)
     d = _save(world, "via-assess", t)
-    rep = damage.assess(d, identity=None, detectors=("identity", "fingerprint"), model_name="org/Pub-1B")
+    rep = damage.assess(d, identity=None, detectors=("identity", "fingerprint"))
     assert rep["verdict"] == "damaged" and rep["by"] == ["fingerprint"]
-    assert rep["detectors"]["fingerprint"]["identified_by"] == "name+norms"
+    assert rep["detectors"]["fingerprint"]["identified_by"] == "norms"
     rep = damage.assess(str(world["pub"]), identity=None, detectors=("fingerprint",))
     assert rep["verdict"] == "clean"
 
@@ -432,7 +435,7 @@ def test_shipped_table_schema():
     assert t["prefix_bytes"] == damage.PREFIX_BYTES and t["built_utc"]
     assert len(t["models"]) >= 40
     for mid, m in t["models"].items():
-        assert len(m["revision"]) == 40 and m["name_hash"] == damage.name_hash(mid)
+        assert len(m["revision"]) == 40 and "name_hash" not in m
         assert m["tensors"] and all(len(v) == 3 for v in m["tensors"].values())
     # the 27 public sources of the damaged-base validation set are all covered
     for mid in ("Qwen/Qwen2.5-3B-Instruct", "LiquidAI/LFM2.5-1.2B-Instruct", "unsloth/Llama-3.2-1B-Instruct",
@@ -449,11 +452,9 @@ _real = pytest.mark.skipif(not (QWEN05 / "model.safetensors").exists(), reason="
 
 @_real
 def test_real_qwen2_0p5b_clean_against_shipped_table():
-    rep = damage.fingerprint(str(QWEN05), None, model_name=damage.name_hash("unsloth/Qwen2-0.5B"))
+    rep = damage.fingerprint(str(QWEN05), None)  # norms alone identify it
     assert rep["verdict"] == "clean" and rep["source"] in ("unsloth/Qwen2-0.5B", "Qwen/Qwen2-0.5B"), rep
     assert rep["bytes_read"] < 8 << 20
-    rep = damage.fingerprint(str(QWEN05), None)  # anonymous argument: norms alone identify it
-    assert rep["verdict"] == "clean"
 
 
 def _damaging_reader(path: Path, target: str, aug: str, intensity: float):
@@ -515,7 +516,7 @@ def test_addendum_entries_are_pinned():
         assert t["models"][mid]["revision"] == rev, mid
     for mid in add:
         m = t["models"][mid]
-        assert len(m["revision"]) == 40 and m["name_hash"] == damage.name_hash(mid) and m["format"] == "safetensors"
+        assert len(m["revision"]) == 40 and "name_hash" not in m and m["format"] == "safetensors"
     # the validator re-save (save_pretrained) drops a tied lm_head.weight: the two post-trained Qwen3 repos store one,
     # so their entries hold the re-saved tensor set (a damaged copy is always a re-save)
     dropped = {mid: t["models"][mid].get("resave_dropped") for mid in add if t["models"][mid].get("resave_dropped")}
@@ -537,9 +538,8 @@ def test_addendum_owner_entries_clean_and_damaged(mid, monkeypatch):
     damage._TABLE_CACHE.clear()
     t = damage.load_table()
     m = t["models"][mid]
-    for name in (None, damage.name_hash(mid)):
-        rep = damage.fingerprint_assess([], None, model_name=name, table=t, fp=_entry_fp(m))
-        assert rep["verdict"] == "clean" and rep["source"] in _twins(t, mid), (name, rep)
+    rep = damage.fingerprint_assess([], None, table=t, fp=_entry_fp(m))
+    assert rep["verdict"] == "clean" and rep["source"] in _twins(t, mid), rep
     # damage one per-layer matrix (validator targets: "weight", not norm / embed) -> damaged, same source
     target = sorted(k for k, v in m["tensors"].items() if len(v[1]) == 2 and ".layers.1." in k and "weight" in k
                     and not damage.is_protected(k))[0]

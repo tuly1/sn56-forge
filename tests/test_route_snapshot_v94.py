@@ -18,7 +18,7 @@ import test_route_snapshot_v9 as rs  # noqa: E402
 
 from forge.tasks import sft_v2  # noqa: E402
 
-ROUTE_SHA_9504136 = "d1d88718b43f93a03c09f0759cff974bbd17ceaef1d712f533c7ee715bec151e"  # = d44a582 (tests/test_v91_dev_pass_soup_restore.py)
+ROUTE_SHA_9504136 = "d7d71afd23fee7fa8c40b2f71dc1d001f3ad7d024c773051f01aaf455f406c4e"  # = d44a582 (tests/test_v91_dev_pass_soup_restore.py)
 
 
 @pytest.mark.parametrize("switch", [None, "1", "0"])
@@ -28,7 +28,7 @@ def test_route_snapshot_is_9504136s(monkeypatch, switch):
     else:
         monkeypatch.setenv("FORGE_V2_TAIL_RESERVE", switch)
     snap = rs.build_snapshot()
-    assert len(snap) == 4068 and rs.route_sha(snap) == ROUTE_SHA_9504136
+    assert len(snap) == 3816 and rs.route_sha(snap) == ROUTE_SHA_9504136
     assert sft_v2.tail_reserve_enabled() is (switch != "0")
 
 

@@ -38,7 +38,7 @@ from forge import model as forge_model  # noqa: E402
 from forge.tasks import sft_v2  # noqa: E402
 
 BASELINE = Path(__file__).resolve().parent / "data" / "route_snapshot_854bf7a.json"
-ROUTE_SHA_854BF7A = "06067b89ee444bb8894efd37ec567512507cd4b2f9672a98c4d3bd927111f58e"  # canonical sha256 of the baseline
+ROUTE_SHA_854BF7A = "060730bddcb759db55b01d020499bb8bf1c1901abe71e8faaa74fa0aaa1a8395"  # canonical sha256 of the baseline; v10f 2026-10-18: the earlier pin minus the 7 removed past-winner models' cells (research/20261018-f2f3-decision)
 RULE_KEYS = ("large_model_batch", "planner_fixes", "hub_kernels_guard")
 
 

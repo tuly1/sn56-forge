@@ -119,7 +119,7 @@ def test_handler_source_restores_dp_pre_not_pool_best():
 
 
 # ---- route snapshot: v9.1 changes no route (failure path only) -------------------------------------------------------
-ROUTE_SHA_D44A582 = "d1d88718b43f93a03c09f0759cff974bbd17ceaef1d712f533c7ee715bec151e"  # ROUTE-SNAPSHOT-DELTA head_route_sha
+ROUTE_SHA_D44A582 = "d7d71afd23fee7fa8c40b2f71dc1d001f3ad7d024c773051f01aaf455f406c4e"  # ROUTE-SNAPSHOT-DELTA head_route_sha; v10f 2026-10-18: the earlier pin minus the 7 removed past-winner models' cells (research/20261018-f2f3-decision)
 
 
 def test_route_snapshot_is_d44a582s():
@@ -129,4 +129,4 @@ def test_route_snapshot_is_d44a582s():
     import test_route_snapshot_v9 as rs
 
     snap = rs.build_snapshot()
-    assert len(snap) == 4068 and rs.route_sha(snap) == ROUTE_SHA_D44A582
+    assert len(snap) == 3816 and rs.route_sha(snap) == ROUTE_SHA_D44A582

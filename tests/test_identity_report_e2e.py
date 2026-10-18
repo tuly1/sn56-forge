@@ -60,7 +60,7 @@ def e2e(tmp_path, monkeypatch):
     def run(name, tensors=None, path=None):
         d = path or _write(tmp_path / name, tensors)
         rep = idr.identify(d)
-        return rep, damage.assess(d, identity=rep, detectors=DETECTORS, model_name="0123456789abcdef")
+        return rep, damage.assess(d, identity=rep, detectors=DETECTORS)
 
     return {"pub": pub, "pub_t": pub_t, "deriv": deriv, "run": run}
 

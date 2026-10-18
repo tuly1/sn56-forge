@@ -492,7 +492,7 @@ def damaged_minicpm5_admits(model_type: str | None, base_damage: str | None, par
 # image 7024722, arm lrh = FORGE_V2_FIELD_LR_MULT=0.5) with phase-ay (evidence/SUPPLEMENT-DEV-VERDICTS.json): clean
 # dsum s7 -3.02 %, dsum s11 -1.94 %, wealth -1.97 % DEV, all PASS; damaged dsum +6.14 %, wealth +3.76 % DEV, both REJECT
 # (so the rule is conditional, not general). Detector on MiniCPM5 (7024722 code, CPU): public openbmb/MiniCPM5-1B ->
-# clean (prefix_identity, fingerprint name+norms); 5/5 validator-style augmented copies (scaling multi-layer 0.7,
+# clean (prefix_identity; the fingerprint norms single-match it, no name needed); 5/5 validator-style augmented copies (scaling multi-layer 0.7,
 # pruning all-layer 0.3, noise all-layer 0.05, layer re-init multi-layer 0.05, noise single-layer 0.02) and the phase-y
 # custody damaged base -> damaged (prefix_mismatch) (research/20260927-new-pool-compat/minicpm5-1b/results/
 # damage-probe.json; phase-ay/base/DAMAGE-DETECTOR-CHECK.json). There is no exact per-tensor identity table for

@@ -35,7 +35,7 @@ except ImportError:  # forge = 9504136 (baseline generation)
     gs = None
 
 BASELINE = Path(__file__).resolve().parent / "data" / "route_snapshot_9504136_v10b.json"
-ROUTE_SHA_BASELINE = "6abe499456d8021b4793439b4dd53d2cbf6613bff670ed7716f438a6f1c7b599"  # canonical sha256 of the baseline (9504136 cells + geometry_select False)
+ROUTE_SHA_BASELINE = "cd076fdc1b459915787f23106f91e2720f51b460c6423ec6faefab9d81106100"  # canonical sha256 of the baseline (9504136 cells + geometry_select False)
 RULE = "geometry_select"
 canonical, route_sha = v9.canonical, v9.route_sha
 
@@ -85,7 +85,7 @@ def snapshots():
 
 def test_baseline_is_the_recorded_9504136_snapshot_with_the_rule_off_everywhere():
     base = load_baseline()
-    assert route_sha(base) == ROUTE_SHA_BASELINE and len(base) == 4068
+    assert route_sha(base) == ROUTE_SHA_BASELINE and len(base) == 3816
     assert all(c["rules"][RULE] is False for c in base.values())
 
 

@@ -160,15 +160,14 @@ def test_real_detector_prefix_rule_on_a_minicpm5_table_entry(tmp_path):
     ref_dir.mkdir()
     _write_st(ref_dir / "model.safetensors", base)
     fp = damage.local_fingerprint(str(ref_dir))
-    table = {"models": {REF: {"tensors": fp["tensors"], "one_d": fp["one_d"]}},
-             "_by_hash": {damage.name_hash(REF): REF}}
+    table = {"models": {REF: {"tensors": fp["tensors"], "one_d": fp["one_d"]}}}
 
     def assess(tensors):
         d = tmp_path / f"t{len(list(tmp_path.iterdir()))}"
         d.mkdir()
         _write_st(d / "model.safetensors", tensors)
         files = damage._local_files(str(d))
-        rep = damage.fingerprint_assess(files, damage._read_local, model_name=None, table=table, fallback=False)
+        rep = damage.fingerprint_assess(files, damage._read_local, table=table, fallback=False)
         verdict, _ = damage.combine({"fingerprint": rep})
         full = {"verdict": verdict, "detectors": {"fingerprint": rep}}
         return verdict, sft_v2.clean_base_reference(full)

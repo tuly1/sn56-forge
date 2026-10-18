@@ -21,7 +21,7 @@ research/20260922-damage-detector/):
                  fraction of exact zeros (validator pruning zeroes 25-50%; trained bf16 weights carry almost none).
                  Opt-in: it detects pruning only.
   fingerprint    (default ON since 2026-09-22) the research/20260922-damage-detector rule against the shipped offline
-                 table data/base_fingerprints.json (73 pool models): source by norm hashes (+ model argument), first
+                 table data/base_fingerprints.json (public pool models): source by norm hashes only, first
                  16 KiB of every tensor compared; local pruning / bf16-scaling fallback when the source is not tabled.
                  Reads ~2-5 MB locally, < 0.1 s. See the section below and research/20260922-prod-patch/FINGERPRINT-TABLE.md.
 """
@@ -144,13 +144,13 @@ def zero_fraction(model_dir: str, identity: dict[str, Any] | None = None, *, sam
 # ---------------------------------------------------------------------------------------------------------------------
 # data/base_fingerprints.json holds, for every public model seen in the tournament pool (<= 35 B; the validator
 # never augments larger ones), per-tensor {dtype, shape, sha256 of the first 16 KiB of stored bytes}, the full sha256
-# of every 1-D tensor (norms / biases: the source-identification key) and sha256(model_id)[:16]. Built by
+# of every 1-D tensor (norms / biases: the source-identification key). Built by
 # research/20260922-prod-patch/fingerprints/build_fingerprints.py with HTTP range reads; no network at task time.
 #
-# Rule (offline on 29 validator-damaged / 27 clean public bases, anonymous and name-hash arguments: 28/29 damaged +
-# 1 "unknown" - open_llama-3b-v2, whose re-save drops 26 rotary inv_freq buffers (structure differs) - and 54/54 clean):
-#   1. candidate source: the model argument (literal id or its unsalted name hash) and/or every validator-protected
-#      1-D tensor (name contains "norm"; the validator never touches norms) byte-identical to one table entry.
+# Rule (offline on 29 validator-damaged / 27 clean public bases: 28/29 damaged + 1 "unknown" - open_llama-3b-v2, whose
+# re-save drops 26 rotary inv_freq buffers (structure differs) - and 27/27 clean):
+#   1. candidate source: every table entry whose validator-protected 1-D tensors (name contains "norm"; the validator
+#      never touches norms) are all byte-identical to the delivered ones. The task's model argument is not used.
 #   2. compare the first 16 KiB of every tensor with that entry. The tensor set, dtypes and shapes must match exactly
 #      (missing / extra tensors, dtype re-save or shape change -> "unknown"); then every tensor identical -> "clean"
 #      (prefix-identical); a norm / embedding differs -> "unknown"; otherwise >= 1 other tensor differs -> "damaged".
@@ -158,8 +158,7 @@ def zero_fraction(model_dir: str, identity: dict[str, Any] | None = None, *, sam
 #   3. source not in the table: local reference-free checks on the first 32 KiB of each per-layer matrix:
 #      magnitude pruning (>= 2 matrices with >= 10% exact zeros) or bf16 weight scaling (>= 3 matrices with >= 2%
 #      empty mantissa codes, unless >= 75% of the tested matrices are gapped) -> "damaged".
-#   4. anything else -> "unknown" (the caller keeps its route). A name-hash miss alone is never evidence
-#      (MODEL_HASH_SALT would turn every task into a miss).
+#   4. anything else -> "unknown" (the caller keeps its route).
 # Shipped as plain, line-per-tensor JSON (readable source; no compressed blob in the submitted tree). load_table also
 # reads a gzip copy (.gz suffix) for research builds.
 FINGERPRINT_TABLE = Path(__file__).resolve().parent / "data" / "base_fingerprints.json"
@@ -167,17 +166,12 @@ FINGERPRINT_SCHEMA = "sn56.base_fingerprints"
 FINGERPRINT_VERSION = 1
 PREFIX_BYTES = 16384          # bytes hashed per tensor (first 16 KiB of the stored data range)
 PREFIX_HEX = 32               # hex digits kept of each prefix / 1-D sha256
-NAME_HASH_LEN = 16            # the validator's anonymous model argument: sha256(model_id)[:16] (MODEL_HASH_SALT empty)
 ONE_D_MAX_BYTES = 1 << 20     # 1-D tensors up to this size are hashed in full
 MIN_ID_NORMS = 2              # protected 1-D tensors that must match to name a source
 R_BYTES = 32768               # reference-free fallback: bytes read per per-layer matrix
 R_ZF, R_ZF_N = 0.10, 2        # pruning: exact-zero fraction, matrices
 R_GAP, R_GAP_N = 0.02, 3      # scaling: empty mantissa-code fraction, matrices
 _LAYER_RE = re.compile(r"\.(\d+)\.")
-
-
-def name_hash(model_id: str) -> str:
-    return hashlib.sha256(str(model_id).encode()).hexdigest()[:NAME_HASH_LEN]
 
 
 def is_norm(name: str) -> bool:
@@ -267,7 +261,6 @@ def load_table(path: str | os.PathLike | None = None) -> dict[str, Any] | None:
                 t = json.load(fh)
             if t.get("schema") != FINGERPRINT_SCHEMA or int(t.get("version", 0)) != FINGERPRINT_VERSION:
                 return None
-            t["_by_hash"] = {m["name_hash"]: k for k, m in t["models"].items()}
             _TABLE_CACHE[p] = t
         except Exception:  # noqa: BLE001 - no table is "unknown", never an error
             return None
@@ -280,25 +273,13 @@ def _norm_match(local: dict[str, str], ref: dict[str, str]) -> tuple[int, int]:
     return sum(local[k] == ref[k] for k in keys), len(keys)
 
 
-def identify_source(fp: dict[str, Any], table: dict[str, Any], model_name: str | None = None) -> dict[str, Any]:
-    """Candidate public source for a local fingerprint: norms first, the model argument as a tie-break / fallback."""
-    models = table["models"]
-    named = None
-    if model_name:
-        named = model_name if model_name in models else table["_by_hash"].get(str(model_name).strip().lower())
+def identify_source(fp: dict[str, Any], table: dict[str, Any]) -> dict[str, Any]:
+    """Candidate public sources for a local fingerprint, from the delivered norm tensors alone (no model name)."""
     hits = []
-    for key, m in models.items():
+    for key, m in table["models"].items():
         ok, n = _norm_match(fp["one_d"], m["one_d"])
         if n >= MIN_ID_NORMS and ok == n:
             hits.append(key)
-    if named and named in hits:
-        return {"source": named, "by": "name+norms", "norm_hits": hits}
-    if named:
-        ok, n = _norm_match(fp["one_d"], models[named]["one_d"])
-        if n == 0 and not hits:
-            return {"source": named, "by": "name_only", "norm_hits": hits}
-        if not hits:
-            return {"source": None, "by": "name_norms_differ", "named": named, "norm_hits": hits}
     if hits:
         return {"source": None, "by": "norms", "norm_hits": hits}  # resolved by compare(): best prefix agreement
     return {"source": None, "by": "none", "norm_hits": []}
@@ -409,7 +390,7 @@ def reference_free(files: Sequence[Any], read: Callable[[Any, int, int], bytes],
     return {"verdict": UNKNOWN, "reason": "no_reference_free_signature", **out}
 
 
-def fingerprint_assess(files: Sequence[Any], read: Callable[[Any, int, int], bytes], *, model_name: str | None = None,
+def fingerprint_assess(files: Sequence[Any], read: Callable[[Any, int, int], bytes], *,
                        table: dict[str, Any] | None = None, fallback: bool = True,
                        fp: dict[str, Any] | None = None) -> dict[str, Any]:
     """The full rule over an abstract reader (local files at task start; HTTP range reads in offline validation).
@@ -419,7 +400,7 @@ def fingerprint_assess(files: Sequence[Any], read: Callable[[Any, int, int], byt
     out: dict[str, Any] = {"bytes_read": fp["bytes_read"], "n_tensors": len(fp["tensors"])}
     table_reason = "no_table"
     if table is not None:
-        src = identify_source(fp, table, model_name)
+        src = identify_source(fp, table)
         out.update(identified_by=src["by"], norm_hits=src["norm_hits"][:5])
         cands = [src["source"]] if src["source"] else list(src["norm_hits"])
         best = None
@@ -447,18 +428,17 @@ def fingerprint_assess(files: Sequence[Any], read: Callable[[Any, int, int], byt
             "reference_free": {k: v for k, v in r.items() if k not in ("verdict", "reason")}, **out}
 
 
-def fingerprint(model_dir: str, identity: dict[str, Any] | None = None, model_name: str | None = None) -> dict[str, Any]:
+def fingerprint(model_dir: str, identity: dict[str, Any] | None = None) -> dict[str, Any]:
     """Detector entry: table rule on the local safetensors (first 16 KiB per tensor + 1-D tensors; fallback 32 KiB per
     per-layer matrix). ``identity`` is unused (kept for the detector signature)."""
     files = _local_files(model_dir)
     if not files:
         return {"verdict": UNKNOWN, "reason": "no_safetensors"}
-    return fingerprint_assess(files, _read_local, model_name=model_name)
+    return fingerprint_assess(files, _read_local)
 
 
 DETECTORS: dict[str, Callable[..., dict[str, Any]]] = {"identity": identity_signature, "zero_fraction": zero_fraction,
                                                        "fingerprint": fingerprint}
-_NAME_AWARE = {"fingerprint"}
 EXACT_DETECTORS = frozenset({"identity"})  # verdicts from full-tensor byte hashes (strongest evidence)
 
 
@@ -467,8 +447,7 @@ def register(name: str, fn: Callable[..., dict[str, Any]]) -> None:
     DETECTORS[name] = fn
 
 
-def assess(model_dir: str, *, identity: dict[str, Any] | None, detectors: Sequence[str],
-           model_name: str | None = None) -> dict[str, Any]:
+def assess(model_dir: str, *, identity: dict[str, Any] | None, detectors: Sequence[str]) -> dict[str, Any]:
     """Combine the named detectors. Never raises; unknown detector names and detector errors read "unknown"."""
     t0 = time.monotonic()
     results: dict[str, dict[str, Any]] = {}
@@ -478,8 +457,7 @@ def assess(model_dir: str, *, identity: dict[str, Any] | None, detectors: Sequen
             results[name] = {"verdict": UNKNOWN, "reason": "no_such_detector"}
             continue
         try:
-            rep = (fn(str(model_dir), identity, model_name=model_name) if name in _NAME_AWARE
-                   else fn(str(model_dir), identity))
+            rep = fn(str(model_dir), identity)
             results[name] = rep if isinstance(rep, dict) else {"verdict": UNKNOWN, "reason": "bad_result"}
         except Exception as exc:  # noqa: BLE001 - detection is advisory; the caller keeps its route
             results[name] = {"verdict": UNKNOWN, "reason": f"{type(exc).__name__}: {exc}"}
