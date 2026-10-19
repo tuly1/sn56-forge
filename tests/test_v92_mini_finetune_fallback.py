@@ -4,7 +4,7 @@ Every test drives the real CLI (forge.cli.main) on CPU with a tiny random Llama 
 failure at one stage. The contract asserted everywhere:
 
   * exit 0  => the output path holds a TRAINED artifact (optimizer steps >= 1, changed adapter weights, a model that
-               differs from the base and passes the validator's vendored model_is_a_finetune);
+               differs from the base, confirmed by the vendored G.O.D model_is_a_finetune);
   * exit 1  => nothing at the output path.
 
 No path may leave an untrained artifact, and no untrained artifact may exist at the output path at any time.

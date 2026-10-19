@@ -1,12 +1,17 @@
-"""Make a full-weight export pass the validator's ``model_is_a_finetune`` check (release defect D1, 2026-09-29).
+"""Keep a full-weight export loadable as the base architecture (release defect D1, 2026-09-29).
 
-The validator (G.O.D a2b14db ``validator/evaluation/evaluators/instruct_text.py:446-455``) loads a non-LoRA submission
-with ``AutoModelForCausalLM.from_pretrained(repo, trust_remote_code=False)`` and compares the LOADED model's in-memory
-config against ``AutoConfig.from_pretrained(original_repo)`` (``validator/evaluation/model_checks.py``):
-``architectures`` (list equality) and every attribute of ``VALIDATOR_ATTRS`` the base config defines must be equal, and
-``max_position_embeddings`` must not shrink. Any mismatch -> ``is_finetune=False`` -> SCORE_PENALTY.
+Transformers' ``AutoModelForCausalLM`` swaps a composite (vision-language) base's text sub-config in on load, so a saved
+config can report a different ``model_type``/``architectures`` than the base even for untouched weights; this module
+writes the base's composite config back around the trained text config and verifies that the saved export loads with
+the base's architecture fields.
 
-Composite (vision-language) bases break this for every full-weight submission, not only ours. Qwen3.5 ships
+Loader behaviour referenced (G.O.D a2b14db ``validator/evaluation/evaluators/instruct_text.py:446-455`` and
+``validator/evaluation/model_checks.py``): a full-weight model is loaded with
+``AutoModelForCausalLM.from_pretrained(repo, trust_remote_code=False)`` and its in-memory config is read next to
+``AutoConfig.from_pretrained(original_repo)``. The fields compared here: ``architectures`` (list equality), every
+attribute of ``VALIDATOR_ATTRS`` the base config defines, and ``max_position_embeddings`` (must not shrink).
+
+Composite (vision-language) bases show this for every full-weight export, not only ours. Qwen3.5 ships
 ``model_type qwen3_5`` / ``Qwen3_5ForConditionalGeneration`` with the LM in ``text_config``. ``AutoModelForCausalLM``
 maps ``qwen3_5`` to ``Qwen3_5ForCausalLM`` and swaps in the text sub-config (transformers 5.12.1
 ``models/auto/auto_factory.py:396-400``), so the loaded model reports ``model_type qwen3_5_text`` and
@@ -16,15 +21,15 @@ alone (the pre-D1 ``_restore_base_architectures``) still fails on ``model_type``
 Fix, computed from the base config on disk (never from a family list):
 * flat configs: copy each compared field whose value differs from the base onto the saved config (and raise a smaller
   ``max_position_embeddings`` to the base's);
-* composite bases whose text sub-config the validator's loader would swap in: write the BASE composite config back,
+* composite bases whose text sub-config the causal-LM loader would swap in: write the BASE composite config back,
   with the trained text config as ``text_config`` carrying the base's ``architectures`` and ``model_type``. A text
   config whose ``model_type`` is the composite type disables transformers' ``language_model`` prefix conversion, so the
   weight names are rewritten to the loaded module names (``model.language_model.X`` -> ``model.X``) in the safetensors
   headers (in place, header only; tensor bytes untouched) and the shard index.
-Every rewrite is verified before it is kept: the emulated validator check must pass and (when names or the model type
-change) the checkpoint's tensor names must be exactly the loaded model's parameter names (a tied ``lm_head`` may be
-absent). A rewrite that fails verification is reverted and reported (``export_config_align_failed``); this module
-never raises into a finished run.
+Every rewrite is verified before it is kept: the loaded view of the export must equal the base on every compared
+field and (when names or the model type change) the checkpoint's tensor names must be exactly the loaded model's
+parameter names (a tied ``lm_head`` may be absent). A rewrite that fails verification is reverted and reported
+(``export_config_align_failed``); this module never raises into a finished run.
 """
 
 from __future__ import annotations
@@ -78,11 +83,12 @@ def loaded_view_config(path: str) -> Any:
 
 
 def validator_check(original_config: Any, finetuned_config: Any) -> tuple[bool, str | None]:
-    """The comparison part of G.O.D ``model_is_a_finetune`` (a2b14db), returning the first mismatch."""
+    """Compare the compared config fields of a loaded export with the base's (the field list of G.O.D a2b14db
+    ``model_checks.py``), returning the first mismatch."""
     try:
         if finetuned_config.architectures != original_config.architectures:
             return False, f"architectures base={original_config.architectures} submitted={finetuned_config.architectures}"
-    except Exception as exc:  # the validator treats this as a mismatch too
+    except Exception as exc:  # an unreadable field counts as a mismatch
         return False, f"architectures unreadable: {exc}"
     for attr in VALIDATOR_ATTRS:
         if getattr(original_config, attr, None) is not None:
@@ -145,7 +151,7 @@ def checkpoint_keys(export_dir: str) -> set[str]:
 
 
 def expected_keys(export_dir: str) -> tuple[set[str], bool]:
-    """Parameter/buffer names of the model the validator's loader would build (meta device), and whether the output
+    """Parameter/buffer names of the model AutoModelForCausalLM would build (meta device), and whether the output
     head is tied to the input embeddings."""
     import torch
     from transformers import AutoModelForCausalLM
@@ -294,7 +300,7 @@ def _write_json(path: str, data: dict) -> None:
 
 
 def _is_composite_swap(base_dir: str) -> bool:
-    """True when the validator's causal-LM loader swaps the base's text sub-config in (Qwen3.5-style bases)."""
+    """True when the causal-LM loader swaps the base's text sub-config in (Qwen3.5-style bases)."""
     return type(loaded_view_config(base_dir)) is not type(_auto_config(base_dir))
 
 
@@ -328,9 +334,10 @@ def _composite_patch(saved: dict, base_raw: dict) -> dict:
 
 
 def align_export_with_base(export_dir: str, base_dir: str) -> dict[str, Any]:
-    """Align ``export_dir/config.json`` (and, for composite bases, the tensor names) with the base so the validator's
-    check passes. Returns a report dict. On any failure every file is rolled back to its journaled original bytes and the
-    rollback is verified byte for byte; only an unverifiable rollback raises (ExportAlignmentError)."""
+    """Align ``export_dir/config.json`` (and, for composite bases, the tensor names) with the base so the export loads
+    with the base's architecture fields. Returns a report dict. On any failure every file is rolled back to its
+    journaled original bytes and the rollback is verified byte for byte; only an unverifiable rollback raises
+    (ExportAlignmentError)."""
     report: dict[str, Any] = {"changed": False}
     cfg_path = os.path.join(export_dir, "config.json")
     if not os.path.isfile(cfg_path):

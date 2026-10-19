@@ -1,12 +1,13 @@
-"""Release defect D1 (2026-09-29): every full-FT family's export must pass the validator's OWN is_finetune logic.
+"""Release defect D1 (2026-09-29): every full-FT family's export must load with the base's architecture fields.
 
 For each model_type the full-FT default can route (research/20260929-release-fullft-default/ROUTE-TABLE.md, in-scope
 rows), a tiny random base is saved with the base's architecture class, loaded the way forge trains it
 (AutoModelForCausalLM), perturbed (a "trained" weight), exported through the production save path
-(common.save_adapter), then loaded the way the validator loads a non-LoRA submission
+(common.save_adapter), then loaded the way G.O.D loads a full-weight model
 (AutoModelForCausalLM.from_pretrained(repo, dtype=bfloat16, trust_remote_code=False); G.O.D a2b14db
-evaluators/instruct_text.py:446-455) and checked with the VENDORED G.O.D model_is_a_finetune (tests/god_vendor).
-The export must pass AND stay loadable with identical logits to the trained model.
+evaluators/instruct_text.py:446-455) and its config fields compared with the base's by the VENDORED G.O.D
+model_is_a_finetune (tests/god_vendor). The fields must match AND the export must load with identical logits to the
+trained model.
 """
 from __future__ import annotations
 

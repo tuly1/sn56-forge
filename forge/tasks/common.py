@@ -428,10 +428,10 @@ def _restore_base_architectures(staged_dir: str, model: Any) -> None:
     """Post-save: put the BASE model's `architectures` back into config.json.
 
     Transformers normalises this field on load for aliased families (a Mistral
-    checkpoint loaded through the Llama class reports `LlamaForCausalLM`). The
-    validator's is_finetune check compares the submitted config against the
-    base, and a mismatch is a REJECTED submission (-1) — worse than losing, and
-    invisible in our own logs.
+    checkpoint loaded through the Llama class reports `LlamaForCausalLM`), so a
+    saved config can name a different architecture than the base even for
+    genuinely trained weights; a loader that reads the config next to the base
+    config then sees a different model, and nothing in our own logs shows it.
 
     Reads the truth from the base config on disk rather than from the in-memory
     config, because the in-memory value is exactly what was rewritten.
@@ -486,7 +486,7 @@ def _restore_base_architectures(staged_dir: str, model: Any) -> None:
             pass
 
 def _align_export_with_base(staged_dir: str, model: Any) -> None:
-    """Post-save (after the architectures restore): make a full-weight export pass the validator's is_finetune check on
+    """Post-save (after the architectures restore): keep a full-weight export loadable as the base architecture on
     EVERY compared attribute (release defect D1; forge.tasks.export_compat). Adapter exports have no config.json and are
     skipped. The report goes to telemetry (``export_config_aligned`` / ``export_config_align_failed``). Raises only
     ExportAlignmentError (rollback not verified), which fails the staging instead of promoting mismatched files."""

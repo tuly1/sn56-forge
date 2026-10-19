@@ -210,7 +210,7 @@ def test_floor_best_export_and_non_sft_handlers_remain_unchanged():
         # 2026-09-10: save_adapter gained an optional state_dict= parameter (default None,
         # identical behaviour) for the v2 handler's bf16 snapshot export; pin refreshed.
         # 2026-09-29 (release defect D1): save_adapter aligns a FULL-weight export's config (and, for composite
-        # Qwen3.5-style bases, tensor names) with the base so the validator's is_finetune check passes
+        # Qwen3.5-style bases, tensor names) with the base so it loads with the base's architecture fields
         # (forge.tasks.export_compat; tests/test_export_validator_finetune.py). Adapter exports are untouched.
         # RESP-072-1: an unverifiable alignment rollback (ExportAlignmentError) now fails the staging.
         # v9.2 (2026-10-05, owner decision "real mini fine-tune, else fail"): fallback.py is the minimal fine-tune (both
@@ -223,8 +223,10 @@ def test_floor_best_export_and_non_sft_handlers_remain_unchanged():
         # Mamba hybrids (Falcon-H1: out_proj); every other family attaches through forge.model.attach_lora as before.
         # v9.2 repair 4 (2026-10-06, RESP-120 C1): the unpredicted-refusal reload runs outside the except block, after
         # the refused model is released (no two models resident at once).
+        # 2026-10-19 (code-review wording): docstring wording only in _restore_base_architectures and
+        # _align_export_with_base (no code change, AST-checked); pin refreshed.
         "forge/tasks/common.py": (
-            "3f6491c522ec93f1ff0b8b88d51f513fa93a1b284227ee0fe5f2f7f3ec9f0a72"
+            "2a091b51f7fe20b53932cbbb3bf67eaf2a2e9b444482a3544b45f9b4a6d9a07f"
         ),
         "forge/tasks/fallback.py": (
             "5b42c0037fd53ac7fceff5d4f69d2d27da92373e98feb809b28779e498f7b393"

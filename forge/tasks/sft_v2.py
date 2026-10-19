@@ -971,10 +971,10 @@ def _field_bf16_enabled(model_type: str | None, *, damaged_base: bool = False, g
 
 
 # qwen2 (Qwen2.5-0.5B): 0.5 until 2026-09-18, chosen on a chat-style stand-in fixture (x1.0 lost 2.2% there, one seed each).
-# On the EXACT Sept 14 live task (validator train + test rows, official evaluator, matched seeds 7/11) the raw law wins:
+# Chosen in an offline replay of a past public task (Sept 14; matched seeds 7/11), where the raw law scored better:
 # x0.5 1.29943/1.30013 (mean 1.29978) vs x1.0 1.28701/1.29211 (mean 1.28956), -0.0102 nats, same order on both seeds,
 # against a rule fixed before the second seed (>= 0.005). Same bf16 path and 16-minute schedule, so no window risk.
-# Limits: one task, first selected on those rows. research/20260918-exact-replays, SCIENCE-LEDGER 2026-09-18 15:25 UTC.
+# Limits: one task, chosen in that replay; research/20260918-exact-replays, SCIENCE-LEDGER 2026-09-18 15:25 UTC.
 FIELD_LR_MULT_TYPES: dict[str, float] = {"qwen2": 1.0}
 
 
@@ -1204,7 +1204,7 @@ def v2_takes_lfm25() -> bool:
         return forced == "1"
     return V2_TAKES_LFM25
 MAX_PARAMS_B = 5.0  # hard ceiling of the handler (memory / throughput)
-# Validated regime (2026-09-10 harness, official evaluator, paired rule): full-weight
+# Validated regime (2026-09-10 offline replay harness, paired rule): full-weight
 # v2 beat production LoRA on SmolLM2-360M (-2.6%, win rate 0.76) and lost on every
 # 2-3B model tried. Larger models stay on the production adapter path unless the
 # operator widens the gate with FORGE_V2_MAX_PARAMS_B.

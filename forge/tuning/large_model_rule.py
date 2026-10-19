@@ -6,11 +6,11 @@ and scale the LR with the batch by (B_new / B_release) ** LR_ALPHA (0.5), bounde
 Below 3.0 B nothing here runs (sft_v2 checks the size before calling), so behaviour is 854bf7a's by construction.
 
 (alpha, cap) = (0.5, 2.0) is the phase-ba frozen-rule choice (research/20260923-replay-bench/phase-ba,
-reduce_phase_ba.py; results/DEV-VERDICT.json sha af0337fcdfe4: CHOSEN_ON_DEV chosen=C, eligible C and E). Arm C on
-7024722 (EXECUTED_SCORED, one seed = DISCOVERY): 522e0294 Qwen2.5-3B DEV +0.873 % / TEST +0.889 % vs 7024722 (rank 14 ->
-15 of 15, inside the +1 % E1 bound; c1f7501's alpha 0.75 was +2.32 %, a blow-up); 880b38e9 NuExtract-v1.5 DEV -4.323 % /
-TEST -3.861 % (rank 8 -> 6). phase-aw (c1f7501 on 7024722): bc347f11 Qwen2.5-3B-Instruct ruqa logged
-sft_v2_large_model_batch_kept (no growth), TEST -0.170 % (CI spans 0) = the release.
+reduce_phase_ba.py; results/DEV-VERDICT.json sha af0337fcdfe4: CHOSEN_ON_DEV chosen=C, eligible C and E), in offline
+replays of past public tasks. Arm C on 7024722 (one seed = DISCOVERY): 522e0294 Qwen2.5-3B DEV +0.873 % vs 7024722
+(inside the +1 % E1 bound; c1f7501's alpha 0.75 was DEV +2.32 %, a blow-up); 880b38e9 NuExtract-v1.5 DEV -4.323 %.
+phase-aw (c1f7501 on 7024722): bc347f11 Qwen2.5-3B-Instruct ruqa logged sft_v2_large_model_batch_kept (no growth),
+no measurable change (CI spans 0) = the release. Full replay results: research/20260923-replay-bench/phase-ba, phase-aw.
   Below 3 B growth hurt (LFM2.5-2.6B 90d361cb +0.0067 DEV; LFM2.5-1.2B cc4550ab +0.028..+0.056 DEV), hence the size gate.
   The 3.0 B threshold is fitted to those cells (anywhere in (2.70, 3.09] separates them), not derived.
 """

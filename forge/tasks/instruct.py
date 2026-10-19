@@ -1804,7 +1804,7 @@ def _discard(value: Any, *, trainer: bool = False) -> None:
 
 LEGACY_NEFTUNE_ALPHA = 5.0
 # NEFTune adds uniform noise of magnitude alpha/sqrt(L*d) to the input embeddings while training; HF's hook takes L from
-# the PADDED micro-batch. Measured 2026-09-18 (official evaluator; identical fixture bytes and image apart from the
+# the PADDED micro-batch. Measured 2026-09-18 (offline replay scoring; identical fixture bytes and image apart from the
 # switch; decision rule logged before the result): unsloth/tinyllama on qa-news-2016 (median 79 / p99 157 tokens) scored
 # 3.77165 with alpha 5 (held-out loss 3.6 at a quarter epoch while train loss fell) and 1.64690 with NEFTune off.
 # What is NOT known: why only this case collapsed. Noise/embedding-RMS is the same for TinyLlama (0.43) and
